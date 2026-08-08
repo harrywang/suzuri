@@ -36,6 +36,13 @@ pub struct FoldPlaceholder {
     /// Text provided by the language server to display in place of the folded range.
     /// When set, this is used instead of the default "⋯" ellipsis.
     pub collapsed_text: Option<SharedString>,
+    /// Whether lines containing this fold show a chevron in the gutter.
+    /// Concealment folds (e.g. markdown live preview) set this to false.
+    pub show_gutter_indicator: bool,
+    /// Whether this fold is saved and restored with the workspace. Concealment
+    /// folds are recomputed from buffer content, so persisting them would
+    /// resurrect them as plain `⋯` folds their owner no longer controls.
+    pub persistent: bool,
 }
 
 impl Default for FoldPlaceholder {
@@ -46,6 +53,8 @@ impl Default for FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
+            show_gutter_indicator: true,
+            persistent: true,
         }
     }
 }
@@ -79,6 +88,8 @@ impl FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
+            show_gutter_indicator: true,
+            persistent: true,
         }
     }
 }
@@ -1538,6 +1549,14 @@ impl<'a> Iterator for FoldChunks<'a> {
                 && self.transform_cursor.item().is_some()
             {
                 self.transform_cursor.next();
+            }
+
+            // A zero-width placeholder (e.g. a fold that conceals markdown
+            // syntax) contributes no display text; emitting an empty chunk
+            // would break downstream consumers that assume chunks are
+            // non-empty.
+            if placeholder.text.is_empty() {
+                return self.next();
             }
 
             self.output_offset.0 += placeholder.text.len();

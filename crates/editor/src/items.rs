@@ -627,6 +627,19 @@ fn deserialize_anchor(anchor: proto::EditorAnchor, buffer: &MultiBufferSnapshot)
 impl Item for Editor {
     type Event = EditorEvent;
 
+    fn handle_drop(
+        &self,
+        _active_pane: &workspace::Pane,
+        dropped: &dyn std::any::Any,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        let Some(paths) = dropped.downcast_ref::<gpui::ExternalPaths>() else {
+            return false;
+        };
+        handle_image_drop_on_markdown(self, paths.paths(), cx)
+    }
+
     fn act_as_type<'a>(
         &'a self,
         type_id: TypeId,
@@ -2455,6 +2468,106 @@ fn compute_modified_ranges(
         merged.push(expanded);
     }
     merged
+}
+
+const DROPPABLE_IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"];
+
+/// Obsidian-style image drop: image files dropped onto a markdown buffer are
+/// copied into an `attachments` directory beside the note and referenced with
+/// `![](...)` at the cursor, instead of being opened as workspace items.
+fn handle_image_drop_on_markdown(
+    editor: &Editor,
+    paths: &[std::path::PathBuf],
+    cx: &mut App,
+) -> bool {
+    use multi_buffer::{ToOffset as _, ToPoint as _};
+
+    let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
+        return false;
+    };
+    if buffer
+        .read(cx)
+        .language()
+        .is_none_or(|language| language.name().as_ref() != "Markdown")
+    {
+        return false;
+    }
+    let Some(note_directory) = buffer.read(cx).file().and_then(|file| {
+        let mut path = file.as_local()?.abs_path(cx);
+        path.pop();
+        Some(path)
+    }) else {
+        return false;
+    };
+
+    let all_images = !paths.is_empty()
+        && paths.iter().all(|path| {
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| {
+                    DROPPABLE_IMAGE_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+                })
+        });
+    if !all_images {
+        return false;
+    }
+
+    let mut markdown_links = String::new();
+    for path in paths {
+        let link_target = if let Ok(relative) = path.strip_prefix(&note_directory) {
+            relative.to_path_buf()
+        } else {
+            let attachments_directory = note_directory.join("attachments");
+            if std::fs::create_dir_all(&attachments_directory)
+                .log_err()
+                .is_none()
+            {
+                continue;
+            }
+            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let stem = std::path::Path::new(file_name)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("image");
+            let extension = std::path::Path::new(file_name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("png");
+            let mut candidate = attachments_directory.join(file_name);
+            let mut suffix = 1;
+            while candidate.exists() {
+                candidate = attachments_directory.join(format!("{stem}-{suffix}.{extension}"));
+                suffix += 1;
+            }
+            if std::fs::copy(path, &candidate).log_err().is_none() {
+                continue;
+            }
+            std::path::Path::new("attachments").join(
+                candidate
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+            )
+        };
+        let link_target = link_target.to_string_lossy().replace(' ', "%20");
+        markdown_links.push_str(&format!("![]({link_target})\n"));
+    }
+    if markdown_links.is_empty() {
+        return false;
+    }
+
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let cursor = editor.selections.newest_anchor().head();
+    let offset = cursor.to_offset(&snapshot);
+    if cursor.to_point(&snapshot).column > 0 {
+        markdown_links.insert(0, '\n');
+    }
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit([(offset..offset, markdown_links)], None, cx);
+    });
+    true
 }
 
 #[cfg(test)]

@@ -18,7 +18,16 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let folded = self.is_line_folded(buffer_row);
+        let folded = self.is_line_folded(buffer_row)
+            && self
+                .folds_in_range(
+                    Point::new(buffer_row.0, 0)
+                        ..Point::new(
+                            buffer_row.0,
+                            self.buffer_snapshot().line_len(buffer_row),
+                        ),
+                )
+                .any(|fold| fold.placeholder.show_gutter_indicator);
         let mut is_foldable = false;
 
         if let Some(crease) = self
@@ -821,6 +830,7 @@ impl Editor {
         };
         let inmemory_folds = display_snapshot
             .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .filter(|fold| fold.placeholder.persistent)
             .map(|fold| {
                 let start = fold.range.start.text_anchor_in(buffer_snapshot);
                 let end = fold.range.end.text_anchor_in(buffer_snapshot);
@@ -847,6 +857,7 @@ impl Editor {
         const FINGERPRINT_LEN: usize = 32;
         let db_folds = display_snapshot
             .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .filter(|fold| fold.placeholder.persistent)
             .map(|fold| {
                 let start = fold
                     .range
@@ -959,6 +970,8 @@ impl Editor {
                 merge_adjacent: false,
                 type_tag: Some(type_id),
                 collapsed_text: None,
+                show_gutter_indicator: true,
+                persistent: false,
             };
             let creases = new_newlines
                 .into_iter()

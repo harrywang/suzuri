@@ -177,6 +177,7 @@ pub enum HighlightKey {
     HoveredLinkState,
     InlineAssist,
     InputComposition,
+    MarkdownLivePreview(usize),
     MatchingBracket,
     NavigationOverlay(NavigationOverlayKey),
     PendingInput,
@@ -988,6 +989,8 @@ impl DisplayMap {
                     merge_adjacent: base_placeholder.merge_adjacent,
                     type_tag: base_placeholder.type_tag,
                     collapsed_text: Some(collapsed_text),
+                    show_gutter_indicator: true,
+                    persistent: true,
                 }
             } else {
                 base_placeholder.clone()
