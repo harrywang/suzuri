@@ -11,7 +11,9 @@ use std::{any::TypeId, ops::Range, path::PathBuf, sync::Arc};
 use collections::{HashMap, HashSet};
 use editor::{
     Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey,
-    display_map::{BlockPlacement, BlockProperties, BlockStyle, Crease, CustomBlockId, RenderBlock},
+    display_map::{
+        BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId, RenderBlock,
+    },
 };
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, FontWeight, HighlightStyle, ImageSource,
@@ -70,15 +72,11 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     }
 
     let mut subscriptions = Vec::new();
-    subscriptions.push(cx.subscribe_in(
-        &cx.entity(),
-        window,
-        |editor, _, event: &EditorEvent, window, cx| match event {
-            EditorEvent::Reparsed(_) => recompute(editor, window, cx),
-            EditorEvent::SelectionsChanged { .. } => apply_decorations(editor, window, cx),
-            _ => {}
-        },
-    ));
+    subscriptions.push(cx.subscribe_self(|editor, event: &EditorEvent, cx| match event {
+        EditorEvent::Reparsed(_) => recompute(editor, cx),
+        EditorEvent::SelectionsChanged { .. } => apply_decorations(editor, cx),
+        _ => {}
+    }));
 
     subscriptions.push(cx.observe_global::<theme::GlobalTheme>(|editor, cx| {
         let markers = editor
@@ -89,7 +87,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
 
     let weak_editor = cx.weak_entity();
     subscriptions.push(
-        editor.register_action::<ToggleLivePreview>(move |_, window, cx| {
+        editor.register_action::<ToggleLivePreview>(move |_, _window, cx| {
             weak_editor
                 .update(cx, |editor, cx| {
                     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
@@ -98,7 +96,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                         });
                         addon.enabled_override = Some(!enabled);
                     }
-                    recompute(editor, window, cx);
+                    recompute(editor, cx);
                 })
                 .log_err();
         }),
@@ -107,7 +105,6 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     editor.register_addon(LivePreviewAddon {
         enabled_override: None,
         markers: None,
-        applied_folds: Vec::new(),
         applied_blocks: Vec::new(),
         _subscriptions: subscriptions,
     });
@@ -115,9 +112,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     // The buffer may already be parsed by the time this editor is created, in
     // which case no `Reparsed` event will arrive; compute an initial pass.
     let weak_editor = cx.weak_entity();
-    window.defer(cx, move |window, cx| {
+    window.defer(cx, move |_window, cx| {
         weak_editor
-            .update(cx, |editor, cx| recompute(editor, window, cx))
+            .update(cx, |editor, cx| recompute(editor, cx))
             .ok();
     });
 }
@@ -126,7 +123,6 @@ struct LivePreviewAddon {
     /// Per-editor override set by the toggle action; falls back to the setting.
     enabled_override: Option<bool>,
     markers: Option<Arc<MarkerSet>>,
-    applied_folds: Vec<Range<Anchor>>,
     applied_blocks: Vec<AppliedBlock>,
     _subscriptions: Vec<Subscription>,
 }
@@ -217,7 +213,7 @@ fn is_enabled(addon: &LivePreviewAddon, cx: &App) -> bool {
         .unwrap_or_else(|| MarkdownLivePreviewSettings::get_global(cx).enabled)
 }
 
-fn recompute(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
     let Some(addon) = editor.addon::<LivePreviewAddon>() else {
         return;
     };
@@ -233,21 +229,8 @@ fn recompute(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>)
         return;
     };
     addon.markers = markers.clone();
-    // Rebuild folds from scratch on reparse: external actions (e.g. unfold
-    // all) can remove this crate's folds without its bookkeeping noticing,
-    // and stale entries would then never be re-folded by the diff.
-    let stale_folds = std::mem::take(&mut addon.applied_folds);
     apply_emphasis_highlights(editor, markers.as_deref(), cx);
-    if !stale_folds.is_empty() {
-        let len = editor.buffer().read(cx).snapshot(cx).len();
-        editor.remove_folds_with_type(
-            &[MultiBufferOffset(0)..len],
-            TypeId::of::<LivePreviewFoldTag>(),
-            false,
-            cx,
-        );
-    }
-    apply_decorations(editor, window, cx);
+    apply_decorations(editor, cx);
 }
 
 /// Emphasis spans get preview-like typography: the plain text color with true
@@ -322,30 +305,30 @@ fn apply_emphasis_highlights(editor: &mut Editor, markers: Option<&MarkerSet>, c
     }
 }
 
-fn apply_decorations(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
         return;
     };
     let markers = addon.markers.clone();
-    let applied_folds = std::mem::take(&mut addon.applied_folds);
     let applied_blocks = std::mem::take(&mut addon.applied_blocks);
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let Some(markers) = markers else {
-        clear_decorations(editor, applied_folds, applied_blocks, cx);
+        clear_decorations(editor, applied_blocks, cx);
         return;
     };
 
-    // Session restore can asynchronously resurrect concealment folds saved by
-    // older builds as plain `⋯` folds this addon does not own; heal them
-    // whenever decorations refresh.
+    // Session restore can resurrect concealments saved as folds by older
+    // builds as plain `⋯` folds this addon does not own; heal them whenever
+    // decorations refresh.
     remove_stale_restored_folds(editor, cx);
 
     let selection_rows = selection_row_ranges(editor, &snapshot);
 
-    // --- Inline folds ---
+    // --- Inline concealments ---
 
-    let mut desired_folds: HashMap<(usize, usize), &InlineMarker> = HashMap::default();
+    let weak_editor = cx.weak_entity();
+    let mut concealments = Vec::new();
     for marker in &markers.inline {
         let start = marker.range.start.to_point(&snapshot);
         let end = marker.range.end.to_point(&snapshot);
@@ -355,44 +338,13 @@ fn apply_decorations(editor: &mut Editor, window: &mut Window, cx: &mut Context<
         if rows_intersect(&selection_rows, start.row, end.row) {
             continue;
         }
-        let start_offset = marker.range.start.to_offset(&snapshot).0;
-        let end_offset = marker.range.end.to_offset(&snapshot).0;
-        desired_folds.insert((start_offset, end_offset), marker);
+        concealments.push(Concealment {
+            range: marker.range.clone(),
+            placeholder: fold_placeholder(marker, weak_editor.clone()),
+            content_key: marker_content_key(&marker.kind),
+        });
     }
-
-    let mut new_applied_folds = Vec::new();
-    let mut folds_to_remove = Vec::new();
-    for range in applied_folds {
-        let start = range.start.to_offset(&snapshot).0;
-        let end = range.end.to_offset(&snapshot).0;
-        if desired_folds.remove(&(start, end)).is_some() && start < end {
-            new_applied_folds.push(range);
-        } else {
-            folds_to_remove.push(range);
-        }
-    }
-
-    let weak_editor = cx.weak_entity();
-    let mut creases_to_add = Vec::new();
-    for marker in desired_folds.into_values() {
-        creases_to_add.push(Crease::simple(
-            marker.range.clone(),
-            fold_placeholder(marker, weak_editor.clone()),
-        ));
-        new_applied_folds.push(marker.range.clone());
-    }
-
-    if !folds_to_remove.is_empty() {
-        editor.remove_folds_with_type(
-            &folds_to_remove,
-            TypeId::of::<LivePreviewFoldTag>(),
-            false,
-            cx,
-        );
-    }
-    if !creases_to_add.is_empty() {
-        editor.fold_creases(creases_to_add, false, window, cx);
-    }
+    editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), concealments, cx);
 
     // --- Block widgets ---
 
@@ -503,7 +455,6 @@ fn apply_decorations(editor: &mut Editor, window: &mut Window, cx: &mut Context<
     }
 
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
-        addon.applied_folds = new_applied_folds;
         addon.applied_blocks = new_applied_blocks;
     }
 }
@@ -549,13 +500,10 @@ fn remove_stale_restored_folds(editor: &mut Editor, cx: &mut Context<Editor>) {
 
 fn clear_decorations(
     editor: &mut Editor,
-    applied_folds: Vec<Range<Anchor>>,
     applied_blocks: Vec<AppliedBlock>,
     cx: &mut Context<Editor>,
 ) {
-    if !applied_folds.is_empty() {
-        editor.remove_folds_with_type(&applied_folds, TypeId::of::<LivePreviewFoldTag>(), false, cx);
-    }
+    editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), Vec::new(), cx);
     if !applied_blocks.is_empty() {
         let block_ids = applied_blocks
             .into_iter()
@@ -634,8 +582,14 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         merge_adjacent: false,
         type_tag: Some(TypeId::of::<LivePreviewFoldTag>()),
         collapsed_text,
-        show_gutter_indicator: false,
-        persistent: false,
+    }
+}
+
+fn marker_content_key(kind: &InlineKind) -> u64 {
+    match kind {
+        InlineKind::Hide => 0,
+        InlineKind::Bullet => 1,
+        InlineKind::Checkbox { checked, .. } => 2 + u64::from(*checked),
     }
 }
 

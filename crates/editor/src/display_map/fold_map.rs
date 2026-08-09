@@ -19,6 +19,7 @@ use std::{
     sync::Arc,
     usize,
 };
+use collections::HashMap;
 use sum_tree::{Bias, Cursor, Dimensions, FilterCursor, SumTree, Summary, TreeMap};
 use ui::IntoElement as _;
 use util::post_inc;
@@ -36,13 +37,6 @@ pub struct FoldPlaceholder {
     /// Text provided by the language server to display in place of the folded range.
     /// When set, this is used instead of the default "⋯" ellipsis.
     pub collapsed_text: Option<SharedString>,
-    /// Whether lines containing this fold show a chevron in the gutter.
-    /// Concealment folds (e.g. markdown live preview) set this to false.
-    pub show_gutter_indicator: bool,
-    /// Whether this fold is saved and restored with the workspace. Concealment
-    /// folds are recomputed from buffer content, so persisting them would
-    /// resurrect them as plain `⋯` folds their owner no longer controls.
-    pub persistent: bool,
 }
 
 impl Default for FoldPlaceholder {
@@ -53,8 +47,6 @@ impl Default for FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
-            show_gutter_indicator: true,
-            persistent: true,
         }
     }
 }
@@ -88,8 +80,6 @@ impl FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
-            show_gutter_indicator: true,
-            persistent: true,
         }
     }
 }
@@ -174,6 +164,19 @@ impl<'a> sum_tree::Dimension<'a, TransformSummary> for FoldPoint {
     fn add_summary(&mut self, summary: &'a TransformSummary, _: ()) {
         self.0 += &summary.output.lines;
     }
+}
+
+/// A rendering-only concealment: hides or replaces a range's display without
+/// registering a fold. Invisible to the gutter, fold persistence, and fold
+/// actions by construction.
+#[derive(Clone)]
+pub struct Concealment {
+    pub range: Range<Anchor>,
+    pub placeholder: FoldPlaceholder,
+    /// Distinguishes different renders at an identical range (e.g. a
+    /// checkbox's checked state); items whose (range, content_key) are
+    /// unchanged are reused without a resync.
+    pub content_key: u64,
 }
 
 pub(crate) struct FoldMapWriter<'a>(&'a mut FoldMap);
@@ -363,6 +366,112 @@ impl FoldMapWriter<'_> {
         let edits = self.0.sync(inlay_snapshot, edits);
         (self.0.snapshot.clone(), edits)
     }
+
+    /// Replaces the owner's entire concealment set. Items whose
+    /// (range, content_key) are unchanged are reused without a resync, so
+    /// callers can idempotently pass the full desired set on every update.
+    #[ztracing::instrument(skip_all)]
+    pub(crate) fn set_concealments(
+        &mut self,
+        owner: TypeId,
+        concealments: Vec<Concealment>,
+    ) -> (FoldSnapshot, Vec<FoldEdit>) {
+        let snapshot = self.0.snapshot.inlay_snapshot.clone();
+        let buffer = snapshot.buffer.clone();
+        let mut edits = Vec::new();
+
+        let mut existing: HashMap<(usize, usize), Fold> = HashMap::default();
+        let mut new_items: Vec<Fold> = Vec::new();
+        for item in self.0.snapshot.concealments.iter() {
+            if item.placeholder.type_tag == Some(owner) {
+                let start = item.range.start.to_offset(&buffer);
+                let end = item.range.end.to_offset(&buffer);
+                existing.insert((start.0, end.0), item.clone());
+            } else {
+                new_items.push(item.clone());
+            }
+        }
+
+        for mut concealment in concealments {
+            let range = concealment.range.start.to_offset(&buffer)
+                ..concealment.range.end.to_offset(&buffer);
+            if range.start >= range.end {
+                continue;
+            }
+            concealment.placeholder.type_tag = Some(owner);
+            match existing.remove(&(range.start.0, range.end.0)) {
+                Some(old)
+                    if self.0.concealment_content_keys.get(&old.id).copied()
+                        == Some(concealment.content_key) =>
+                {
+                    new_items.push(old);
+                }
+                old => {
+                    if let Some(old) = old {
+                        self.0.snapshot.fold_metadata_by_id.remove(&old.id);
+                        self.0.concealment_content_keys.remove(&old.id);
+                    }
+                    let fold_range =
+                        FoldRange(buffer.anchor_after(range.start)..buffer.anchor_before(range.end));
+                    if buffer
+                        .anchor_range_to_buffer_anchor_range(fold_range.0.clone())
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let id = FoldId(post_inc(&mut self.0.next_fold_id.0));
+                    self.0.snapshot.fold_metadata_by_id.insert(
+                        id,
+                        FoldMetadata {
+                            range: fold_range.clone(),
+                            width: None,
+                        },
+                    );
+                    self.0
+                        .concealment_content_keys
+                        .insert(id, concealment.content_key);
+                    new_items.push(Fold {
+                        id,
+                        range: fold_range,
+                        placeholder: concealment.placeholder,
+                    });
+                    let inlay_range = snapshot.to_inlay_offset(range.start)
+                        ..snapshot.to_inlay_offset(range.end);
+                    edits.push(InlayEdit {
+                        old: inlay_range.clone(),
+                        new: inlay_range,
+                    });
+                }
+            }
+        }
+
+        for (_, old) in existing {
+            let start = old.range.start.to_offset(&buffer);
+            let end = old.range.end.to_offset(&buffer);
+            self.0.snapshot.fold_metadata_by_id.remove(&old.id);
+            self.0.concealment_content_keys.remove(&old.id);
+            if end > start {
+                let inlay_range =
+                    snapshot.to_inlay_offset(start)..snapshot.to_inlay_offset(end);
+                edits.push(InlayEdit {
+                    old: inlay_range.clone(),
+                    new: inlay_range,
+                });
+            }
+        }
+
+        new_items
+            .sort_unstable_by(|a, b| sum_tree::SeekTarget::cmp(&a.range, &b.range, &buffer));
+        let mut tree = SumTree::new(&buffer);
+        for item in new_items {
+            tree.push(item, &buffer);
+        }
+        self.0.snapshot.concealments = tree;
+
+        let edits = consolidate_inlay_edits(edits);
+        let edits = self.0.sync(snapshot, edits);
+        (self.0.snapshot.clone(), edits)
+    }
 }
 
 /// Decides where the fold indicators should be; also tracks parts of a source file that are currently folded.
@@ -371,6 +480,7 @@ impl FoldMapWriter<'_> {
 pub struct FoldMap {
     snapshot: FoldSnapshot,
     next_fold_id: FoldId,
+    concealment_content_keys: HashMap<FoldId, u64>,
 }
 
 impl FoldMap {
@@ -379,6 +489,7 @@ impl FoldMap {
         let this = Self {
             snapshot: FoldSnapshot {
                 folds: SumTree::new(&inlay_snapshot.buffer),
+                concealments: SumTree::new(&inlay_snapshot.buffer),
                 transforms: SumTree::from_item(
                     Transform {
                         summary: TransformSummary {
@@ -394,6 +505,7 @@ impl FoldMap {
                 fold_metadata_by_id: TreeMap::default(),
             },
             next_fold_id: FoldId::default(),
+            concealment_content_keys: HashMap::default(),
         };
         let snapshot = this.snapshot.clone();
         (this, snapshot)
@@ -524,11 +636,34 @@ impl FoldMap {
                     .folds
                     .cursor::<FoldRange>(&inlay_snapshot.buffer);
                 folds_cursor.seek(&FoldRange(anchor..Anchor::Max), Bias::Left);
+                let mut concealments_cursor = self
+                    .snapshot
+                    .concealments
+                    .cursor::<FoldRange>(&inlay_snapshot.buffer);
+                concealments_cursor.seek(&FoldRange(anchor..Anchor::Max), Bias::Left);
 
                 let mut folds = iter::from_fn({
                     let inlay_snapshot = &inlay_snapshot;
                     move || {
-                        let item = folds_cursor.item().map(|fold| {
+                        // Merge real folds and concealments in range order.
+                        let next_is_fold =
+                            match (folds_cursor.item(), concealments_cursor.item()) {
+                                (Some(fold), Some(concealment)) => sum_tree::SeekTarget::cmp(
+                                    &fold.range,
+                                    &concealment.range,
+                                    &inlay_snapshot.buffer,
+                                )
+                                .is_le(),
+                                (Some(_), None) => true,
+                                (None, Some(_)) => false,
+                                (None, None) => true,
+                            };
+                        let active_cursor = if next_is_fold {
+                            &mut folds_cursor
+                        } else {
+                            &mut concealments_cursor
+                        };
+                        let item = active_cursor.item().map(|fold| {
                             let buffer_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
                             let buffer_end = fold.range.end.to_offset(&inlay_snapshot.buffer);
                             (
@@ -537,7 +672,7 @@ impl FoldMap {
                                     ..inlay_snapshot.to_inlay_offset(buffer_end),
                             )
                         });
-                        folds_cursor.next();
+                        active_cursor.next();
                         item
                     }
                 })
@@ -692,6 +827,10 @@ pub struct FoldSnapshot {
     pub inlay_snapshot: InlaySnapshot,
     transforms: SumTree<Transform>,
     folds: SumTree<Fold>,
+    /// Rendering-only concealments; deliberately excluded from every fold
+    /// query so fold consumers (gutter, persistence, unfold actions) cannot
+    /// observe them.
+    concealments: SumTree<Fold>,
     fold_metadata_by_id: TreeMap<FoldId, FoldMetadata>,
     pub version: usize,
 }

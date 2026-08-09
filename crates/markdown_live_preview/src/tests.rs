@@ -370,7 +370,7 @@ async fn test_disabling_restores_raw_markdown(cx: &mut TestAppContext) {
         if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
             addon.enabled_override = Some(false);
         }
-        recompute(editor, window, cx);
+        recompute(editor, cx);
     });
     cx.executor().run_until_parked();
     pretty_assertions::assert_eq!(cx.display_text(), cx.buffer_text());
@@ -379,7 +379,7 @@ async fn test_disabling_restores_raw_markdown(cx: &mut TestAppContext) {
         if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
             addon.enabled_override = Some(true);
         }
-        recompute(editor, window, cx);
+        recompute(editor, cx);
     });
     cx.executor().run_until_parked();
     assert_ne!(cx.display_text(), cx.buffer_text());
@@ -458,7 +458,7 @@ async fn test_non_markdown_buffers_untouched(cx: &mut TestAppContext) {
     let has_decorations = cx.update_editor(|editor, _, _| {
         editor
             .addon::<LivePreviewAddon>()
-            .is_some_and(|addon| !addon.applied_folds.is_empty() || !addon.applied_blocks.is_empty())
+            .is_some_and(|addon| !addon.applied_blocks.is_empty())
     });
     assert!(!has_decorations);
 }
@@ -542,4 +542,31 @@ async fn test_images_section_context(cx: &mut TestAppContext) {
     // revealed because the cursor sits on it.
     assert_eq!(blocks, 3, "applied block rows: {rows:?}");
     assert!(rows.contains(&(12, 12)), "linked image row missing: {rows:?}");
+}
+
+#[gpui::test]
+async fn test_concealments_invisible_to_fold_machinery(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nsome **bold** text\n");
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("some bold text"));
+
+    // "Unfold All" must not reveal concealments: they are not folds.
+    cx.update_editor(|editor, window, cx| {
+        editor.unfold_all(&Default::default(), window, cx);
+    });
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text().contains("some bold text"),
+        "unfold-all revealed concealments: {}",
+        cx.display_text()
+    );
+
+    // Fold queries (what the gutter and fold persistence read) see nothing.
+    let fold_count = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let len = snapshot.buffer_snapshot().len();
+        snapshot.folds_in_range(MultiBufferOffset(0)..len).count()
+    });
+    assert_eq!(fold_count, 0);
 }
