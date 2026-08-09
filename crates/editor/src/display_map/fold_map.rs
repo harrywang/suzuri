@@ -670,6 +670,7 @@ impl FoldMap {
                                 fold.clone(),
                                 inlay_snapshot.to_inlay_offset(buffer_start)
                                     ..inlay_snapshot.to_inlay_offset(buffer_end),
+                                !next_is_fold,
                             )
                         });
                         active_cursor.next();
@@ -680,20 +681,25 @@ impl FoldMap {
 
                 while folds
                     .peek()
-                    .is_some_and(|(_, fold_range)| fold_range.start < edit.new.end)
+                    .is_some_and(|(_, fold_range, _)| fold_range.start < edit.new.end)
                 {
-                    let (fold, mut fold_range) = folds.next().unwrap();
+                    let (fold, mut fold_range, mut is_concealment) = folds.next().unwrap();
                     let sum = new_transforms.summary();
 
                     assert!(fold_range.start.0 >= sum.input.len);
 
-                    while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
-                        next_fold_range.start < fold_range.end
-                            || (next_fold_range.start == fold_range.end
-                                && fold.placeholder.merge_adjacent
-                                && next_fold.placeholder.merge_adjacent)
-                    }) {
-                        let (_, next_fold_range) = folds.next().unwrap();
+                    while folds
+                        .peek()
+                        .is_some_and(|(next_fold, next_fold_range, _)| {
+                            next_fold_range.start < fold_range.end
+                                || (next_fold_range.start == fold_range.end
+                                    && fold.placeholder.merge_adjacent
+                                    && next_fold.placeholder.merge_adjacent)
+                        })
+                    {
+                        let (_, next_fold_range, next_is_concealment) = folds.next().unwrap();
+                        // A region containing a real fold is a fold.
+                        is_concealment &= next_is_concealment;
                         if next_fold_range.end > fold_range.end {
                             fold_range.end = next_fold_range.end;
                         }
@@ -730,6 +736,7 @@ impl FoldMap {
                                 placeholder: Some(TransformPlaceholder {
                                     text: placeholder_text,
                                     chars: chars_bitmap,
+                                    is_concealment,
                                     renderer: ChunkRenderer {
                                         id: ChunkRendererId::Fold(fold.id),
                                         render: Arc::new(move |cx| {
@@ -1031,7 +1038,12 @@ impl FoldSnapshot {
         let (_, _, item) = self
             .transforms
             .find::<InlayOffset, _>((), &inlay_offset, Bias::Right);
-        item.is_some_and(|t| t.placeholder.is_some())
+        item.is_some_and(|transform| {
+            transform
+                .placeholder
+                .as_ref()
+                .is_some_and(|placeholder| !placeholder.is_concealment)
+        })
     }
 
     #[ztracing::instrument(skip_all)]
@@ -1047,7 +1059,11 @@ impl FoldSnapshot {
                     let buffer_point = self.inlay_snapshot.to_buffer_point(inlay_point);
                     if buffer_point.row != buffer_row.0 {
                         return false;
-                    } else if transform.placeholder.is_some() {
+                    } else if transform
+                        .placeholder
+                        .as_ref()
+                        .is_some_and(|placeholder| !placeholder.is_concealment)
+                    {
                         return true;
                     }
                 }
@@ -1329,6 +1345,10 @@ struct TransformPlaceholder {
     text: SharedString,
     chars: u128,
     renderer: ChunkRenderer,
+    /// True when produced by a concealment rather than a fold; excluded from
+    /// fold queries like `is_line_folded` so the gutter and cursor placement
+    /// treat concealed text as ordinary text.
+    is_concealment: bool,
 }
 
 impl Transform {

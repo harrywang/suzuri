@@ -63,47 +63,107 @@ async fn test_inline_markers_hidden_off_cursor_line(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_markers_revealed_on_cursor_line(cx: &mut TestAppContext) {
+async fn test_per_token_reveal(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
 
     cx.set_state(indoc::indoc! {"
         ˇplain line
-        some **bold** text
+        some **bold** and *italic* text
     "});
     cx.executor().run_until_parked();
     pretty_assertions::assert_eq!(
         cx.display_text(),
         indoc::indoc! {"
             plain line
-            some bold text
+            some bold and italic text
         "}
     );
 
-    // Moving the cursor onto the formatted line reveals the raw syntax.
+    // Cursor inside the bold span reveals only that span's markers; the
+    // italic further along the same line stays rendered.
     cx.set_state(indoc::indoc! {"
         plain line
-        some **bold** ˇtext
+        some **boˇld** and *italic* text
     "});
     cx.executor().run_until_parked();
     pretty_assertions::assert_eq!(
         cx.display_text(),
         indoc::indoc! {"
             plain line
-            some **bold** text
+            some **bold** and italic text
         "}
     );
 
-    // Moving away hides it again.
+    // Cursor in plain text on the same line reveals nothing.
     cx.set_state(indoc::indoc! {"
-        plainˇ line
-        some **bold** text
+        plain line
+        some **bold** anˇd *italic* text
     "});
     cx.executor().run_until_parked();
     pretty_assertions::assert_eq!(
         cx.display_text(),
         indoc::indoc! {"
             plain line
-            some bold text
+            some bold and italic text
+        "}
+    );
+
+    // A selection sweeping the line reveals everything it touches.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        «some **bold** and *italic* textˇ»
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            some **bold** and *italic* text
+        "}
+    );
+
+    // A list marker stays rendered while editing elsewhere on its line,
+    // and reveals only when the cursor touches it.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        - bullet with **bold** insideˇ
+    "});
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("⋯ bullet with bold inside"));
+    cx.set_state(indoc::indoc! {"
+        plain line
+        ˇ- bullet with **bold** inside
+    "});
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("- bullet with bold inside"));
+
+    // The boundary just past the marker's trailing space does not reveal it.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        - ˇbullet with **bold** inside
+    "});
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("⋯ bullet with bold inside"));
+
+    // A checkbox stays rendered while editing the task text.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        - [ ] task textˇ
+    "});
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("⋯ task text"));
+
+    // Moving to another line hides everything again.
+    cx.set_state(indoc::indoc! {"
+        plainˇ line
+        some **bold** and *italic* text
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            some bold and italic text
         "}
     );
 }
@@ -366,7 +426,7 @@ async fn test_disabling_restores_raw_markdown(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
     assert_ne!(cx.display_text(), cx.buffer_text());
 
-    cx.update_editor(|editor, window, cx| {
+    cx.update_editor(|editor, _window, cx| {
         if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
             addon.enabled_override = Some(false);
         }
@@ -375,7 +435,7 @@ async fn test_disabling_restores_raw_markdown(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
     pretty_assertions::assert_eq!(cx.display_text(), cx.buffer_text());
 
-    cx.update_editor(|editor, window, cx| {
+    cx.update_editor(|editor, _window, cx| {
         if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
             addon.enabled_override = Some(true);
         }
@@ -564,9 +624,130 @@ async fn test_concealments_invisible_to_fold_machinery(cx: &mut TestAppContext) 
 
     // Fold queries (what the gutter and fold persistence read) see nothing.
     let fold_count = cx.update_editor(|editor, window, cx| {
+        let _ = &window;
         let snapshot = editor.snapshot(window, cx);
         let len = snapshot.buffer_snapshot().len();
         snapshot.folds_in_range(MultiBufferOffset(0)..len).count()
     });
     assert_eq!(fold_count, 0);
+
+    // No row reads as folded (the gutter's chevron predicate), across
+    // concealed inline markers, bullets, headings, and rules.
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        # Heading
+
+        ---
+
+        - bullet with **bold** text
+        - [ ] a task
+
+        [a link](https://example.com)
+    "});
+    cx.executor().run_until_parked();
+    // The gutter's chevron predicate: fold-map folds only.
+    let folded_rows: Vec<u32> = cx.update_editor(|editor, window, cx| {
+        let _ = &window;
+        let snapshot = editor.snapshot(window, cx);
+        let max_row = snapshot.buffer_snapshot().max_point().row;
+        (0..=max_row)
+            .filter(|row| {
+                snapshot
+                    .fold_snapshot()
+                    .is_line_folded(multi_buffer::MultiBufferRow(*row))
+            })
+            .collect()
+    });
+    assert_eq!(folded_rows, Vec::<u32>::new());
+}
+
+#[test]
+fn test_image_source_resolution_decodes_percent_encoding() {
+    let dir = std::env::temp_dir().join("mdlp-resolver-test");
+    std::fs::create_dir_all(&dir).unwrap();
+    // macOS screenshot names mix ASCII spaces (percent-encoded in links)
+    // with a raw narrow no-break space before "AM".
+    let file_name = "Screenshot 2026-08-09 at 11.38.37\u{202f}AM.png";
+    std::fs::write(dir.join(file_name), b"png").unwrap();
+
+    let destination = "Screenshot%202026-08-09%20at%2011.38.37\u{202f}AM.png";
+    assert!(
+        resolve_image_source(destination, Some(&dir)).is_some(),
+        "percent-encoded path failed to resolve"
+    );
+    assert!(resolve_image_source("missing%20file.png", Some(&dir)).is_none());
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+async fn test_image_size_syntax(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        ![sized|640](a.png)
+
+        ![sized dims|320x200](b.png)
+
+        ![unsized](c.png)
+    "});
+    cx.executor().run_until_parked();
+    let widths: Vec<Option<f32>> = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .filter_map(|block| match block.kind {
+                BlockRenderKind::Image { display_width, .. } => Some(display_width),
+                _ => None,
+            })
+            .collect()
+    });
+    assert_eq!(widths, vec![Some(640.), Some(320.), None]);
+}
+
+#[test]
+fn test_with_image_width_rewrites_alt() {
+    assert_eq!(
+        with_image_width("![alt](a.png)", 500).as_deref(),
+        Some("![alt|500](a.png)")
+    );
+    assert_eq!(
+        with_image_width("![alt|300](a.png)", 500).as_deref(),
+        Some("![alt|500](a.png)")
+    );
+    assert_eq!(
+        with_image_width("![alt|320x200](a.png)", 500).as_deref(),
+        Some("![alt|500](a.png)")
+    );
+    assert_eq!(
+        with_image_width("![](a.png)", 500).as_deref(),
+        Some("![|500](a.png)")
+    );
+    assert_eq!(
+        with_image_width("![ref style|300][img]", 500).as_deref(),
+        Some("![ref style|500][img]")
+    );
+    // A pipe that is not a size suffix stays intact.
+    assert_eq!(
+        with_image_width("![a|b](a.png)", 500).as_deref(),
+        Some("![a|b|500](a.png)")
+    );
+}
+
+#[gpui::test]
+async fn test_wikilinks_conceal(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        see [[CLAUDE]] and [[notes/plan|the plan]] here
+        embed stays raw: ![[image.png]]
+        code stays raw: `[[not a link]]`
+    "});
+    cx.executor().run_until_parked();
+    let display = cx.display_text();
+    assert!(display.contains("see CLAUDE and the plan here"), "{display}");
+    assert!(display.contains("embed stays raw: ![[image.png]]"), "{display}");
+    assert!(display.contains("code stays raw: [[not a link]]"), "{display}");
 }

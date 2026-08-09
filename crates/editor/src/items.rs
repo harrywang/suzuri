@@ -629,16 +629,15 @@ impl Item for Editor {
 
     fn handle_drop(
         &self,
-        active_pane: &workspace::Pane,
+        _active_pane: &workspace::Pane,
         dropped: &dyn std::any::Any,
         _window: &mut Window,
         cx: &mut App,
     ) -> bool {
-        // Edge drops promise a pane split in the drag overlay; only claim
-        // center drops for markdown link insertion.
-        if active_pane.drag_split_direction.is_some() {
-            return false;
-        }
+        // Drops anywhere on a markdown buffer insert links (Obsidian-style);
+        // the pane's split zones cover wide edge bands that made insertion
+        // unreliable when they took precedence. Splitting is still available
+        // via the tab bar or with non-markdown drops.
         if let Some(paths) = dropped.downcast_ref::<gpui::ExternalPaths>() {
             return handle_image_drop_on_markdown(self, paths.paths(), cx);
         }
@@ -2504,6 +2503,37 @@ impl settings::Settings for MarkdownAttachmentSettings {
     }
 }
 
+
+/// Inserts block-level markdown at the cursor, padded with blank lines so it
+/// cannot fuse with its neighbors: a following `---` would otherwise turn an
+/// inserted link line into a setext heading underline, and a preceding text
+/// line would absorb an inserted image into its paragraph.
+fn insert_dropped_markdown(editor: &Editor, mut markdown: String, cx: &mut App) {
+    use multi_buffer::{MultiBufferRow, ToOffset as _, ToPoint as _};
+
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let cursor = editor.selections.newest_anchor().head();
+    let offset = cursor.to_offset(&snapshot);
+    let point = cursor.to_point(&snapshot);
+
+    if point.column > 0 {
+        markdown.insert_str(0, "\n\n");
+    } else if point.row > 0 && snapshot.line_len(MultiBufferRow(point.row - 1)) > 0 {
+        markdown.insert(0, '\n');
+    }
+    let followed_by_text = snapshot
+        .chars_at(offset)
+        .next()
+        .is_some_and(|character| character != '\n');
+    if followed_by_text {
+        markdown.push('\n');
+    }
+
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit([(offset..offset, markdown)], None, cx);
+    });
+}
+
 /// The note's folder for a saved, local, singleton markdown buffer; the
 /// gate for all markdown drop handling.
 fn markdown_note_directory(editor: &Editor, cx: &App) -> Option<std::path::PathBuf> {
@@ -2529,8 +2559,6 @@ fn handle_project_entry_drop_on_markdown(
     selection: &workspace::DraggedSelection,
     cx: &mut App,
 ) -> bool {
-    use multi_buffer::{ToOffset as _, ToPoint as _};
-
     let Some(note_directory) = markdown_note_directory(editor, cx) else {
         return false;
     };
@@ -2571,15 +2599,7 @@ fn handle_project_entry_drop_on_markdown(
         return false;
     }
 
-    let snapshot = editor.buffer().read(cx).snapshot(cx);
-    let cursor = editor.selections.newest_anchor().head();
-    let offset = cursor.to_offset(&snapshot);
-    if cursor.to_point(&snapshot).column > 0 {
-        markdown_links.insert(0, '\n');
-    }
-    editor.buffer().update(cx, |multibuffer, cx| {
-        multibuffer.edit([(offset..offset, markdown_links)], None, cx);
-    });
+    insert_dropped_markdown(editor, markdown_links, cx);
     true
 }
 
@@ -2610,7 +2630,6 @@ fn handle_image_drop_on_markdown(
     paths: &[std::path::PathBuf],
     cx: &mut App,
 ) -> bool {
-    use multi_buffer::{ToOffset as _, ToPoint as _};
 
     let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
         return false;
@@ -2715,15 +2734,7 @@ fn handle_image_drop_on_markdown(
         return false;
     }
 
-    let snapshot = editor.buffer().read(cx).snapshot(cx);
-    let cursor = editor.selections.newest_anchor().head();
-    let offset = cursor.to_offset(&snapshot);
-    if cursor.to_point(&snapshot).column > 0 {
-        markdown_links.insert(0, '\n');
-    }
-    editor.buffer().update(cx, |multibuffer, cx| {
-        multibuffer.edit([(offset..offset, markdown_links)], None, cx);
-    });
+    insert_dropped_markdown(editor, markdown_links, cx);
     true
 }
 

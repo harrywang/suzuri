@@ -3,8 +3,10 @@
 //! When enabled, markdown syntax markers (`**`, `*`, `~~`, backticks, link
 //! targets, list bullets) are hidden and rendered inline, and block elements
 //! (headings, tables, images, mermaid diagrams, horizontal rules) are replaced
-//! with rendered widgets — except on the lines the cursor is on, where the raw
-//! markdown is revealed for editing, mirroring Obsidian's Live Preview mode.
+//! with rendered widgets. Raw markdown is revealed for editing per token: an
+//! inline construct reveals when the selection touches it, and a block
+//! reveals when the selection reaches its lines, mirroring Obsidian's Live
+//! Preview mode.
 
 use std::{any::TypeId, ops::Range, path::PathBuf, sync::Arc};
 
@@ -74,7 +76,17 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let mut subscriptions = Vec::new();
     subscriptions.push(cx.subscribe_self(|editor, event: &EditorEvent, cx| match event {
         EditorEvent::Reparsed(_) => recompute(editor, cx),
-        EditorEvent::SelectionsChanged { .. } => apply_decorations(editor, cx),
+        EditorEvent::SelectionsChanged { .. } => {
+            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                let resizing = addon
+                    .last_resize_at
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500));
+                if !resizing {
+                    addon.selected_image = None;
+                }
+            }
+            apply_decorations(editor, cx);
+        }
         _ => {}
     }));
 
@@ -106,6 +118,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         enabled_override: None,
         markers: None,
         applied_blocks: Vec::new(),
+        selected_image: None,
+        last_resize_at: None,
         _subscriptions: subscriptions,
     });
 
@@ -124,6 +138,12 @@ struct LivePreviewAddon {
     enabled_override: Option<bool>,
     markers: Option<Arc<MarkerSet>>,
     applied_blocks: Vec<AppliedBlock>,
+    /// The image widget currently selected (Obsidian-style click state),
+    /// identified by its marker range.
+    selected_image: Option<Range<Anchor>>,
+    /// When a resize drag last wrote a width, so selection isn't cleared by
+    /// the selection refresh that buffer edits trigger mid-drag.
+    last_resize_at: Option<std::time::Instant>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -157,6 +177,9 @@ struct MarkerSet {
     /// Definition lines are muted: the preview hides them entirely, but
     /// invisible text is confusing in an editor, so they recede instead.
     definition_ranges: Vec<Range<Anchor>>,
+    /// Ordered-list markers, restyled to the plain text color for
+    /// consistency with bullet glyphs.
+    ordered_markers: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -168,8 +191,13 @@ struct InlineMarker {
 #[derive(Clone)]
 enum InlineKind {
     /// Pure syntax to hide: emphasis delimiters, backticks, link brackets and
-    /// destinations, etc.
-    Hide,
+    /// destinations, etc. Reveals when the selection touches the enclosing
+    /// construct (per-token reveal), not the whole line.
+    Hide {
+        /// The whole construct (e.g. `**bold**` including delimiters); the
+        /// marker reveals when the selection touches this span.
+        reveal_span: Range<Anchor>,
+    },
     /// An unordered list marker, rendered as a bullet glyph.
     Bullet,
     /// A task list marker (`- [ ]` / `- [x]`), rendered as a clickable checkbox.
@@ -189,7 +217,7 @@ struct BlockMarker {
     indent_columns: u32,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum BlockRenderKind {
     /// Rendered through `MarkdownElement`.
     Markdown,
@@ -199,6 +227,15 @@ enum BlockRenderKind {
     /// YAML/TOML frontmatter, rendered as a compact properties card instead
     /// of the markdown crate's oversized metadata table.
     Frontmatter,
+    /// A standalone image, width-capped and honoring Obsidian's
+    /// `![alt|640](path)` size syntax. When the destination is known the
+    /// widget renders a bare image element (which the selection border hugs
+    /// exactly); reference-style images fall back to the markdown renderer.
+    Image {
+        display_width: Option<f32>,
+        destination: Option<String>,
+        alt: String,
+    },
 }
 
 struct AppliedBlock {
@@ -243,6 +280,7 @@ fn apply_emphasis_highlights(editor: &mut Editor, markers: Option<&MarkerSet>, c
     const BOLD: usize = 2;
     const LINK: usize = 3;
     const DEFINITION: usize = 4;
+    const ORDERED_MARKER: usize = 5;
     let text_color = cx.theme().colors().text;
     let accent_color = cx.theme().colors().text_accent;
     let muted_color = cx.theme().colors().text_muted;
@@ -294,6 +332,14 @@ fn apply_emphasis_highlights(editor: &mut Editor, markers: Option<&MarkerSet>, c
                 ..Default::default()
             },
         ),
+        (
+            ORDERED_MARKER,
+            markers.map(|markers| markers.ordered_markers.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                ..Default::default()
+            },
+        ),
     ];
     for (key, ranges, style) in sets {
         match ranges {
@@ -324,6 +370,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     remove_stale_restored_folds(editor, cx);
 
     let selection_rows = selection_row_ranges(editor, &snapshot);
+    let selection_offsets = selection_offset_ranges(editor, &snapshot);
 
     // --- Inline concealments ---
 
@@ -335,7 +382,19 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         if start >= end {
             continue;
         }
-        if rows_intersect(&selection_rows, start.row, end.row) {
+        // Per-token: reveal only when the selection touches the marker's
+        // enclosing construct (for list markers, the marker itself), leaving
+        // the rest of the line rendered.
+        let reveal_span = match &marker.kind {
+            InlineKind::Hide { reveal_span } => reveal_span,
+            InlineKind::Bullet | InlineKind::Checkbox { .. } => &marker.range,
+        };
+        let span =
+            reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
+        let revealed = selection_offsets
+            .iter()
+            .any(|selection| selection.start <= span.end && span.start <= selection.end);
+        if revealed {
             continue;
         }
         concealments.push(Concealment {
@@ -366,7 +425,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         }
         // Reference links/images inside a widget resolve against the whole
         // document's definitions, which live outside the widget's slice.
-        if marker.kind == BlockRenderKind::Markdown && !markers.definitions.is_empty() {
+        if matches!(
+            marker.kind,
+            BlockRenderKind::Markdown | BlockRenderKind::Image { .. }
+        ) && !markers.definitions.is_empty()
+        {
             source.push_str("\n\n");
             source.push_str(&markers.definitions);
         }
@@ -400,7 +463,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         .as_singleton()
         .and_then(|buffer| buffer.read(cx).language_registry());
     for (marker, source) in desired_blocks.into_values() {
-        let render = match marker.kind {
+        let render = match &marker.kind {
             BlockRenderKind::Markdown => {
                 let markdown = cx.new(|cx| {
                     Markdown::new_with_options(
@@ -423,12 +486,42 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     marker.indent_columns,
                 )
             }
+            BlockRenderKind::Image {
+                display_width,
+                destination,
+                alt,
+            } => {
+                let markdown = cx.new(|cx| {
+                    Markdown::new_with_options(
+                        SharedString::from(source.clone()),
+                        language_registry.clone(),
+                        None,
+                        markdown::MarkdownOptions {
+                            parse_html: true,
+                            render_mermaid_diagrams: true,
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                });
+                render_image_block(
+                    markdown,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    base_directory.clone(),
+                    marker.indent_columns,
+                    *display_width,
+                    destination.clone(),
+                    SharedString::from(alt.clone()),
+                )
+            }
             BlockRenderKind::Rule => {
                 render_rule_block(weak_editor.clone(), marker.range.clone(), marker.indent_columns)
             }
             BlockRenderKind::Frontmatter => {
                 render_frontmatter_block(weak_editor.clone(), marker.range.clone(), source.clone())
             }
+
         };
         blocks_to_insert.push(BlockProperties {
             placement: BlockPlacement::Replace(marker.range.start..=marker.range.end),
@@ -527,6 +620,20 @@ fn selection_row_ranges(editor: &Editor, snapshot: &MultiBufferSnapshot) -> Vec<
     rows
 }
 
+/// Selection ranges as offsets, including the pending mouse selection.
+fn selection_offset_ranges(editor: &Editor, snapshot: &MultiBufferSnapshot) -> Vec<Range<usize>> {
+    let mut offsets = Vec::new();
+    for selection in editor.selections.disjoint_anchors().iter() {
+        let range = selection.range();
+        offsets.push(range.start.to_offset(snapshot).0..range.end.to_offset(snapshot).0);
+    }
+    if let Some(pending) = editor.selections.pending_anchor() {
+        let range = pending.range();
+        offsets.push(range.start.to_offset(snapshot).0..range.end.to_offset(snapshot).0);
+    }
+    offsets
+}
+
 fn rows_intersect(selection_rows: &[Range<u32>], start_row: u32, end_row: u32) -> bool {
     selection_rows
         .iter()
@@ -538,11 +645,11 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
     // default placeholder text, whose visual is replaced by the rendered
     // element at its measured width.
     let collapsed_text = match &marker.kind {
-        InlineKind::Hide => Some(SharedString::new_static("")),
+        InlineKind::Hide { .. } => Some(SharedString::new_static("")),
         InlineKind::Bullet | InlineKind::Checkbox { .. } => None,
     };
     let render: Arc<dyn Send + Sync + Fn(_, _, &mut App) -> gpui::AnyElement> = match &marker.kind {
-        InlineKind::Hide => Arc::new(|_, _, _| Empty.into_any_element()),
+        InlineKind::Hide { .. } => Arc::new(|_, _, _| Empty.into_any_element()),
         InlineKind::Bullet => Arc::new(|_, _, cx| {
             let theme_settings = theme_settings::ThemeSettings::get_global(cx);
             div()
@@ -587,7 +694,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
 
 fn marker_content_key(kind: &InlineKind) -> u64 {
     match kind {
-        InlineKind::Hide => 0,
+        InlineKind::Hide { .. } => 0,
         InlineKind::Bullet => 1,
         InlineKind::Checkbox { checked, .. } => 2 + u64::from(*checked),
     }
@@ -660,6 +767,269 @@ fn render_markdown_block(
             )
             .into_any_element()
     })
+}
+
+/// Drag payload for the image resize handle; renders no preview.
+struct ImageResizeDrag {
+    range: Range<Anchor>,
+    content_left_offset: gpui::Pixels,
+}
+
+struct EmptyDragPreview;
+
+impl gpui::Render for EmptyDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// Rewrites (or inserts) Obsidian's `|width` suffix in an image's alt text.
+fn with_image_width(image_markdown: &str, width: u32) -> Option<String> {
+    let alt_start = image_markdown.find("![")? + 2;
+    let alt_end = alt_start + image_markdown.get(alt_start..)?.find(']')?;
+    let alt = image_markdown.get(alt_start..alt_end)?;
+    let base_alt = alt.rsplit_once('|').map_or(alt, |(base, suffix)| {
+        if suffix.chars().all(|c| c.is_ascii_digit() || c == 'x') && !suffix.is_empty() {
+            base
+        } else {
+            alt
+        }
+    });
+    Some(format!(
+        "{}{}|{}{}",
+        &image_markdown[..alt_start],
+        base_alt,
+        width,
+        &image_markdown[alt_end..]
+    ))
+}
+
+/// An Obsidian-style image widget: click to select, showing a border, a
+/// corner drag handle that resizes by rewriting `|width` into the source,
+/// and a code button that reveals the raw markdown.
+fn render_image_block(
+    markdown: Entity<Markdown>,
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    base_directory: Option<PathBuf>,
+    indent_columns: u32,
+    display_width: Option<f32>,
+    destination: Option<String>,
+    alt: SharedString,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let mut style = block_markdown_style(block_cx.window, block_cx.app);
+        // Suppress the paragraph's trailing margin so the selection border
+        // hugs the image instead of leaving a gap beneath it.
+        style.height_is_multiple_of_line_height = true;
+        let start = range.start;
+        let base_directory = base_directory.clone();
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let max_width = block_cx.max_width;
+        let accent = block_cx.app.theme().colors().text_accent;
+        let surface = block_cx.app.theme().colors().elevated_surface_background;
+
+        // Images render at their explicit width, or capped at two thirds of
+        // the pane so screenshots do not dominate the note.
+        let content_width = display_width
+            .map(|width| gpui::px(width).min(max_width))
+            .map(gpui::Length::from);
+
+        let selected = editor
+            .upgrade()
+            .map(|editor_entity| {
+                let editor_ref = editor_entity.read(block_cx.app);
+                let snapshot = editor_ref.buffer().read(block_cx.app).snapshot(block_cx.app);
+                editor_ref
+                    .addon::<LivePreviewAddon>()
+                    .and_then(|addon| addon.selected_image.as_ref())
+                    .is_some_and(|selection| {
+                        selection.start.to_offset(&snapshot) == range.start.to_offset(&snapshot)
+                            && selection.end.to_offset(&snapshot) == range.end.to_offset(&snapshot)
+                    })
+            })
+            .unwrap_or(false);
+
+        let select_editor = editor.clone();
+        let select_range = range.clone();
+        let reveal_editor = editor.clone();
+        let drag_editor = editor.clone();
+        let drag_range = range.clone();
+
+        // A direct image element lets the selection border hug the image
+        // exactly; reference-style images (no inline destination) fall back
+        // to the markdown renderer.
+        let resolved = destination
+            .as_deref()
+            .and_then(|destination| resolve_image_source(destination, base_directory.as_deref()));
+        let muted = block_cx.app.theme().colors().text_muted;
+        let image_content: gpui::AnyElement = match (&destination, resolved) {
+            (Some(_), Some(source)) => {
+                let fallback_alt = alt.clone();
+                gpui::img(source)
+                    .id(("mdlp-image", f32::from(max_width) as u64))
+                    .max_w_full()
+                    .rounded_sm()
+                    .when(content_width.is_some(), |this| this.w_full())
+                    .with_fallback(move || {
+                        div()
+                            .text_color(muted)
+                            .child(fallback_alt.clone())
+                            .into_any_element()
+                    })
+                    .into_any_element()
+            }
+            (Some(_), None) => div()
+                .text_color(muted)
+                .child(alt.clone())
+                .into_any_element(),
+            (None, _) => MarkdownElement::new(markdown.clone(), style)
+                .image_resolver(move |destination| {
+                    resolve_image_source(destination, base_directory.as_deref())
+                })
+                .into_any_element(),
+        };
+
+        let mut content = div()
+            .relative()
+            .border_2()
+            .rounded_sm()
+            .map(|this| {
+                if selected {
+                    this.border_color(accent)
+                } else {
+                    this.border_color(gpui::transparent_black())
+                }
+            })
+            .when_some(content_width, |this, width| this.w(width))
+            .when(content_width.is_none(), |this| {
+                this.max_w(max_width * 0.66)
+            })
+            .child(image_content);
+
+        if selected {
+            content = content
+                .child(
+                    // Reveal-source button, top right.
+                    div()
+                        .absolute()
+                        .top_1()
+                        .right_1()
+                        .child(
+                            IconButton::new("mdlp-show-source", IconName::Code)
+                                .style(ButtonStyle::Filled)
+                                .on_click(move |_, window, cx| {
+                                    cx.stop_propagation();
+                                    reveal_editor
+                                        .update(cx, |editor, cx| {
+                                            let snapshot =
+                                                editor.buffer().read(cx).snapshot(cx);
+                                            let offset = start.to_offset(&snapshot);
+                                            editor.change_selections(
+                                                Default::default(),
+                                                window,
+                                                cx,
+                                                |selections| {
+                                                    selections
+                                                        .select_ranges([offset..offset]);
+                                                },
+                                            );
+                                        })
+                                        .log_err();
+                                }),
+                        ),
+                )
+                .child(
+                    // Resize handle, bottom right.
+                    div()
+                        .id("mdlp-resize-handle")
+                        .absolute()
+                        .bottom_neg_1()
+                        .right_neg_1()
+                        .size_3()
+                        .rounded_full()
+                        .border_2()
+                        .border_color(accent)
+                        .bg(surface)
+                        .cursor_col_resize()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_drag(
+                            ImageResizeDrag {
+                                range: drag_range,
+                                content_left_offset: gutter_width,
+                            },
+                            |_, _, _, cx| cx.new(|_| EmptyDragPreview),
+                        ),
+                );
+        }
+
+        div()
+            .pl(gutter_width)
+            .w(max_width)
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                cx.stop_propagation();
+                select_editor
+                    .update(cx, |editor, cx| {
+                        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                            addon.selected_image = Some(select_range.clone());
+                        }
+                        cx.notify();
+                    })
+                    .log_err();
+            })
+            .on_drag_move::<ImageResizeDrag>(move |event, _window, cx| {
+                let drag = event.drag(cx);
+                let width = (event.event.position.x
+                    - event.bounds.left()
+                    - drag.content_left_offset)
+                    .max(gpui::px(64.));
+                let width = (f32::from(width) / 4.).round() * 4.;
+                let drag_range = drag.range.clone();
+                drag_editor
+                    .update(cx, |editor, cx| {
+                        resize_image_to_width(editor, &drag_range, width as u32, cx);
+                    })
+                    .log_err();
+            })
+            .child(div().max_w(max_width).child(content))
+            .into_any_element()
+    })
+}
+
+/// Writes `|width` into the image markdown at `range`, throttled to actual
+/// changes; the edit round-trips through the normal reparse pipeline, so the
+/// widget re-renders at the new size and the whole drag undoes as one step.
+fn resize_image_to_width(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    width: u32,
+    cx: &mut Context<Editor>,
+) {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let start = range.start.to_offset(&snapshot);
+    let end = range.end.to_offset(&snapshot);
+    if start >= end {
+        return;
+    }
+    let current: String = snapshot.text_for_range(start..end).collect();
+    let Some(updated) = with_image_width(current.trim(), width) else {
+        return;
+    };
+    if updated == current.trim() {
+        return;
+    }
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.last_resize_at = Some(std::time::Instant::now());
+        // Keep the widget selected across the rewrite.
+        addon.selected_image = Some(range.clone());
+    }
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit([(start..end, updated)], None, cx);
+    });
 }
 
 fn render_rule_block(
@@ -776,7 +1146,11 @@ fn resolve_image_source(
             destination.to_string(),
         ))));
     }
-    let path = std::path::Path::new(destination);
+    // Markdown links percent-encode spaces; the filesystem stores them raw.
+    let decoded = urlencoding::decode(destination)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| destination.to_string());
+    let path = std::path::Path::new(&decoded);
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -822,6 +1196,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     let mut extraction = Extraction {
         text: &text,
         snapshot: &multibuffer_snapshot,
+        prose_regions: Vec::new(),
+        code_spans: Vec::new(),
         inline: Vec::new(),
         blocks: Vec::new(),
         strikethrough: Vec::new(),
@@ -830,6 +1206,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         link_text: Vec::new(),
         definitions: Vec::new(),
         definition_ranges: Vec::new(),
+        ordered_markers: Vec::new(),
     };
 
     for layer in buffer_snapshot.syntax_layers() {
@@ -841,6 +1218,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         }
     }
 
+    extraction.scan_wikilinks();
+
     let Extraction {
         inline,
         mut blocks,
@@ -850,6 +1229,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         link_text,
         definitions,
         definition_ranges,
+        ordered_markers,
         ..
     } = extraction;
 
@@ -886,12 +1266,17 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         link_text,
         definitions: definitions.join("\n"),
         definition_ranges,
+        ordered_markers,
     })
 }
 
 struct Extraction<'a> {
     text: &'a str,
     snapshot: &'a MultiBufferSnapshot,
+    /// Prose regions (the block grammar's `inline` nodes) and code spans,
+    /// used to scan for wikilinks only where they can occur.
+    prose_regions: Vec<Range<usize>>,
+    code_spans: Vec<Range<usize>>,
     inline: Vec<InlineMarker>,
     blocks: Vec<BlockMarker>,
     strikethrough: Vec<Range<Anchor>>,
@@ -900,6 +1285,7 @@ struct Extraction<'a> {
     link_text: Vec<Range<Anchor>>,
     definitions: Vec<String>,
     definition_ranges: Vec<Range<Anchor>>,
+    ordered_markers: Vec<Range<Anchor>>,
 }
 
 impl Extraction<'_> {
@@ -911,11 +1297,13 @@ impl Extraction<'_> {
             ..self.snapshot.anchor_before(MultiBufferOffset(range.end))
     }
 
-    fn hide(&mut self, range: Range<usize>) {
+    fn hide(&mut self, range: Range<usize>, reveal_span: Range<usize>) {
         if range.start < range.end {
             self.inline.push(InlineMarker {
                 range: self.anchor_range(range),
-                kind: InlineKind::Hide,
+                kind: InlineKind::Hide {
+                    reveal_span: self.anchor_range(reveal_span),
+                },
             });
         }
     }
@@ -1039,6 +1427,7 @@ impl Extraction<'_> {
                     self.list_item_markers(node);
                     push_children(node, &mut stack);
                 }
+                "inline" => self.prose_regions.push(node.byte_range()),
                 _ => push_children(node, &mut stack),
             }
         }
@@ -1054,6 +1443,17 @@ impl Extraction<'_> {
             match child.kind() {
                 "list_marker_minus" | "list_marker_plus" | "list_marker_star" => {
                     list_marker = Some(child);
+                }
+                "list_marker_dot" | "list_marker_parenthesis" => {
+                    let Some(marker_text) = self.text.get(child.byte_range()) else {
+                        continue;
+                    };
+                    let trimmed_len = marker_text.trim_end().len();
+                    if trimmed_len > 0 {
+                        let start = child.start_byte();
+                        let range = self.anchor_range(start..start + trimmed_len);
+                        self.ordered_markers.push(range);
+                    }
                 }
                 "task_list_marker_checked" => task_marker = Some((child, true)),
                 "task_list_marker_unchecked" => task_marker = Some((child, false)),
@@ -1107,18 +1507,19 @@ impl Extraction<'_> {
                             continue;
                         };
                         if child.kind() == "emphasis_delimiter" {
-                            self.hide(child.byte_range());
+                            self.hide(child.byte_range(), node.byte_range());
                         }
                     }
                     push_children(node, &mut stack);
                 }
                 "code_span" => {
+                    self.code_spans.push(node.byte_range());
                     for index in 0..node.child_count() as u32 {
                         let Some(child) = node.child(index) else {
                             continue;
                         };
                         if child.kind() == "code_span_delimiter" {
-                            self.hide(child.byte_range());
+                            self.hide(child.byte_range(), node.byte_range());
                         }
                     }
                 }
@@ -1136,10 +1537,10 @@ impl Extraction<'_> {
                         }
                     }
                     if let Some(open) = open_bracket {
-                        self.hide(open.byte_range());
+                        self.hide(open.byte_range(), node.byte_range());
                     }
                     if let Some(close) = close_bracket {
-                        self.hide(close.start_byte()..node.end_byte());
+                        self.hide(close.start_byte()..node.end_byte(), node.byte_range());
                     }
                     if let (Some(open), Some(close)) = (open_bracket, close_bracket)
                         && open.end_byte() < close.start_byte()
@@ -1176,10 +1577,11 @@ impl Extraction<'_> {
                             ..self
                                 .snapshot
                                 .anchor_after(MultiBufferOffset(image_range.end));
+                        let kind = self.image_kind(image_node);
                         self.blocks.push(BlockMarker {
                             range,
                             height_estimate: 8,
-                            kind: BlockRenderKind::Markdown,
+                            kind,
                             indent_columns: 0,
                         });
                     }
@@ -1188,11 +1590,20 @@ impl Extraction<'_> {
                 "uri_autolink" | "email_autolink" => {
                     let range = node.byte_range();
                     if range.len() >= 2 {
-                        self.hide(range.start..range.start + 1);
-                        self.hide(range.end - 1..range.end);
+                        self.hide(range.start..range.start + 1, range.clone());
+                        self.hide(range.end - 1..range.end, range.clone());
                     }
                 }
                 "image" => {
+                    // `![[...]]` is an Obsidian embed, not a markdown image;
+                    // leave it raw rather than concealing it half-way.
+                    if self
+                        .text
+                        .get(node.byte_range())
+                        .is_some_and(|text| text.starts_with("![["))
+                    {
+                        continue;
+                    }
                     if self.is_alone_on_line(node) {
                         self.image_block(node);
                     } else if let Some(description) = (0..node.child_count() as u32)
@@ -1201,13 +1612,70 @@ impl Extraction<'_> {
                     {
                         // The image itself cannot render mid-line, but the
                         // alt text can: conceal `![` and `](url)` like links.
-                        self.hide(node.start_byte()..description.start_byte());
-                        self.hide(description.end_byte()..node.end_byte());
+                        self.hide(
+                            node.start_byte()..description.start_byte(),
+                            node.byte_range(),
+                        );
+                        self.hide(description.end_byte()..node.end_byte(), node.byte_range());
                     }
                 }
                 _ => push_children(node, &mut stack),
             }
         }
+    }
+
+    /// Conceal Obsidian-style wikilinks: `[[Note]]`, `[[Note|alias]]`, and
+    /// `[[Note#heading]]`. Zed's markdown grammar has no wikilink nodes, so
+    /// this scans the prose regions directly, skipping code spans; embeds
+    /// (`![[...]]`) are left raw.
+    fn scan_wikilinks(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            while let Some(open_offset) = region_text[search_from..].find("[[") {
+                let open = search_from + open_offset;
+                let Some(close_offset) = region_text[open + 2..].find("]]") else {
+                    break;
+                };
+                let close = open + 2 + close_offset;
+                search_from = close + 2;
+
+                let inner = &region_text[open + 2..close];
+                if inner.is_empty() || inner.contains('\n') || inner.contains("[[") {
+                    continue;
+                }
+                let is_embed = region_text[..open].ends_with('!');
+                let start = region.start + open;
+                let end = region.start + close + 2;
+                if is_embed
+                    || self
+                        .code_spans
+                        .iter()
+                        .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+
+                let reveal = start..end;
+                if let Some(pipe) = inner.find('|') {
+                    // `[[target|alias]]`: show only the alias.
+                    self.hide(start..start + 2 + pipe + 1, reveal.clone());
+                    self.hide(end - 2..end, reveal.clone());
+                    let alias_start = start + 2 + pipe + 1;
+                    let range = self.anchor_range(alias_start..end - 2);
+                    self.link_text.push(range);
+                } else {
+                    self.hide(start..start + 2, reveal.clone());
+                    self.hide(end - 2..end, reveal.clone());
+                    let range = self.anchor_range(start + 2..end - 2);
+                    self.link_text.push(range);
+                }
+            }
+        }
+        self.prose_regions = regions;
     }
 
     /// Whether this single-line node is the only content on its line.
@@ -1226,12 +1694,49 @@ impl Extraction<'_> {
             .is_some_and(|node_text| line_text.trim() == node_text.trim())
     }
 
+    /// Obsidian's image size syntax: `![alt|640](p)` or `![alt|640x480](p)`.
+    fn image_display_width(&self, image_node: tree_sitter::Node) -> Option<f32> {
+        let (_, size) = self.image_alt(image_node)?.rsplit_once('|')?;
+        let width: String = size.chars().take_while(|c| c.is_ascii_digit()).collect();
+        width.parse::<f32>().ok().filter(|width| *width > 0.)
+    }
+
+    fn image_alt(&self, image_node: tree_sitter::Node) -> Option<&str> {
+        let description = (0..image_node.child_count() as u32)
+            .filter_map(|index| image_node.child(index))
+            .find(|child| child.kind() == "image_description")?;
+        self.text.get(description.byte_range())
+    }
+
+    fn image_destination(&self, image_node: tree_sitter::Node) -> Option<String> {
+        let destination = (0..image_node.child_count() as u32)
+            .filter_map(|index| image_node.child(index))
+            .find(|child| child.kind() == "link_destination")?;
+        self.text
+            .get(destination.byte_range())
+            .map(|text| text.to_string())
+    }
+
+    fn image_kind(&self, image_node: tree_sitter::Node) -> BlockRenderKind {
+        let alt = self
+            .image_alt(image_node)
+            .map(|alt| alt.rsplit_once('|').map_or(alt, |(base, _)| base))
+            .unwrap_or_default()
+            .to_string();
+        BlockRenderKind::Image {
+            display_width: self.image_display_width(image_node),
+            destination: self.image_destination(image_node),
+            alt,
+        }
+    }
+
     /// Renders an image as a block widget when it is the only content on its
     /// line; inline images are left as raw markdown.
     fn image_block(&mut self, node: tree_sitter::Node) {
         if self.is_alone_on_line(node) {
             let row = node.start_position().row as u32;
-            self.push_block_rows(row, row, 8, BlockRenderKind::Markdown);
+            let kind = self.image_kind(node);
+            self.push_block_rows(row, row, 8, kind);
         }
     }
 }

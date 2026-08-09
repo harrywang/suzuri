@@ -18,7 +18,11 @@ impl EditorSnapshot {
         window: &mut Window,
         cx: &mut App,
     ) -> Option<AnyElement> {
-        let folded = self.is_line_folded(buffer_row);
+        // Query the fold map directly rather than `is_line_folded`, which
+        // also reports rows replaced by custom blocks (e.g. rendered markdown
+        // widgets); the toggle this chevron drives only unfolds fold-map
+        // folds.
+        let folded = self.fold_snapshot().is_line_folded(buffer_row);
         let mut is_foldable = false;
 
         if let Some(crease) = self
