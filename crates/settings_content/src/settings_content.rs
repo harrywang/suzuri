@@ -1226,6 +1226,12 @@ pub struct MarkdownLivePreviewSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// Folder for attachments dropped onto a markdown buffer, relative to
+    /// the note's folder. An empty string stores attachments directly in
+    /// the note's folder.
+    ///
+    /// Default: "attachments"
+    pub attachments_folder: Option<String>,
 }
 
 /// The settings for the image viewer.
