@@ -10838,6 +10838,7 @@ dependencies = [
  "gpui",
  "indoc",
  "language",
+ "log",
  "markdown",
  "multi_buffer",
  "pretty_assertions",

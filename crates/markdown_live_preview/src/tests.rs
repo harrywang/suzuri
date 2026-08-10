@@ -751,3 +751,716 @@ async fn test_wikilinks_conceal(cx: &mut TestAppContext) {
     assert!(display.contains("embed stays raw: ![[image.png]]"), "{display}");
     assert!(display.contains("code stays raw: [[not a link]]"), "{display}");
 }
+
+#[gpui::test]
+async fn test_table_structure_extraction(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | Left | Center | Right |
+        |:-----|:------:|------:|
+        | a    |   b    |     c |
+        | d    |   e    |     f |
+    "});
+    cx.executor().run_until_parked();
+    let (structure, cell_texts) = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let markers = extract_markers(editor, cx).unwrap();
+        let structure = markers
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(structure) => Some(structure.clone()),
+                _ => None,
+            })
+            .expect("table structure");
+        let texts: Vec<String> = structure
+            .cells_in_order()
+            .iter()
+            .map(|range| {
+                let start = range.start.to_offset(&snapshot);
+                let end = range.end.to_offset(&snapshot);
+                snapshot
+                    .text_for_range(start..end)
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        (structure, texts)
+    });
+    assert_eq!(structure.header.len(), 3);
+    assert_eq!(structure.rows.len(), 2);
+    assert_eq!(
+        structure.alignments,
+        vec![
+            CellAlignment::Left,
+            CellAlignment::Center,
+            CellAlignment::Right
+        ]
+    );
+    assert_eq!(
+        cell_texts,
+        vec!["Left", "Center", "Right", "a", "b", "c", "d", "e", "f"]
+    );
+
+    // Empty cells omitted from the syntax tree are padded to a rectangle.
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B | C |
+        |---|---|---|
+        | 1 |   | 3 |
+        |   | 2 |   |
+    "});
+    cx.executor().run_until_parked();
+    let structure = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(structure) => Some(structure.clone()),
+                _ => None,
+            })
+            .expect("table structure")
+    });
+    assert_eq!(structure.header.len(), 3);
+    assert!(structure.rows.iter().all(|row| row.len() == 3));
+    // Empty cells sit between pipes, so they are real editable ranges with
+    // correct column identity — never sentinels shifted to the row's end.
+    let row_texts: Vec<Vec<String>> = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        structure
+            .rows
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        assert!(cell.start != Anchor::Min, "unexpected sentinel cell");
+                        let start = cell.start.to_offset(&snapshot);
+                        let end = cell.end.to_offset(&snapshot);
+                        snapshot
+                            .text_for_range(start..end)
+                            .collect::<String>()
+                            .trim()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .collect()
+    });
+    assert_eq!(row_texts, vec![vec!["1", "", "3"], vec!["", "2", ""]]);
+}
+
+#[gpui::test]
+async fn test_table_structural_changes(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | 1 | 2 |
+    "});
+    cx.executor().run_until_parked();
+    let range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(_) => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("table")
+    });
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(editor, &range, TableStructuralChange::AddColumn, cx);
+    });
+    cx.executor().run_until_parked();
+    assert!(cx.buffer_text().contains("| A | B |   |"), "{}", cx.buffer_text());
+
+    // Reuse the now-stale range on purpose: structural ops must re-resolve the
+    // table from the live tree, since widget closures outlive edits.
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(editor, &range, TableStructuralChange::AddRow, cx);
+    });
+    cx.executor().run_until_parked();
+    let text = cx.buffer_text();
+    let table_lines: Vec<&str> = text.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(table_lines.len(), 4, "{text}");
+    assert!(
+        text.lines().filter(|line| line.starts_with('|')).all(|line| line.matches('|').count() == 4),
+        "every table line should have 3 columns after the changes: {text}"
+    );
+    assert_eq!(table_lines.len(), 4, "{text}");
+}
+
+
+#[gpui::test]
+async fn test_add_row_no_outer_pipes(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        Name | Value
+        --- | ---
+        alpha | 1
+        beta | 2
+
+        after
+    "});
+    cx.executor().run_until_parked();
+    let range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(_) => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("table")
+    });
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(editor, &range, TableStructuralChange::AddRow, cx);
+    });
+    cx.executor().run_until_parked();
+    let text = cx.buffer_text();
+    let table_lines: Vec<&str> = text.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(
+        table_lines,
+        vec![
+            "| Name | Value |",
+            "| --- | --- |",
+            "| alpha | 1 |",
+            "| beta | 2 |",
+            "|   |   |",
+        ],
+        "full text: {text:?}"
+    );
+    assert!(text.contains("\n\nafter"), "must not eat the blank line: {text:?}");
+}
+
+#[gpui::test]
+async fn test_rapid_structural_changes_between_reparses(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | 1 | 2 |
+    "});
+    cx.executor().run_until_parked();
+    let range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(_) => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("table")
+    });
+    // Two clicks in quick succession: no run_until_parked between them, so
+    // the second acts before any reparse — it must still resolve the table
+    // from live text instead of the stale tree.
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(editor, &range, TableStructuralChange::AddRow, cx);
+        apply_table_structural_change(editor, &range, TableStructuralChange::AddRow, cx);
+        apply_table_structural_change(editor, &range, TableStructuralChange::AddColumn, cx);
+    });
+    cx.executor().run_until_parked();
+    let text = cx.buffer_text();
+    let table_lines: Vec<&str> = text.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(
+        table_lines,
+        vec![
+            "| A | B |   |",
+            "| --- | --- | --- |",
+            "| 1 | 2 |   |",
+            "|   |   |   |",
+            "|   |   |   |",
+        ],
+        "full text: {text:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_add_row_extends_widget_over_empty_row(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇMinimal table without outer pipes:
+
+        Name | Value
+        --- | ---
+        alpha | 1
+        beta | 2
+
+        Table with empty cells:
+    "});
+    cx.executor().run_until_parked();
+    let range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(_) => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("table")
+    });
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(editor, &range, TableStructuralChange::AddRow, cx);
+    });
+    cx.executor().run_until_parked();
+    // tree-sitter-md errors on the all-empty row and ends its table node
+    // early; the widget must still span the full textual table.
+    let tables: Vec<(u32, u32, usize)> = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                BlockRenderKind::Table(structure) => Some((
+                    block.range.start.to_point(&snapshot).row,
+                    block.range.end.to_point(&snapshot).row,
+                    structure.rows.len(),
+                )),
+                _ => None,
+            })
+            .collect()
+    });
+    assert_eq!(tables, vec![(2, 6, 3)], "text: {:?}", cx.buffer_text());
+}
+
+#[gpui::test]
+async fn test_table_reveals_only_via_button(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | 1 | 2 |
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    // Cursor inside the table does NOT reveal its source.
+    cx.set_state(indoc::indoc! {"
+        plain line
+
+        | A | B |
+        | --- | --- |
+        | 1 |ˇ 2 |
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    // Marking the block explicitly revealed (what the `</>` button does)
+    // removes the widget while the cursor stays inside.
+    cx.update_editor(|editor, _, cx| {
+        let range = extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(_) => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("table");
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.source_revealed = Some(range);
+        }
+        apply_decorations(editor, cx);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 0);
+
+    // Moving the cursor out re-renders the widget and clears the reveal.
+    cx.set_state(indoc::indoc! {"
+        plain lineˇ
+
+        | A | B |
+        | --- | --- |
+        | 1 | 2 |
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    let cleared = cx.update_editor(|editor, _, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.source_revealed.clone())
+            .is_none()
+    });
+    assert!(cleared, "reveal must clear when the selection leaves the block");
+}
+
+#[gpui::test]
+async fn test_move_and_delete_rows_columns(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B | C |
+        | --- | --- | --- |
+        | 1 | 2 | 3 |
+        | x | y | z |
+    "});
+    cx.executor().run_until_parked();
+    let range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(_) => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("table")
+    });
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(
+            editor,
+            &range,
+            TableStructuralChange::MoveRow { from: 0, to: 1 },
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+    assert!(
+        cx.buffer_text().contains("| x | y | z |\n| 1 | 2 | 3 |"),
+        "{}",
+        cx.buffer_text()
+    );
+
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(
+            editor,
+            &range,
+            TableStructuralChange::MoveColumn { from: 0, to: 2 },
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+    // Move semantics: remove+insert (drag across positions), not swap.
+    assert!(
+        cx.buffer_text().contains("| B | C | A |"),
+        "{}",
+        cx.buffer_text()
+    );
+
+    cx.update_editor(|editor, _, cx| {
+        apply_table_structural_change(editor, &range, TableStructuralChange::DeleteRow(1), cx);
+        apply_table_structural_change(editor, &range, TableStructuralChange::DeleteColumn(1), cx);
+    });
+    cx.executor().run_until_parked();
+    let text = cx.buffer_text();
+    assert!(text.contains("| B | A |"), "{text}");
+    assert!(text.contains("| y | x |"), "{text}");
+    assert!(!text.contains("| 1 |"), "deleted row should be gone: {text}");
+}
+
+#[gpui::test]
+async fn test_drag_row_reorders_via_mouse(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | one | 1 |
+        | two | 2 |
+    "});
+    cx.executor().run_until_parked();
+
+    let handle = cx
+        .cx
+        .debug_bounds("mdlp-row-handle-0")
+        .expect("row handle rendered");
+    let target = cx
+        .cx
+        .debug_bounds("mdlp-cell-1-0")
+        .expect("target cell rendered");
+
+    let start = handle.center();
+    cx.cx
+        .simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+    // Cross the drag threshold, then hover the target row.
+    cx.cx.simulate_mouse_move(
+        start + gpui::point(gpui::px(0.), gpui::px(6.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    let below_target = target.center() + gpui::point(gpui::px(0.), target.size.height * 0.3);
+    cx.cx.simulate_mouse_move(
+        below_target,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+
+    let (drag_active, source_set, boundary_set) = cx.update_editor(|editor, _, cx| {
+        let addon = editor.addon::<LivePreviewAddon>().expect("addon");
+        (
+            cx.has_active_drag(),
+            addon.drag_source.as_ref().map(|s| s.unit),
+            addon.drop_boundary.as_ref().map(|(_, boundary)| *boundary),
+        )
+    });
+    assert!(drag_active, "drag should be active after moving past threshold");
+    assert_eq!(source_set, Some(TableUnit::Row(0)), "source should be recorded");
+    assert_eq!(
+        boundary_set,
+        Some(TableBoundary::Row(2)),
+        "lower half of row 1 should target the boundary below it"
+    );
+
+    cx.cx.simulate_mouse_up(
+        below_target,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+
+    let text = cx.buffer_text();
+    let rows: Vec<&str> = text.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(
+        rows,
+        vec!["| A | B |", "| --- | --- |", "| two | 2 |", "| one | 1 |"],
+        "rows should be reordered by the drop: {text:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_drag_row_drop_anywhere_on_table(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | one | 1 |
+        | two | 2 |
+    "});
+    cx.executor().run_until_parked();
+
+    let handle = cx
+        .cx
+        .debug_bounds("mdlp-row-handle-0")
+        .expect("row handle rendered");
+    let target_cell = cx
+        .cx
+        .debug_bounds("mdlp-cell-1-0")
+        .expect("target cell rendered");
+    let target_handle = cx
+        .cx
+        .debug_bounds("mdlp-row-handle-1")
+        .expect("target row handle rendered");
+
+    let start = handle.center();
+    cx.cx
+        .simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx.simulate_mouse_move(
+        start + gpui::point(gpui::px(0.), gpui::px(6.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    // Hover the target row's lower half (tracks the below-boundary), then
+    // drift onto the row HANDLE and release there — like a user following
+    // the pill column.
+    cx.cx.simulate_mouse_move(
+        target_cell.center() + gpui::point(gpui::px(0.), target_cell.size.height * 0.3),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    let handle_lower = target_handle.center()
+        + gpui::point(gpui::px(0.), target_handle.size.height * 0.3);
+    cx.cx.simulate_mouse_move(
+        handle_lower,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.cx.simulate_mouse_up(
+        handle_lower,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+
+    let text = cx.buffer_text();
+    let rows: Vec<&str> = text.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(
+        rows,
+        vec!["| A | B |", "| --- | --- |", "| two | 2 |", "| one | 1 |"],
+        "release anywhere over the table should still apply the tracked drop: {text:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_drag_column_release_on_handle_strip(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | one | 1 |
+    "});
+    cx.executor().run_until_parked();
+
+    let source = cx
+        .cx
+        .debug_bounds("mdlp-column-handle-0")
+        .expect("column handle rendered");
+    let target = cx
+        .cx
+        .debug_bounds("mdlp-column-handle-1")
+        .expect("second column handle rendered");
+
+    let start = source.center();
+    cx.cx
+        .simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx.simulate_mouse_move(
+        start + gpui::point(gpui::px(6.), gpui::px(0.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    let right_half = target.center() + gpui::point(target.size.width * 0.3, gpui::px(0.));
+    cx.cx.simulate_mouse_move(
+        right_half,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.cx.simulate_mouse_up(
+        right_half,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+
+    let text = cx.buffer_text();
+    assert!(
+        text.contains("| B | A |"),
+        "dragging a column along the handle strip should reorder: {text:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_drag_survives_mid_gesture_repaint(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | one | 1 |
+        | two | 2 |
+    "});
+    cx.executor().run_until_parked();
+
+    let handle = cx
+        .cx
+        .debug_bounds("mdlp-row-handle-0")
+        .expect("row handle rendered");
+    let target = cx
+        .cx
+        .debug_bounds("mdlp-cell-1-0")
+        .expect("target cell rendered");
+
+    let start = handle.center();
+    cx.cx
+        .simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+    // A repaint lands between press and first movement (cursor blink, agent
+    // panel updates, etc.) — the armed gesture must survive it.
+    cx.update_editor(|_, _, cx| cx.notify());
+    cx.executor().run_until_parked();
+    cx.cx.simulate_mouse_move(
+        start + gpui::point(gpui::px(0.), gpui::px(6.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.update_editor(|_, _, cx| cx.notify());
+    cx.executor().run_until_parked();
+    let below_target = target.center() + gpui::point(gpui::px(0.), target.size.height * 0.3);
+    cx.cx.simulate_mouse_move(
+        below_target,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.cx.simulate_mouse_up(
+        below_target,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+
+    let text = cx.buffer_text();
+    let rows: Vec<&str> = text.lines().filter(|line| line.starts_with('|')).collect();
+    assert_eq!(
+        rows,
+        vec!["| A | B |", "| --- | --- |", "| two | 2 |", "| one | 1 |"],
+        "drag should survive repaints mid-gesture: {text:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_drag_column_between_others(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B | C |
+        | --- | --- | --- |
+        | 1 |   | 3 |
+    "});
+    cx.executor().run_until_parked();
+
+    let source = cx
+        .cx
+        .debug_bounds("mdlp-column-handle-0")
+        .expect("column handle rendered");
+    let target = cx.cx.debug_bounds("mdlp-cell-h-2").expect("header C rendered");
+
+    let start = source.center();
+    cx.cx
+        .simulate_mouse_down(start, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx.simulate_mouse_move(
+        start + gpui::point(gpui::px(6.), gpui::px(0.)),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    // Left half of column C targets the boundary between B and C.
+    let left_half = target.center() - gpui::point(target.size.width * 0.3, gpui::px(0.));
+    cx.cx.simulate_mouse_move(
+        left_half,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    let boundary = cx.update_editor(|editor, _, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.drop_boundary.as_ref().map(|(_, boundary)| *boundary))
+    });
+    assert_eq!(
+        boundary,
+        Some(TableBoundary::Column(2)),
+        "left half of C should target the B|C boundary"
+    );
+    cx.cx
+        .simulate_mouse_up(left_half, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+
+    let text = cx.buffer_text();
+    assert!(
+        text.contains("| B | A | C |"),
+        "A dropped between B and C: {text:?}"
+    );
+}
