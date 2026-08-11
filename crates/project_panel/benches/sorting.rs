@@ -64,7 +64,7 @@ fn criterion_benchmark(c: &mut Criterion) {
                 |b| {
                     b.iter_batched(
                         || snapshot.clone(),
-                        |mut snapshot| par_sort_worktree_entries(&mut snapshot, *mode, *order),
+                        |mut snapshot| par_sort_worktree_entries(&mut snapshot, *mode, *order, Default::default()),
                         criterion::BatchSize::LargeInput,
                     );
                 },
