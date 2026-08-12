@@ -17,7 +17,8 @@ status bar.
 Use the arrow keys to move through entries. {#kb
 project_panel::ExpandSelectedEntry} expands a directory and {#kb
 project_panel::CollapseSelectedEntry} collapses it. {#kb
-project_panel::CollapseAllEntries} collapses every directory at once. {#kb
+project_panel::CollapseAllEntries} collapses every directory at once, as does
+the collapse button at the top of the panel. {#kb
 project_panel::ExpandAllEntries} expands every directory at once. Press {#kb
 project_panel::Open} or click to preview a selected file, without giving it a
 permanent tab. Editing the file or double-clicking it promotes it to a permanent tab.
@@ -73,6 +74,9 @@ keybindings below.
   file inside the selected directory.
 - {#action project_panel::NewDirectory} ({#kb project_panel::NewDirectory})
   creates a new directory.
+
+Both are also available as buttons at the top of the panel. When no entry is
+selected, the new file or directory is created at the root of the last worktree.
 
 An inline editor appears so you can type the name. Press `enter` to
 confirm or `escape` to cancel.
@@ -160,6 +164,15 @@ See also [Diagnostics & Quick Fixes](./diagnostics.md) for editor and tab diagno
   with {#action project_panel::ToggleHideHidden}.
 
 ### Sorting
+
+The sort button at the top of the panel opens a menu for the two sorting axes
+you are most likely to change: grouping and direction. The menu items are also
+available as actions, so they can be bound to keys or run from the command
+palette: {#action project_panel::SetSortDirectoriesFirst}, {#action
+project_panel::SetSortMixed}, {#action project_panel::SetSortFilesFirst},
+{#action project_panel::SetSortAscending} and {#action
+project_panel::SetSortDescending}. Choosing an item writes the corresponding
+setting to your user settings file.
 
 The `project_panel.sort_mode` setting controls grouping:
 

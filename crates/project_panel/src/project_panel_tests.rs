@@ -11640,8 +11640,10 @@ async fn test_sort_direction_descending(cx: &mut gpui::TestAppContext) {
     cx.update(|_, cx| {
         cx.update_global::<SettingsStore, _>(|store, cx| {
             store.update_user_settings(cx, |settings| {
-                settings.project_panel.get_or_insert_default().sort_direction =
-                    Some(settings::ProjectPanelSortDirection::Descending);
+                settings
+                    .project_panel
+                    .get_or_insert_default()
+                    .sort_direction = Some(settings::ProjectPanelSortDirection::Descending);
             });
         });
     });

@@ -43,8 +43,8 @@ use rayon::slice::ParallelSliceMut;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
-    DockSide, ProjectPanelEntrySpacing, Settings, SettingsStore, ShowDiagnostics, ShowIndentGuides,
-    update_settings_file,
+    DockSide, ProjectPanelEntrySpacing, ProjectPanelSortDirection, ProjectPanelSortMode, Settings,
+    SettingsStore, ShowDiagnostics, ShowIndentGuides, update_settings_file,
 };
 use smallvec::SmallVec;
 use std::{
@@ -61,8 +61,9 @@ use std::{
 use theme_settings::ThemeSettings;
 use ui::{
     ContextMenu, DecoratedIcon, IconDecoration, IconDecorationKind, IndentGuideColors,
-    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, ProjectEmptyState,
-    ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tooltip, WithScrollbar, prelude::*,
+    IndentGuideLayout, Indicator, KeyBinding, ListItem, ListItemSpacing, PopoverMenu,
+    ProjectEmptyState, ScrollAxes, ScrollableHandle, Scrollbars, StickyCandidate, Tab, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use util::{
     ResultExt, TakeUntilExt, TryFutureExt,
@@ -411,6 +412,16 @@ actions!(
         Redo,
         /// Opens a markdown preview for the selected file.
         OpenMarkdownPreview,
+        /// Lists directories before files in the project panel.
+        SetSortDirectoriesFirst,
+        /// Interleaves directories and files in the project panel.
+        SetSortMixed,
+        /// Lists files before directories in the project panel.
+        SetSortFilesFirst,
+        /// Sorts entry names in ascending order.
+        SetSortAscending,
+        /// Sorts entry names in descending order.
+        SetSortDescending,
     ]
 );
 
@@ -497,6 +508,26 @@ pub fn init(cx: &mut App) {
             })
         });
 
+        workspace.register_action(|workspace, _: &SetSortDirectoriesFirst, _, cx| {
+            set_sort_mode(workspace, ProjectPanelSortMode::DirectoriesFirst, cx);
+        });
+
+        workspace.register_action(|workspace, _: &SetSortMixed, _, cx| {
+            set_sort_mode(workspace, ProjectPanelSortMode::Mixed, cx);
+        });
+
+        workspace.register_action(|workspace, _: &SetSortFilesFirst, _, cx| {
+            set_sort_mode(workspace, ProjectPanelSortMode::FilesFirst, cx);
+        });
+
+        workspace.register_action(|workspace, _: &SetSortAscending, _, cx| {
+            set_sort_direction(workspace, ProjectPanelSortDirection::Ascending, cx);
+        });
+
+        workspace.register_action(|workspace, _: &SetSortDescending, _, cx| {
+            set_sort_direction(workspace, ProjectPanelSortDirection::Descending, cx);
+        });
+
         workspace.register_action(|workspace, action: &CollapseAllEntries, window, cx| {
             if let Some(panel) = workspace.panel::<ProjectPanel>(cx) {
                 panel.update(cx, |panel, cx| {
@@ -575,6 +606,23 @@ pub fn init(cx: &mut App) {
         });
     })
     .detach();
+}
+
+fn set_sort_mode(workspace: &Workspace, mode: ProjectPanelSortMode, cx: &mut App) {
+    let fs = workspace.app_state().fs.clone();
+    update_settings_file(fs, cx, move |settings, _| {
+        settings.project_panel.get_or_insert_default().sort_mode = Some(mode);
+    });
+}
+
+fn set_sort_direction(workspace: &Workspace, direction: ProjectPanelSortDirection, cx: &mut App) {
+    let fs = workspace.app_state().fs.clone();
+    update_settings_file(fs, cx, move |settings, _| {
+        settings
+            .project_panel
+            .get_or_insert_default()
+            .sort_direction = Some(direction);
+    });
 }
 
 #[derive(Debug)]
@@ -6885,6 +6933,138 @@ impl ProjectPanel {
     }
 }
 
+impl ProjectPanel {
+    fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let can_write = !self.project.read(cx).is_read_only(cx);
+        let focus_handle = self.focus_handle.clone();
+
+        h_flex()
+            .id("project-panel-header")
+            .min_h(Tab::container_height(cx))
+            .w_full()
+            .flex_none()
+            .px_1()
+            .gap_px()
+            .justify_end()
+            .border_b_1()
+            .border_color(cx.theme().colors().border)
+            .when(can_write, |this| {
+                this.child(
+                    IconButton::new("project-panel-new-file", IconName::FilePlus)
+                        .icon_size(IconSize::Small)
+                        .tooltip({
+                            let focus_handle = focus_handle.clone();
+                            move |_window, cx| {
+                                Tooltip::for_action_in("New File", &NewFile, &focus_handle, cx)
+                            }
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_file(&NewFile, window, cx);
+                        })),
+                )
+                .child(
+                    IconButton::new("project-panel-new-directory", IconName::FolderAdd)
+                        .icon_size(IconSize::Small)
+                        .tooltip({
+                            let focus_handle = focus_handle.clone();
+                            move |_window, cx| {
+                                Tooltip::for_action_in(
+                                    "New Folder",
+                                    &NewDirectory,
+                                    &focus_handle,
+                                    cx,
+                                )
+                            }
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_directory(&NewDirectory, window, cx);
+                        })),
+                )
+            })
+            .child(self.render_sort_menu(cx))
+            .child(
+                IconButton::new("project-panel-collapse-all", IconName::ListCollapse)
+                    .icon_size(IconSize::Small)
+                    .tooltip(move |_window, cx| {
+                        Tooltip::for_action_in(
+                            "Collapse All Entries",
+                            &CollapseAllEntries,
+                            &focus_handle,
+                            cx,
+                        )
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.collapse_all_entries(&CollapseAllEntries, window, cx);
+                    })),
+            )
+    }
+
+    fn render_sort_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let focus_handle = self.focus_handle.clone();
+        let settings = ProjectPanelSettings::get_global(cx);
+        let mode = settings.sort_mode;
+        let direction = settings.sort_direction;
+
+        PopoverMenu::new("project-panel-sort-menu")
+            .trigger_with_tooltip(
+                IconButton::new("project-panel-sort-menu-trigger", IconName::ArrowDown10)
+                    .icon_size(IconSize::Small),
+                Tooltip::text("Change Sort Order"),
+            )
+            .menu(move |window, cx| {
+                let focus_handle = focus_handle.clone();
+                Some(ContextMenu::build(window, cx, move |menu, _, _| {
+                    menu.context(focus_handle.clone())
+                        .header("Group")
+                        .toggleable_entry(
+                            "Directories First",
+                            mode == ProjectPanelSortMode::DirectoriesFirst,
+                            IconPosition::Start,
+                            Some(SetSortDirectoriesFirst.boxed_clone()),
+                            |window, cx| {
+                                window.dispatch_action(SetSortDirectoriesFirst.boxed_clone(), cx)
+                            },
+                        )
+                        .toggleable_entry(
+                            "Mixed",
+                            mode == ProjectPanelSortMode::Mixed,
+                            IconPosition::Start,
+                            Some(SetSortMixed.boxed_clone()),
+                            |window, cx| window.dispatch_action(SetSortMixed.boxed_clone(), cx),
+                        )
+                        .toggleable_entry(
+                            "Files First",
+                            mode == ProjectPanelSortMode::FilesFirst,
+                            IconPosition::Start,
+                            Some(SetSortFilesFirst.boxed_clone()),
+                            |window, cx| {
+                                window.dispatch_action(SetSortFilesFirst.boxed_clone(), cx)
+                            },
+                        )
+                        .separator()
+                        .header("Order")
+                        .toggleable_entry(
+                            "Ascending",
+                            direction == ProjectPanelSortDirection::Ascending,
+                            IconPosition::Start,
+                            Some(SetSortAscending.boxed_clone()),
+                            |window, cx| window.dispatch_action(SetSortAscending.boxed_clone(), cx),
+                        )
+                        .toggleable_entry(
+                            "Descending",
+                            direction == ProjectPanelSortDirection::Descending,
+                            IconPosition::Start,
+                            Some(SetSortDescending.boxed_clone()),
+                            |window, cx| {
+                                window.dispatch_action(SetSortDescending.boxed_clone(), cx)
+                            },
+                        )
+                }))
+            })
+            .anchor(gpui::Anchor::TopRight)
+    }
+}
+
 #[derive(Clone)]
 struct StickyProjectPanelCandidate {
     index: usize,
@@ -6935,7 +7115,7 @@ impl Render for ProjectPanel {
         let is_collab = project.is_via_collab();
         let is_local = project.is_local();
 
-        if has_worktree {
+        let contents = if has_worktree {
             let item_count = self
                 .state
                 .visible_entries
@@ -7572,7 +7752,12 @@ impl Render for ProjectPanel {
                         ))
                     })
                 })
-        }
+        };
+
+        v_flex()
+            .size_full()
+            .when(has_worktree, |this| this.child(self.render_header(cx)))
+            .child(contents.flex_1().min_h_0())
     }
 }
 
