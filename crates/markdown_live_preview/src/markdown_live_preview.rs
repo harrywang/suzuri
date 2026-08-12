@@ -387,17 +387,20 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
     apply_decorations(editor, cx);
 }
 
+/// Namespaces within `HighlightKey::MarkdownLivePreview`, one per decoration
+/// kind so each can be written and cleared independently of the others.
+const STRIKE: usize = 0;
+const ITALIC: usize = 1;
+const BOLD: usize = 2;
+const LINK: usize = 3;
+const DEFINITION: usize = 4;
+const ORDERED_MARKER: usize = 5;
+
 /// Emphasis spans get preview-like typography: the plain text color with true
 /// bold/italic styling, overriding the theme's source-mode markup colors
 /// (e.g. blue non-slanted italics, orange bold), plus a real line-through for
 /// strikethrough, which themes color but never strike.
 fn apply_emphasis_highlights(editor: &mut Editor, markers: Option<&MarkerSet>, cx: &mut Context<Editor>) {
-    const STRIKE: usize = 0;
-    const ITALIC: usize = 1;
-    const BOLD: usize = 2;
-    const LINK: usize = 3;
-    const DEFINITION: usize = 4;
-    const ORDERED_MARKER: usize = 5;
     let text_color = cx.theme().colors().text;
     let accent_color = cx.theme().colors().text_accent;
     let muted_color = cx.theme().colors().text_muted;

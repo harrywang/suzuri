@@ -1464,3 +1464,44 @@ async fn test_drag_column_between_others(cx: &mut TestAppContext) {
         "A dropped between B and C: {text:?}"
     );
 }
+
+// --- Contract tests ---
+//
+// These pin behavior this crate relies on from `editor` and `gpui` rather than
+// behavior of its own. They exist so an upstream merge that changes those
+// semantics fails here, loudly, instead of silently degrading live preview.
+
+/// Live preview's text decorations all hang off `HighlightKey::MarkdownLivePreview`,
+/// keyed per decoration kind. Highlights written under one key must not be
+/// disturbed when another key is cleared, or disabling one decoration would
+/// wipe the others.
+#[gpui::test]
+async fn test_highlight_key_namespaces_are_independent(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇone **bold** and *italic* and ~~struck~~ here\n");
+    cx.executor().run_until_parked();
+
+    let highlighted = |cx: &mut EditorTestContext, key: usize| {
+        cx.update_editor(|editor, _, cx| {
+            editor
+                .text_highlights(HighlightKey::MarkdownLivePreview(key), cx)
+                .map_or(0, |(_, ranges)| ranges.len())
+        })
+    };
+
+    assert!(highlighted(&mut cx, BOLD) > 0);
+    assert!(highlighted(&mut cx, ITALIC) > 0);
+
+    cx.update_editor(|editor, _, cx| {
+        editor.clear_highlights(
+            HighlightKey::MarkdownLivePreview(BOLD),
+            cx,
+        );
+    });
+
+    assert_eq!(highlighted(&mut cx, BOLD), 0);
+    assert!(
+        highlighted(&mut cx, ITALIC) > 0,
+        "clearing one highlight key dropped another key's ranges"
+    );
+}
