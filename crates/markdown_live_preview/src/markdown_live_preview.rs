@@ -938,9 +938,11 @@ fn render_markdown_block(
                     .log_err();
             })
             .child(
-                MarkdownElement::new(markdown.clone(), style).image_resolver(move |destination| {
-                    resolve_image_source(destination, base_directory.as_deref())
-                }),
+                MarkdownElement::new(markdown.clone(), style).image_resolver(
+                    move |destination, _cx| {
+                        resolve_image_source(destination, base_directory.as_deref())
+                    },
+                ),
             )
             .into_any_element()
     })
@@ -2410,7 +2412,7 @@ fn render_image_block(
                 .child(alt.clone())
                 .into_any_element(),
             (None, _) => MarkdownElement::new(markdown.clone(), style)
-                .image_resolver(move |destination| {
+                .image_resolver(move |destination, _cx| {
                     resolve_image_source(destination, base_directory.as_deref())
                 })
                 .into_any_element(),
