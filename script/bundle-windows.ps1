@@ -41,7 +41,16 @@ function Get-VSArch {
 }
 
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+# GitHub-hosted runners install Enterprise, local machines usually Community;
+# probe the editions instead of hardcoding one.
+$vsDevShell = @('Enterprise', 'Professional', 'Community', 'BuildTools') |
+    ForEach-Object { "C:\Program Files\Microsoft Visual Studio\2022\$_\Common7\Tools\Launch-VsDevShell.ps1" } |
+    Where-Object { Test-Path $_ } |
+    Select-Object -First 1
+if (-not $vsDevShell) {
+    throw "Visual Studio 2022 not found under C:\Program Files\Microsoft Visual Studio\2022"
+}
+& $vsDevShell -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -306,17 +315,22 @@ function BuildInstaller {
             $appAppxFullName = "ZedIndustries.Zed.Nightly_1.0.0.0_neutral__japxn1gcva8rg"
         }
         "dev" {
-            $appId = "{{8357632E-24A4-4F32-BA97-E575B4D1FE5D}"
-            $appIconName = "app-icon-dev"
-            $appName = "Zed Dev"
-            $appDisplayName = "Zed Dev"
-            $appSetupName = "Zed-$Architecture"
+            # Suzuri branding: installer-facing values only. The mutex, exe
+            # name, AppUserModelID, and appx identity stay Zed's — they are
+            # contracts with the code and AppxManifest, not branding. The
+            # AppId GUID is Suzuri's own so installs never collide with a
+            # real Zed Dev.
+            $appId = "{{399CDA59-271B-4C3E-B9E8-C478EED45AA6}"
+            $appIconName = "app-icon-suzuri"
+            $appName = "Suzuri"
+            $appDisplayName = "Suzuri"
+            $appSetupName = "suzuri-windows-$Architecture"
             # The mutex name here should match the mutex name in crates\zed\src\zed\windows_only_instance.rs
             $appMutex = "Zed-Dev-Instance-Mutex"
             $appExeName = "Zed"
             $regValueName = "ZedDev"
             $appUserId = "ZedIndustries.Zed.Dev"
-            $appShellNameShort = "Z&ed Dev"
+            $appShellNameShort = "S&uzuri"
             $appAppxFullName = "ZedIndustries.Zed.Dev_1.0.0.0_neutral__japxn1gcva8rg"
         }
         default {

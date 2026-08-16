@@ -1,0 +1,114 @@
+# Suzuri's release pipeline (AgentFit-style): push a `suzuri-v*` tag and a
+# GitHub Release appears with macOS DMGs (both architectures) and a Windows
+# installer. Deliberately separate from Zed's own release.yml, which targets
+# Namespace runners this fork does not have.
+#
+# Unsigned by default. To sign/notarize macOS builds, add the secrets
+# bundle-mac expects (MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD,
+# APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID,
+# APPLE_NOTARIZATION_ISSUER_ID) and export them in the bundle step — note
+# bundle-mac currently hardcodes Zed Industries' signing identity, which must
+# be patched to your Developer ID first. Windows signing uses the Azure
+# Trusted Signing variables listed in bundle-windows.ps1.
+name: Suzuri Release
+
+on:
+  push:
+    tags:
+      - "suzuri-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-mac:
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bundle-${{ matrix.target }}
+
+      - name: Report disk space
+        run: df -h /
+
+      - name: Build DMG
+        run: ./script/bundle-mac ${{ matrix.target }}
+
+      - name: Rename artifact
+        run: |
+          arch="${{ matrix.target }}"
+          arch="${arch%%-*}"
+          mv "target/${{ matrix.target }}/release/Zed-${arch}.dmg" \
+             "target/${{ matrix.target }}/release/suzuri-${arch}.dmg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dmg-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/suzuri-*.dmg
+
+  build-windows:
+    # windows-2022 specifically: it ships ISCC (Inno Setup) on PATH, which
+    # bundle-windows.ps1 relies on; windows-2025 images currently do not.
+    runs-on: windows-2022
+    timeout-minutes: 180
+    env:
+      ZED_WORKSPACE: ${{ github.workspace }}
+      # Shrink the target dir to fit hosted-runner disks; users don't need
+      # debug info in a release installer anyway.
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Derive version from tag
+        shell: pwsh
+        run: |
+          $version = if ($env:GITHUB_REF_NAME -like 'suzuri-v*') {
+            $env:GITHUB_REF_NAME -replace '^suzuri-v', ''
+          } else {
+            "0.0.0-manual"
+          }
+          "RELEASE_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bundle-windows
+
+      - name: Report disk space
+        shell: pwsh
+        run: Get-PSDrive -PSProvider FileSystem
+
+      - name: Build installer
+        shell: pwsh
+        run: ./script/bundle-windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: target/suzuri-windows-x86_64.exe
+
+  release:
+    needs: [build-mac, build-windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
