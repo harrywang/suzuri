@@ -2588,7 +2588,7 @@ fn handle_project_entry_drop_on_markdown(
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let link_target = relative.to_string_lossy().replace(' ', "%20");
+        let link_target = markdown_link_target(&relative);
         if is_image {
             markdown_links.push_str(&format!("![]({link_target})\n"));
         } else {
@@ -2601,6 +2601,21 @@ fn handle_project_entry_drop_on_markdown(
 
     insert_dropped_markdown(editor, markdown_links, cx);
     true
+}
+
+/// A markdown link destination for a dropped file's relative path.
+///
+/// Percent-encodes each component fully: filenames can contain more than
+/// ASCII spaces — macOS screenshots use a narrow no-break space (U+202F)
+/// before "PM", and parentheses or a literal `%` also break the markdown
+/// destination. The live preview decodes with `urlencoding::decode`, which
+/// round-trips this encoding exactly.
+fn markdown_link_target(relative: &std::path::Path) -> String {
+    relative
+        .components()
+        .map(|component| urlencoding::encode(&component.as_os_str().to_string_lossy()).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// A relative path from `from_directory` to `to`, using `..` where needed.
@@ -2753,6 +2768,33 @@ mod tests {
     use std::path::{Path, PathBuf};
     use util::{path, paths::PathWithPosition, rel_path::RelPath};
     use workspace::path_link::{OpenTarget, OpenTargetFoundBy};
+
+    #[test]
+    fn test_markdown_link_target_encodes_unicode_whitespace() {
+        // macOS screenshot names contain U+202F before "PM"; the naive
+        // space-only replace used to leave it raw, producing an invalid
+        // markdown destination that never rendered.
+        let relative =
+            PathBuf::from("attachments").join("Screenshot 2026-08-14 at 8.02.26\u{202F}PM.png");
+        let target = markdown_link_target(&relative);
+        assert_eq!(
+            target,
+            "attachments/Screenshot%202026-08-14%20at%208.02.26%E2%80%AFPM.png"
+        );
+        assert_eq!(
+            urlencoding::decode(&target).unwrap(),
+            "attachments/Screenshot 2026-08-14 at 8.02.26\u{202F}PM.png"
+        );
+
+        let tricky = PathBuf::from("attachments").join("chart (v2) 100%.png");
+        let tricky_target = markdown_link_target(&tricky);
+        assert!(!tricky_target.contains(' '), "{tricky_target}");
+        assert!(!tricky_target.contains('('), "{tricky_target}");
+        assert_eq!(
+            urlencoding::decode(&tricky_target).unwrap(),
+            "attachments/chart (v2) 100%.png"
+        );
+    }
 
     #[gpui::test]
     fn test_path_for_file(cx: &mut App) {
