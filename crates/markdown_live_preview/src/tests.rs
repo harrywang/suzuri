@@ -753,6 +753,95 @@ async fn test_wikilinks_conceal(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_obsidian_image_embed_renders_as_block(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        ![[photo.png]]
+        ![[photo.png|640]]
+        inline stays raw: ![[photo.png]]
+        ![[Some Note]]
+    "});
+    cx.executor().run_until_parked();
+
+    // The two standalone image embeds render as image blocks; the inline
+    // embed and the non-image note embed stay raw.
+    assert_eq!(applied_block_count(&mut cx), 2);
+    let display = cx.display_text();
+    assert!(
+        display.contains("inline stays raw: ![[photo.png]]"),
+        "{display}"
+    );
+    assert!(display.contains("![[Some Note]]"), "{display}");
+}
+
+#[gpui::test]
+async fn test_citations_conceal(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        a claim [@doe2020] here
+        grouped [see @smith2019, p. 33; also @lee2021] here
+        a [label](https://example.com) link stays a link
+        code stays raw: `[@nope]`
+        not citations: [plain] and [me@example.com]
+    "});
+    cx.executor().run_until_parked();
+    let display = cx.display_text();
+    assert!(display.contains("a claim @doe2020 here"), "{display}");
+    assert!(
+        display.contains("grouped see @smith2019, p. 33; also @lee2021 here"),
+        "{display}"
+    );
+    assert!(display.contains("a label link stays a link"), "{display}");
+    assert!(display.contains("code stays raw: [@nope]"), "{display}");
+    assert!(
+        display.contains("not citations: [plain] and [me@example.com]"),
+        "{display}"
+    );
+
+    // The three keys across the two citation groups carry the citation
+    // highlight; the email and the link do not.
+    let citation_ranges = cx.update_editor(|editor, _, cx| {
+        editor
+            .text_highlights(HighlightKey::MarkdownLivePreview(CITATION), cx)
+            .map_or(0, |(_, ranges)| ranges.len())
+    });
+    assert_eq!(citation_ranges, 3);
+}
+
+#[gpui::test]
+async fn test_citation_reveals_on_touch(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {"
+        plain line
+        a claim [@doe2020] with **bold** afterˇ
+    "});
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text()
+            .contains("a claim @doe2020 with bold after"),
+        "{}",
+        cx.display_text()
+    );
+
+    // Cursor inside the citation reveals its brackets, per-token: the bold
+    // further along the line stays rendered.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        a claim [@doeˇ2020] with **bold** after
+    "});
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text()
+            .contains("a claim [@doe2020] with bold after"),
+        "{}",
+        cx.display_text()
+    );
+}
+
+#[gpui::test]
 async fn test_table_structure_extraction(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     cx.set_state(indoc::indoc! {"

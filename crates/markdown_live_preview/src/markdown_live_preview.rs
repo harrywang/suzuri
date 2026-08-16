@@ -225,6 +225,9 @@ struct MarkerSet {
     /// Ordered-list markers, restyled to the plain text color for
     /// consistency with bullet glyphs.
     ordered_markers: Vec<Range<Anchor>>,
+    /// Pandoc-style citation keys (`@key` including the `@`), styled as
+    /// reference chips once the surrounding brackets are concealed.
+    citations: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -395,6 +398,7 @@ const BOLD: usize = 2;
 const LINK: usize = 3;
 const DEFINITION: usize = 4;
 const ORDERED_MARKER: usize = 5;
+const CITATION: usize = 6;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
 /// bold/italic styling, overriding the theme's source-mode markup colors
@@ -404,6 +408,10 @@ fn apply_emphasis_highlights(editor: &mut Editor, markers: Option<&MarkerSet>, c
     let text_color = cx.theme().colors().text;
     let accent_color = cx.theme().colors().text_accent;
     let muted_color = cx.theme().colors().text_muted;
+    let citation_background = cx
+        .theme()
+        .colors()
+        .editor_document_highlight_read_background;
     let sets = [
         (
             STRIKE,
@@ -457,6 +465,16 @@ fn apply_emphasis_highlights(editor: &mut Editor, markers: Option<&MarkerSet>, c
             markers.map(|markers| markers.ordered_markers.clone()),
             HighlightStyle {
                 color: Some(text_color),
+                ..Default::default()
+            },
+        ),
+        (
+            CITATION,
+            markers.map(|markers| markers.citations.clone()),
+            HighlightStyle {
+                color: Some(accent_color),
+                background_color: Some(citation_background),
+                font_style: Some(gpui::FontStyle::Normal),
                 ..Default::default()
             },
         ),
@@ -2744,6 +2762,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definitions: Vec::new(),
         definition_ranges: Vec::new(),
         ordered_markers: Vec::new(),
+        citations: Vec::new(),
     };
 
     for layer in buffer_snapshot.syntax_layers() {
@@ -2756,6 +2775,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     }
 
     extraction.scan_wikilinks();
+    extraction.scan_citations();
 
     let Extraction {
         inline,
@@ -2767,6 +2787,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definitions,
         definition_ranges,
         ordered_markers,
+        citations,
         ..
     } = extraction;
 
@@ -2804,6 +2825,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definitions: definitions.join("\n"),
         definition_ranges,
         ordered_markers,
+        citations,
     })
 }
 
@@ -2826,6 +2848,7 @@ struct Extraction<'a> {
     definitions: Vec<String>,
     definition_ranges: Vec<Range<Anchor>>,
     ordered_markers: Vec<Range<Anchor>>,
+    citations: Vec<Range<Anchor>>,
 }
 
 impl Extraction<'_> {
@@ -3161,7 +3184,7 @@ impl Extraction<'_> {
                 }
                 "image" => {
                     // `![[...]]` is an Obsidian embed, not a markdown image;
-                    // leave it raw rather than concealing it half-way.
+                    // `embed_image_block` (via `scan_wikilinks`) renders it.
                     if self
                         .text
                         .get(node.byte_range())
@@ -3215,12 +3238,15 @@ impl Extraction<'_> {
                 let is_embed = region_text[..open].ends_with('!');
                 let start = region.start + open;
                 let end = region.start + close + 2;
-                if is_embed
-                    || self
-                        .code_spans
-                        .iter()
-                        .any(|span| span.start < end && start < span.end)
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
                 {
+                    continue;
+                }
+                if is_embed {
+                    self.embed_image_block(start - 1, end, inner);
                     continue;
                 }
 
@@ -3238,6 +3264,128 @@ impl Extraction<'_> {
                     let range = self.anchor_range(start + 2..end - 2);
                     self.link_text.push(range);
                 }
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Renders an Obsidian image embed (`![[photo.png]]`, with Obsidian's
+    /// `![[photo.png|640]]` width syntax) as an image block when it is the
+    /// only content on its line. The target resolves like a regular markdown
+    /// image destination — relative to the buffer's directory. Non-image
+    /// embeds (`![[Some Note]]`) and inline embeds stay raw.
+    fn embed_image_block(&mut self, embed_start: usize, embed_end: usize, inner: &str) {
+        let (target, size) = match inner.split_once('|') {
+            Some((target, size)) => (target.trim(), Some(size)),
+            None => (inner.trim(), None),
+        };
+        let is_image = std::path::Path::new(target)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(
+                    extension.to_ascii_lowercase().as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp"
+                )
+            });
+        if !is_image {
+            return;
+        }
+        let row = self
+            .snapshot
+            .offset_to_point(MultiBufferOffset(embed_start))
+            .row;
+        let line_start = self.snapshot.point_to_offset(Point::new(row, 0));
+        let line_end = self
+            .snapshot
+            .point_to_offset(Point::new(row, self.snapshot.line_len(MultiBufferRow(row))));
+        let line_text: String = self.snapshot.text_for_range(line_start..line_end).collect();
+        let embed_text = self.text.get(embed_start..embed_end).unwrap_or_default();
+        if line_text.trim() != embed_text.trim() {
+            return;
+        }
+        let display_width = size
+            .map(|size| {
+                size.chars()
+                    .take_while(|character| character.is_ascii_digit())
+                    .collect::<String>()
+            })
+            .and_then(|width| width.parse::<f32>().ok())
+            .filter(|width| *width > 0.);
+        self.push_block_rows(
+            row,
+            row,
+            8,
+            BlockRenderKind::Image {
+                display_width,
+                destination: Some(target.to_string()),
+                alt: String::new(),
+            },
+        );
+    }
+
+    /// Conceal pandoc-style citations: `[@key]`, `[-@key]`, and citation
+    /// groups like `[see @doe2020, p. 3; also @roe2021]`. The markdown
+    /// grammar has no citation nodes (it parses `[@key]` as a shortcut
+    /// link), so like wikilinks this scans the prose regions directly,
+    /// skipping code spans. Brackets that are really links (`[@key](url)`,
+    /// `[@key][label]`) are left to the link machinery, and brackets with no
+    /// valid `@key` are left raw.
+    fn scan_citations(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            while let Some(open_offset) = region_text[search_from..].find('[') {
+                let open = search_from + open_offset;
+                search_from = open + 1;
+                let Some(close_offset) = region_text[open + 1..].find(']') else {
+                    break;
+                };
+                let close = open + 1 + close_offset;
+                let inner = &region_text[open + 1..close];
+                if inner.is_empty() || inner.contains('\n') || inner.contains('[') {
+                    continue;
+                }
+                // A preceding `[`, `!`, or `]` makes this bracket part of a
+                // wikilink, image, or reference link's label instead.
+                if matches!(
+                    region_text[..open].chars().last(),
+                    Some('[') | Some('!') | Some(']')
+                ) {
+                    continue;
+                }
+                // `[...](url)` and `[...][label]` are links, not citations.
+                if matches!(
+                    region_text[close + 1..].chars().next(),
+                    Some('(') | Some('[')
+                ) {
+                    continue;
+                }
+                let keys = citation_keys(inner);
+                if keys.is_empty() {
+                    continue;
+                }
+                let start = region.start + open;
+                let end = region.start + close + 1;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+
+                let reveal = start..end;
+                self.hide(start..start + 1, reveal.clone());
+                self.hide(end - 1..end, reveal.clone());
+                for key in keys {
+                    let range = self.anchor_range(start + 1 + key.start..start + 1 + key.end);
+                    self.citations.push(range);
+                }
+                search_from = close + 1;
             }
         }
         self.prose_regions = regions;
@@ -3304,6 +3452,52 @@ impl Extraction<'_> {
             self.push_block_rows(row, row, 8, kind);
         }
     }
+}
+
+/// Byte ranges (relative to a citation group's inner text, `@` included) of
+/// the valid pandoc citation keys it contains. An `@` only starts a key at an
+/// item boundary — the group start, after whitespace, `;`, or a `-` (author
+/// suppression) — so an email address in brackets does not read as a
+/// citation. Key syntax follows pandoc: a leading alphanumeric or `_`, then
+/// alphanumerics with internal punctuation.
+fn citation_keys(inner: &str) -> Vec<Range<usize>> {
+    let mut keys = Vec::new();
+    for (at, _) in inner.match_indices('@') {
+        let boundary = match inner[..at].chars().last() {
+            None => true,
+            Some(character) => character.is_whitespace() || character == ';' || character == '-',
+        };
+        if !boundary {
+            continue;
+        }
+        let after = &inner[at + 1..];
+        let mut length = 0;
+        for character in after.chars() {
+            let internal_punctuation = matches!(
+                character,
+                ':' | '.' | '#' | '$' | '%' | '&' | '-' | '+' | '?' | '<' | '>' | '~' | '/'
+            );
+            if character.is_ascii_alphanumeric() || character == '_' || internal_punctuation {
+                length += character.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // Punctuation is only valid inside a key, not at its edges.
+        let key = after[..length].trim_end_matches(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '_')
+        });
+        if key.is_empty()
+            || !key
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            continue;
+        }
+        keys.push(at..at + 1 + key.len());
+    }
+    keys
 }
 
 fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::Node<'a>>) {
