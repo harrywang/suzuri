@@ -1361,7 +1361,11 @@
   //     "autosave": "on_focus_change",
   // 4. Save when idle for a certain amount of time:
   //     "autosave": { "after_delay": {"milliseconds": 500} },
-  "autosave": "off",
+  //
+  // Suzuri defaults to delay-based autosave: notes are terminal artifacts
+  // with no build watchers, and agents read the vault from disk, so the
+  // buffer and disk should never diverge for long.
+  "autosave": { "after_delay": { "milliseconds": 1000 } },
   // Maximum number of tabs per pane. Unset for unlimited.
   "max_tabs": null,
   // Settings related to the editor's tab bar.
