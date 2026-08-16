@@ -2603,6 +2603,93 @@ fn handle_project_entry_drop_on_markdown(
     true
 }
 
+/// Saves an image on the clipboard into the note's attachments folder and
+/// inserts an embed link at the cursor, Obsidian-style. Returns false when
+/// the buffer is not a saved local markdown note or the clipboard holds no
+/// image, so the caller can fall through to the regular paste.
+pub fn paste_clipboard_image(editor: &Editor, cx: &mut App) -> bool {
+    let Some(note_directory) = markdown_note_directory(editor, cx) else {
+        return false;
+    };
+    let Some(item) = cx.read_from_clipboard() else {
+        return false;
+    };
+
+    // Files copied in Finder (e.g. ⌘C on a saved screenshot) arrive as
+    // paths, not bitmap data; route them through the same copier as an
+    // external drop so they attach instead of pasting their names as text.
+    if let Some(paths) = item.entries().iter().find_map(|entry| match entry {
+        gpui::ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
+        _ => None,
+    }) {
+        return handle_image_drop_on_markdown(editor, paths, cx);
+    }
+
+    let Some(image) = item.entries().iter().find_map(|entry| match entry {
+        gpui::ClipboardEntry::Image(image) => Some(image),
+        _ => None,
+    }) else {
+        return false;
+    };
+
+    let attachments_folder = <MarkdownAttachmentSettings as settings::Settings>::get_global(cx)
+        .folder
+        .trim()
+        .trim_matches('/')
+        .to_string();
+    let attachments_directory = if attachments_folder.is_empty() {
+        note_directory.clone()
+    } else {
+        note_directory.join(&attachments_folder)
+    };
+    if std::fs::create_dir_all(&attachments_directory)
+        .log_err()
+        .is_none()
+    {
+        return false;
+    }
+
+    let stem = pasted_image_stem();
+    let extension = image.format.extension();
+    let mut candidate = attachments_directory.join(format!("{stem}.{extension}"));
+    let mut suffix = 1;
+    while candidate.exists() {
+        candidate = attachments_directory.join(format!("{stem}-{suffix}.{extension}"));
+        suffix += 1;
+    }
+    if std::fs::write(&candidate, &image.bytes).log_err().is_none() {
+        return false;
+    }
+
+    let file_name = candidate
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let relative = if attachments_folder.is_empty() {
+        std::path::PathBuf::from(file_name)
+    } else {
+        std::path::Path::new(&attachments_folder).join(file_name)
+    };
+    let link_target = markdown_link_target(&relative);
+    insert_dropped_markdown(editor, format!("![]({link_target})\n"), cx);
+    true
+}
+
+/// `pasted-image-YYYYMMDD-HHMMSS`, local time when determinable.
+fn pasted_image_stem() -> String {
+    let now = time::OffsetDateTime::now_local()
+        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    format!(
+        "pasted-image-{:04}{:02}{:02}-{:02}{:02}{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    )
+}
+
 /// A markdown link destination for a dropped file's relative path.
 ///
 /// Percent-encodes each component fully: filenames can contain more than
@@ -2738,7 +2825,7 @@ fn handle_image_drop_on_markdown(
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let link_target = link_target.to_string_lossy().replace(' ', "%20");
+        let link_target = markdown_link_target(&link_target);
         if is_image {
             markdown_links.push_str(&format!("![]({link_target})\n"));
         } else {
@@ -2768,6 +2855,20 @@ mod tests {
     use std::path::{Path, PathBuf};
     use util::{path, paths::PathWithPosition, rel_path::RelPath};
     use workspace::path_link::{OpenTarget, OpenTargetFoundBy};
+
+    #[test]
+    fn test_pasted_image_stem_shape() {
+        let stem = pasted_image_stem();
+        // pasted-image-YYYYMMDD-HHMMSS
+        assert_eq!(stem.len(), "pasted-image-20260816-161930".len(), "{stem}");
+        assert!(stem.starts_with("pasted-image-"), "{stem}");
+        assert!(
+            stem["pasted-image-".len()..]
+                .chars()
+                .all(|character| character.is_ascii_digit() || character == '-'),
+            "{stem}"
+        );
+    }
 
     #[test]
     fn test_markdown_link_target_encodes_unicode_whitespace() {

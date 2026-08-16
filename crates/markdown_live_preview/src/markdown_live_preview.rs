@@ -115,6 +115,20 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         }),
     );
 
+    // Pasting an image saves it into the attachments folder and inserts an
+    // embed link (Obsidian-style); text pastes pass through untouched.
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(
+        editor.register_action::<editor::actions::Paste>(move |_, _window, cx| {
+            let handled = weak_editor
+                .update(cx, |editor, cx| editor::items::paste_clipboard_image(editor, cx))
+                .unwrap_or(false);
+            if !handled {
+                cx.propagate();
+            }
+        }),
+    );
+
     // Backspace/Delete removes a selected table row/column (Obsidian-style)
     // instead of editing text; without a selection they pass through.
     let weak_editor = cx.weak_entity();
