@@ -3,13 +3,12 @@
 # installer. Deliberately separate from Zed's own release.yml, which targets
 # Namespace runners this fork does not have.
 #
-# Unsigned by default. To sign/notarize macOS builds, add the secrets
-# bundle-mac expects (MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD,
-# APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID,
-# APPLE_NOTARIZATION_ISSUER_ID) and export them in the bundle step — note
-# bundle-mac currently hardcodes Zed Industries' signing identity, which must
-# be patched to your Developer ID first. Windows signing uses the Azure
-# Trusted Signing variables listed in bundle-windows.ps1.
+# macOS builds sign and notarize automatically when the repo has the same
+# five secrets AgentFit's release flow uses: CERTIFICATE_P12,
+# CERTIFICATE_PASSWORD (Developer ID .p12, base64), APPLE_ID,
+# APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID. Without them the build falls
+# back to ad-hoc signing (right-click → Open). Windows signing uses the
+# Azure Trusted Signing variables listed in bundle-windows.ps1.
 name: Suzuri Release
 
 on:
@@ -44,6 +43,12 @@ jobs:
         run: df -h /
 
       - name: Build DMG
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: ./script/bundle-mac ${{ matrix.target }}
 
       - name: Rename artifact
