@@ -12,6 +12,7 @@ enum PreviewTarget {
     Markdown(Entity<Editor>),
     Svg(Entity<MultiBuffer>),
     Csv(Entity<Editor>),
+    Typeset(Entity<Editor>),
 }
 
 impl QuickActionBar {
@@ -30,11 +31,15 @@ impl QuickActionBar {
             && SvgPreviewView::is_svg_file(&buffer, cx)
         {
             PreviewTarget::Svg(buffer)
-        } else if let Some(editor) = editor
+        } else if let Some(editor) = &editor
             && cx.has_flag::<TabularDataPreviewFeatureFlag>()
-            && CsvPreviewView::is_csv_file(&editor, cx)
+            && CsvPreviewView::is_csv_file(editor, cx)
         {
-            PreviewTarget::Csv(editor)
+            PreviewTarget::Csv(editor.clone())
+        } else if let Some(editor) = editor
+            && typeset_preview::is_typeset_editor(&editor, cx)
+        {
+            PreviewTarget::Typeset(editor)
         } else {
             return None;
         };
@@ -54,6 +59,11 @@ impl QuickActionBar {
                 "toggle-csv-preview",
                 "Preview CSV",
                 &csv_preview::OpenPreview as &dyn gpui::Action,
+            ),
+            PreviewTarget::Typeset(_) => (
+                "open-typeset-preview",
+                "Open Live PDF Preview",
+                &typeset_preview::OpenLivePreview as &dyn gpui::Action,
             ),
         };
 
@@ -123,6 +133,14 @@ impl QuickActionBar {
                                 } else {
                                     CsvPreviewView::open_preview_in_pane(editor, pane, window, cx);
                                 }
+                            }
+                            PreviewTarget::Typeset(editor) => {
+                                typeset_preview::open_live_preview_for_editor(
+                                    workspace,
+                                    editor.clone(),
+                                    window,
+                                    cx,
+                                );
                             }
                         }
                     });

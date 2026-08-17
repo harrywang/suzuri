@@ -14492,6 +14492,7 @@ dependencies = [
  "tempfile",
  "theme",
  "theme_settings",
+ "typeset_preview",
  "ui",
  "util",
  "workspace",
@@ -20046,6 +20047,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
+name = "typeset_preview"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "futures 0.3.32",
+ "gpui",
+ "http_client",
+ "language",
+ "log",
+ "paths",
+ "project",
+ "sha2",
+ "util",
+ "which 6.0.3",
+ "workspace",
+]
+
+[[package]]
 name = "ucd-trie"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23627,6 +23647,7 @@ dependencies = [
  "title_bar",
  "toolchain_selector",
  "tracing",
+ "typeset_preview",
  "ui",
  "ui_prompt",
  "url",

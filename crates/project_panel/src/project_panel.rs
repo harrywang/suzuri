@@ -412,6 +412,8 @@ actions!(
         Redo,
         /// Opens a markdown preview for the selected file.
         OpenMarkdownPreview,
+        /// Opens a live-compiling PDF preview for the selected Typst or LaTeX file.
+        OpenTypesetPreview,
         /// Lists directories before files in the project panel.
         SetSortDirectoriesFirst,
         /// Interleaves directories and files in the project panel.
@@ -1147,6 +1149,14 @@ impl ProjectPanel {
                     entry.path.as_std_path(),
                     project.languages(),
                 );
+            let is_typeset = !is_dir
+                && entry
+                    .path
+                    .extension()
+                    .is_some_and(|extension| {
+                        let extension = extension.to_ascii_lowercase();
+                        extension == "typ" || extension == "tex" || extension == "latex"
+                    });
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -1178,6 +1188,9 @@ impl ProjectPanel {
                         menu.when(is_markdown, |menu| {
                             menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                         })
+                        .when(is_typeset, |menu| {
+                            menu.action("Open Live PDF Preview", Box::new(OpenTypesetPreview))
+                        })
                         .when(is_dir, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
                         })
@@ -1197,6 +1210,9 @@ impl ProjectPanel {
                             .action("Open in Terminal", Box::new(OpenInTerminal))
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
+                            })
+                            .when(is_typeset, |menu| {
+                                menu.action("Open Live PDF Preview", Box::new(OpenTypesetPreview))
                             })
                             .when(is_dir, |menu| {
                                 menu.separator()
@@ -1849,6 +1865,43 @@ impl ProjectPanel {
         self.workspace
             .update(cx, |workspace, cx| {
                 MarkdownPreviewView::open_for_project_path(project_path, workspace, window, cx);
+            })
+            .ok();
+    }
+
+    fn open_typeset_preview(
+        &mut self,
+        _: &OpenTypesetPreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((worktree, entry)) = self.selected_entry(cx) else {
+            return;
+        };
+        if !entry.is_file() {
+            return;
+        }
+        let project_path = ProjectPath {
+            worktree_id: worktree.id(),
+            path: entry.path.clone(),
+        };
+        // Open the file focused, then hand off to the workspace-level
+        // action, which reads the now-active editor.
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let open = workspace.open_path(project_path, None, true, window, cx);
+                cx.spawn_in(window, async move |_, cx| {
+                    if open.await.log_err().is_some() {
+                        cx.update(|window, cx| {
+                            window.dispatch_action(
+                                Box::new(typeset_preview::OpenLivePreview),
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
             })
             .ok();
     }
@@ -7269,6 +7322,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_split_vertical))
                 .on_action(cx.listener(Self::open_split_horizontal))
                 .on_action(cx.listener(Self::open_markdown_preview))
+                .on_action(cx.listener(Self::open_typeset_preview))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))

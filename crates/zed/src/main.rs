@@ -729,6 +729,7 @@ fn main() {
         editor::init(cx);
         image_viewer::init(cx);
         pdf_viewer::init(cx);
+        typeset_preview::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 
