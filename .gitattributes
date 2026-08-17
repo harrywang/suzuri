@@ -3,3 +3,8 @@
 
 # Ensure the WSL script always has LF line endings, even on Windows
 crates/zed/resources/windows/zed.sh text eol=lf
+
+# Suzuri-owned files: always keep our version in upstream merges. The
+# "ours" merge driver must be enabled once per clone:
+#   git config merge.ours.driver true
+README.md merge=ours
