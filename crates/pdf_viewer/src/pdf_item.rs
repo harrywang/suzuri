@@ -2,13 +2,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use gpui::{App, AppContext as _, BackgroundExecutor, Entity, EventEmitter, Task};
+use gpui::{
+    App, AppContext as _, BackgroundExecutor, Context, Entity, EventEmitter, Subscription, Task,
+};
 use project::{Project, ProjectEntryId, ProjectItem, ProjectPath};
+use util::ResultExt as _;
 
 pub struct PdfItem {
     project_path: ProjectPath,
     abs_path: PathBuf,
     pdf_bytes: Arc<[u8]>,
+    reload_task: Task<()>,
+    _project_subscription: Subscription,
 }
 
 pub enum PdfItemEvent {
@@ -35,6 +40,26 @@ impl PdfItem {
 
     pub fn project_path(&self) -> &ProjectPath {
         &self.project_path
+    }
+
+    /// Reloads the bytes from disk when the file changes underneath us —
+    /// a recompiled Typst/LaTeX document, a re-exported figure, an
+    /// agent-rewritten file — and announces it so views re-render.
+    fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
+        let abs_path = self.abs_path.clone();
+        let background = cx.background_executor().clone();
+        self.reload_task = cx.spawn(async move |this, cx| {
+            let Some(bytes) = load_pdf_bytes(abs_path, background).await.log_err() else {
+                // Transient empty/locked file mid-write; the next change
+                // event retries.
+                return;
+            };
+            this.update(cx, |this, cx| {
+                this.pdf_bytes = bytes;
+                cx.emit(PdfItemEvent::Reloaded);
+            })
+            .ok();
+        });
     }
 }
 
@@ -68,16 +93,39 @@ impl ProjectItem for PdfItem {
             .abs_path()
             .join(path.path.as_std_path());
         let project_path = path.clone();
+        let project = project.clone();
         let background = cx.background_executor().clone();
 
         Some(cx.spawn(async move |cx| {
             let pdf_bytes = load_pdf_bytes(abs_path.clone(), background).await?;
 
             let entity = cx.update(|cx| {
-                cx.new(|_| PdfItem {
-                    project_path,
-                    abs_path,
-                    pdf_bytes,
+                cx.new(|cx| {
+                    let subscription = cx.subscribe(
+                        &project,
+                        |this: &mut PdfItem, _project, event: &project::Event, cx| {
+                            if let project::Event::WorktreeUpdatedEntries(
+                                worktree_id,
+                                updated_entries,
+                            ) = event
+                            {
+                                if *worktree_id == this.project_path.worktree_id
+                                    && updated_entries
+                                        .iter()
+                                        .any(|(path, _, _)| *path == this.project_path.path)
+                                {
+                                    this.reload_from_disk(cx);
+                                }
+                            }
+                        },
+                    );
+                    PdfItem {
+                        project_path,
+                        abs_path,
+                        pdf_bytes,
+                        reload_task: Task::ready(()),
+                        _project_subscription: subscription,
+                    }
                 })
             });
             Ok(entity)

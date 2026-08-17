@@ -116,6 +116,15 @@ impl PdfViewer {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Live-preview loop: the item reloads itself when the file changes
+        // on disk (e.g. a Typst/LaTeX recompile); rebuild rendering state
+        // but keep zoom and scroll so the document doesn't jump.
+        cx.subscribe(&pdf_item, |this, _, event: &pdf_item::PdfItemEvent, cx| {
+            match event {
+                pdf_item::PdfItemEvent::Reloaded => this.reload_document(cx),
+            }
+        })
+        .detach();
         let mut this = Self {
             pdf_item,
             project,
@@ -140,6 +149,18 @@ impl PdfViewer {
         };
         this.load_metadata(cx);
         this
+    }
+
+    fn reload_document(&mut self, cx: &mut Context<Self>) {
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.cancel_token = Arc::new(AtomicBool::new(false));
+        self.pages_in_flight.clear();
+        self.rendered_pages.clear();
+        self.text_layouts.clear();
+        self.selection_start = None;
+        self.selection_end = None;
+        self.load_metadata(cx);
+        cx.notify();
     }
 
     fn load_metadata(&mut self, cx: &mut Context<Self>) {
