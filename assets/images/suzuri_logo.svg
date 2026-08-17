@@ -1,0 +1,30 @@
+<!--
+  Suzuri master mark: an organic stone pebble, ink well cut out as true
+  negative space. Single evenodd path; ink uses currentColor (default
+  #17130F) so setting `color` restyles it - #EFE6D5 for reversed-on-dark.
+  No stamp, no text in the mark.
+
+  Palette: ink black #17130F / vermilion #C0472B (accent, sparingly) /
+  paper cream #EFE6D5.
+
+  Derived assets to regenerate when this changes:
+  - crates/zed/resources/app-icon-suzuri.png + @2x (pebble on cream tile)
+  - crates/zed/resources/windows/app-icon-suzuri.ico
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" color="#17130F" role="img" aria-labelledby="sm-t sm-d">
+  <title id="sm-t">Suzuri</title>
+  <desc id="sm-d">An organic stone pebble in ink, its round well cut out slightly above and right of center.</desc>
+  <path fill="currentColor" fill-rule="evenodd" d="
+    M30 7.5
+    C41.5 7.5 50.5 16.5 53.5 27.5
+    C56 36 55.5 45.5 48.5 51
+    C42.5 55.8 32 57 22.5 55.2
+    C13.5 53.4 7.5 46.5 7.5 36.5
+    C7.5 25.5 11.5 15 19.5 10.3
+    C23 8.2 26.5 7.5 30 7.5 Z
+    M35 19.8
+    C40.8 19.8 45.3 24.2 45.3 29.8
+    C45.3 35.6 40.6 40.4 34.8 40.2
+    C29.3 40 24.9 35.5 25 30
+    C25.1 24.4 29.2 19.8 35 19.8 Z"/>
+</svg>
