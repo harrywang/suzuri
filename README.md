@@ -1,29 +1,35 @@
 # Suzuri
 
-**The AI editor for researchers.**
+**Code and write in one place.**
 
-Suzuri is a research editor built on Zed: Obsidian-style live preview for notes, Typst and LaTeX for papers, and a PDF pane for reading — all over plain markdown on your own machine. Your agents draft, import, and cite; you verify and publish.
+Suzuri adds a writing environment to Zed without giving up the code editor: Obsidian-style live preview for notes, Typst and LaTeX for papers, and a PDF pane for reading — all over plain markdown on your own machine. The agents you already code with draft, import, and cite; you verify and publish.
 
 *Suzuri* (硯) is Japanese for inkstone — the stone a scholar grinds ink on before writing begins.
 
 > [!NOTE]
 > Suzuri is early and in active development, built in the open and dogfooded daily. Expect sharp edges.
 
-## Features
+## Key Features
 
-- **Writing** — Markdown renders in place and reveals its source when your cursor touches it: editable tables, resizable images, citation chips for `[@key]`, Obsidian embeds like `![[figure.png|640]]`, and screenshots that attach themselves when you paste. Files autosave, so agents and you always see the same thing.
-
-- **Connecting** — `[[wikilinks]]` with completion, ⌘-click follow, backlinks, and broken-link diagnostics, via a built-in [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide) language server. No extension to install.
+- **Writing** — Markdown renders in place and reveals its source when your cursor touches it: editable tables, resizable images, citation chips, Obsidian-style embeds, and screenshots that attach themselves when you paste. Files autosave, so agents and you always see the same thing.
 
 - **Reading** — A native PDF viewer with continuous scroll, zoom, and real text selection, built on [hayro](https://github.com/LaurenzV/hayro). PDFs reload in place when they change on disk.
 
 - **Typesetting** — Write [Typst](https://typst.app) or LaTeX in one pane and watch the PDF update in the other, a second after you stop typing. Compilers install themselves on first use.
 
+- **Linking** — `[[wikilinks]]` with completion, ⌘-click follow, backlinks, and broken-link diagnostics, built in with no extension to install.
+
 - **Everything Zed does** — LSP, tree-sitter, multi-buffer editing, terminals, git, and the rest of a fast, mature editor.
 
 ## Install
 
-Download the latest installer from [Releases](../../releases): `suzuri-aarch64.dmg` (Apple Silicon), `suzuri-x86_64.dmg` (Intel Mac), or `suzuri-windows-x86_64.exe`. The macOS builds are signed and notarized — open the DMG and drag Suzuri to Applications. The Windows installer is not yet signed, so SmartScreen shows a warning: choose "More info → Run anyway".
+Download the latest installer:
+
+- [macOS — Apple Silicon](../../releases/latest/download/suzuri-aarch64.dmg)
+- [macOS — Intel](../../releases/latest/download/suzuri-x86_64.dmg)
+- [Windows](../../releases/latest/download/suzuri-windows-x86_64.exe)
+
+The macOS builds are signed and notarized — open the DMG and drag Suzuri to Applications. The Windows installer is not yet signed, so SmartScreen shows a warning: choose "More info → Run anyway".
 
 Or build from source, the same way Zed builds:
 
@@ -38,7 +44,7 @@ Suzuri stands on generous shoulders:
 - [Zed](https://zed.dev) — the editor underneath everything
 - [David Turnbull](https://github.com/dsturnbull) — the PDF viewer ([zed#51040](https://github.com/zed-industries/zed/pull/51040)) and the hayro text-extraction work it builds on
 - [hayro](https://github.com/LaurenzV/hayro) by Laurenz Stampfl — pure-Rust PDF rendering
-- [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide) by FelixZeller — PKM language server
+- [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide) by Felix Zeller — the PKM language server behind wikilinks, backlinks, and link diagnostics
 - [Typst](https://github.com/typst/typst) and [Tectonic](https://github.com/tectonic-typesetting/tectonic) — the typesetting engines behind live preview
 
 ## Relationship to Zed
