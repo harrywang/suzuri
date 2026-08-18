@@ -414,6 +414,8 @@ actions!(
         OpenMarkdownPreview,
         /// Opens a live-compiling PDF preview for the selected Typst or LaTeX file.
         OpenTypesetPreview,
+        /// Rescans the visible worktrees from disk.
+        RefreshFileTree,
         /// Lists directories before files in the project panel.
         SetSortDirectoriesFirst,
         /// Interleaves directories and files in the project panel.
@@ -1867,6 +1869,34 @@ impl ProjectPanel {
                 MarkdownPreviewView::open_for_project_path(project_path, workspace, window, cx);
             })
             .ok();
+    }
+
+    /// Rescans the root and every expanded directory of each local worktree.
+    /// File-system events keep the tree current on their own; this is the
+    /// escape hatch for when they are missed — network volumes, some Docker
+    /// mounts, and iCloud Drive are the usual culprits.
+    fn refresh_file_tree(&mut self, _: &RefreshFileTree, _: &mut Window, cx: &mut Context<Self>) {
+        let expanded_dir_ids = self.state.expanded_dir_ids.clone();
+        self.project.update(cx, |project, cx| {
+            for worktree in project.visible_worktrees(cx).collect::<Vec<_>>() {
+                worktree.update(cx, |worktree, _| {
+                    let worktree_id = worktree.id();
+                    let expanded_paths = expanded_dir_ids
+                        .get(&worktree_id)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|entry_id| worktree.entry_for_id(*entry_id))
+                        .map(|entry| entry.path.clone());
+                    let paths = std::iter::once(RelPath::empty().into())
+                        .chain(expanded_paths)
+                        .collect::<Vec<_>>();
+                    if let Some(worktree) = worktree.as_local() {
+                        worktree.refresh_entries_for_paths(paths);
+                    }
+                });
+            }
+        });
+        cx.notify();
     }
 
     fn open_typeset_preview(
@@ -7069,6 +7099,24 @@ impl ProjectPanel {
             })
             .child(self.render_sort_menu(cx))
             .child(
+                IconButton::new("project-panel-refresh", IconName::RotateCw)
+                    .icon_size(IconSize::Small)
+                    .tooltip({
+                        let focus_handle = focus_handle.clone();
+                        move |_window, cx| {
+                            Tooltip::for_action_in(
+                                "Refresh File Tree",
+                                &RefreshFileTree,
+                                &focus_handle,
+                                cx,
+                            )
+                        }
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.refresh_file_tree(&RefreshFileTree, window, cx);
+                    })),
+            )
+            .child(
                 IconButton::new("project-panel-collapse-all", IconName::ListCollapse)
                     .icon_size(IconSize::Small)
                     .tooltip(move |_window, cx| {
@@ -7323,6 +7371,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_split_horizontal))
                 .on_action(cx.listener(Self::open_markdown_preview))
                 .on_action(cx.listener(Self::open_typeset_preview))
+                .on_action(cx.listener(Self::refresh_file_tree))
                 .on_action(cx.listener(Self::confirm))
                 .on_action(cx.listener(Self::cancel))
                 .on_action(cx.listener(Self::copy_path))
