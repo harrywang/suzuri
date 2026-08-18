@@ -38,6 +38,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: bundle-${{ matrix.target }}
+          # These builds run long enough that a timeout or a late failure
+          # would otherwise throw away hours of compilation.
+          cache-on-failure: true
 
       - name: Report disk space
         run: df -h /
@@ -67,7 +70,9 @@ jobs:
     # windows-2022 specifically: it ships ISCC (Inno Setup) on PATH, which
     # bundle-windows.ps1 relies on; windows-2025 images currently do not.
     runs-on: windows-2022
-    timeout-minutes: 180
+    # A cold-cache Rust build of the whole workspace runs past three hours
+    # on hosted Windows runners.
+    timeout-minutes: 350
     env:
       ZED_WORKSPACE: ${{ github.workspace }}
       # Shrink the target dir to fit hosted-runner disks; users don't need
@@ -100,6 +105,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: bundle-windows
+          cache-on-failure: true
 
       - name: Report disk space
         shell: pwsh
