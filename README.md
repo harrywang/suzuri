@@ -1,6 +1,8 @@
 # Suzuri
 
-Suzuri starts by bringing Obsidian's features to Zed, then adds Typst and LaTeX for academic writing. It's plain markdown on your machine: your agents draft, import, and cite; Suzuri renders it beautifully and keeps everything in one window — notes, citations, drafts, PDFs.
+**The AI editor for researchers.**
+
+Suzuri is a research editor built on Zed: Obsidian-style live preview for notes, Typst and LaTeX for papers, and a PDF pane for reading — all over plain markdown on your own machine. Your agents draft, import, and cite; you verify and publish.
 
 *Suzuri* (硯) is Japanese for inkstone — the stone a scholar grinds ink on before writing begins.
 
@@ -9,15 +11,15 @@ Suzuri starts by bringing Obsidian's features to Zed, then adds Typst and LaTeX 
 
 ## Features
 
-**Writing** — Obsidian-style live preview: headings, emphasis, links, and code render in place and reveal their source when the cursor touches them. Tables are editable grids; images render as resizable widgets. Pandoc citations (`[@key]`) render as chips. Obsidian image embeds (`![[figure.png|640]]`) and drag-or-paste image attachments just work — paste a screenshot and it lands in your attachments folder, linked. Files autosave a second after you pause, so what agents see on disk is always what you see on screen.
+- **Writing** — Markdown renders in place and reveals its source when your cursor touches it: editable tables, resizable images, citation chips for `[@key]`, Obsidian embeds like `![[figure.png|640]]`, and screenshots that attach themselves when you paste. Files autosave, so agents and you always see the same thing.
 
-**Connecting** — `[[wikilinks]]` with completion, ⌘-click follow, backlinks, and broken-link diagnostics, powered by a built-in [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide) language server (auto-provisioned; no extension required).
+- **Connecting** — `[[wikilinks]]` with completion, ⌘-click follow, backlinks, and broken-link diagnostics, via a built-in [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide) language server. No extension to install.
 
-**Reading** — a native PDF viewer with continuous scroll, zoom, and glyph-accurate text selection, adopted from David Turnbull's contribution to Zed ([zed#51040](https://github.com/zed-industries/zed/pull/51040)) and built on [hayro](https://github.com/LaurenzV/hayro). PDFs reload in place when they change on disk.
+- **Reading** — A native PDF viewer with continuous scroll, zoom, and real text selection, built on [hayro](https://github.com/LaurenzV/hayro). PDFs reload in place when they change on disk.
 
-**Typesetting** — write [Typst](https://typst.app) or LaTeX in one pane and watch the compiled PDF update in the other, a second after you stop typing. Compilers are found on your PATH or downloaded automatically on first use (Typst; [Tectonic](https://tectonic-typesetting.github.io) for LaTeX), so a fresh install needs no setup.
+- **Typesetting** — Write [Typst](https://typst.app) or LaTeX in one pane and watch the PDF update in the other, a second after you stop typing. Compilers install themselves on first use.
 
-**Everything Zed does** — LSP, tree-sitter, multi-buffer editing, terminals, git, collaboration, and the rest of a mature, fast editor, because Suzuri is built on one.
+- **Everything Zed does** — LSP, tree-sitter, multi-buffer editing, terminals, git, and the rest of a fast, mature editor.
 
 ## Install
 
