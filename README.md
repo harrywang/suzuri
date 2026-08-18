@@ -21,7 +21,7 @@ Suzuri starts by bringing Obsidian's features to Zed, then adds Typst and LaTeX 
 
 ## Install
 
-Download the latest installer from [Releases](../../releases): `suzuri-aarch64.dmg` (Apple Silicon), `suzuri-x86_64.dmg` (Intel Mac), or `suzuri-windows-x86_64.exe`. Builds are currently unsigned: on macOS, right-click → Open on first launch; on Windows, choose "More info → Run anyway".
+Download the latest installer from [Releases](../../releases): `suzuri-aarch64.dmg` (Apple Silicon), `suzuri-x86_64.dmg` (Intel Mac), or `suzuri-windows-x86_64.exe`. The macOS builds are signed and notarized — open the DMG and drag Suzuri to Applications. The Windows installer is not yet signed, so SmartScreen shows a warning: choose "More info → Run anyway".
 
 Or build from source, the same way Zed builds:
 
