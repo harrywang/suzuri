@@ -9,7 +9,7 @@
 //! Preview mode. Tables and images are the exception: they are edited
 //! through their widgets and only reveal source via their `</>` button.
 
-use std::{any::TypeId, ops::Range, path::PathBuf, sync::Arc};
+use std::{any::TypeId, borrow::Cow, ops::Range, path::PathBuf, sync::Arc};
 
 use collections::{HashMap, HashSet};
 use editor::{
@@ -668,11 +668,19 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     let start = range.start.to_offset(&snapshot);
                     let end = range.end.to_offset(&snapshot);
                     let text: String = snapshot.text_for_range(start..end).collect();
+                    let text = wikilink_display_text(text.trim()).into_owned();
                     cx.new(|cx| {
-                        Markdown::new(
-                            SharedString::from(text.trim().to_string()),
+                        // A pipe table row cannot contain a newline, so `<br>`
+                        // is the only way to break a line inside a cell; that
+                        // needs the HTML parser other blocks already enable.
+                        Markdown::new_with_options(
+                            SharedString::from(text),
                             language_registry.clone(),
                             None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                ..Default::default()
+                            },
                             cx,
                         )
                     })
@@ -985,6 +993,92 @@ fn render_markdown_block(
 
 
 /// Per-column flex weights approximating content-based column sizing.
+/// Byte ranges of CommonMark code spans: a run of N backticks opens one and the
+/// next run of exactly N backticks closes it. An unclosed run opens nothing.
+fn code_span_ranges(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let open_start = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        let run = index - open_start;
+        let mut search = index;
+        while let Some(next) = text[search..].find('`') {
+            let close_start = search + next;
+            let mut close_end = close_start;
+            while close_end < bytes.len() && bytes[close_end] == b'`' {
+                close_end += 1;
+            }
+            if close_end - close_start == run {
+                spans.push(open_start..close_end);
+                index = close_end;
+                break;
+            }
+            search = close_end;
+        }
+    }
+    spans
+}
+
+/// Wikilinks are concealed on the buffer text by `scan_wikilinks`, but a table
+/// cell is a replace block rendered from extracted text by the markdown crate,
+/// which has no wikilink support — so the raw `[[..]]` would reach the screen.
+/// Rewrite them to the same display text concealment shows. Embeds (`![[..]]`)
+/// and code spans are left raw, matching `scan_wikilinks`.
+fn wikilink_display_text(text: &str) -> Cow<'_, str> {
+    if !text.contains("[[") {
+        return Cow::Borrowed(text);
+    }
+    let code_spans = code_span_ranges(text);
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut search_from = 0;
+    while let Some(open_offset) = text[search_from..].find("[[") {
+        let open = search_from + open_offset;
+        let Some(close_offset) = text[open + 2..].find("]]") else {
+            break;
+        };
+        let close = open + 2 + close_offset;
+        search_from = close + 2;
+
+        let inner = &text[open + 2..close];
+        if inner.is_empty() || inner.contains('\n') || inner.contains("[[") {
+            continue;
+        }
+        if text[..open].ends_with('!') {
+            continue;
+        }
+        if code_spans
+            .iter()
+            .any(|span| span.start < close + 2 && open < span.end)
+        {
+            continue;
+        }
+
+        // `[[target|alias]]` shows the alias; everything else shows the inner
+        // text verbatim, so `[[Note#heading]]` keeps its heading.
+        let display = match inner.find('|') {
+            Some(pipe) => &inner[pipe + 1..],
+            None => inner,
+        };
+        out.push_str(&text[copied..open]);
+        out.push_str(display);
+        copied = close + 2;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
 fn table_column_weights(structure: &TableStructure, snapshot: &MultiBufferSnapshot) -> Vec<f32> {
     let columns = structure
         .header
@@ -2010,7 +2104,7 @@ fn render_table_block(
                 })
                 .on_drag_move::<TableRowDrag>(row_track_drag(None))
                 .child(row_handle(None))
-                .child(h_flex().flex_grow(1.).children(
+                .child(h_flex().items_stretch().flex_grow(1.).children(
                     header_markdown.iter().enumerate().map(|(column, markdown)| {
                         let empty = Range {
                             start: Anchor::Min,
@@ -2041,7 +2135,7 @@ fn render_table_block(
                     .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
                     .child(row_handle(Some(row_index)))
                     .child(
-                        h_flex().flex_grow(1.).children(row_markdown.iter().enumerate().map(
+                        h_flex().items_stretch().flex_grow(1.).children(row_markdown.iter().enumerate().map(
                             |(column, markdown)| {
                                 let empty = Range {
                                     start: Anchor::Min,

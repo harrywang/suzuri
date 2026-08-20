@@ -1584,6 +1584,100 @@ async fn test_table_cell_wraps_long_content(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+async fn test_table_cell_br_breaks_the_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | Degree | Year |
+        | --- | --- |
+        | **Ph.D.**<br>University of Arizona | 2006 |
+        | **B.S.** | 2001 |
+    "});
+    cx.executor().run_until_parked();
+
+    let broken = cx
+        .cx
+        .debug_bounds("mdlp-cell-0-0")
+        .expect("cell with <br> rendered");
+    let single_line = cx
+        .cx
+        .debug_bounds("mdlp-cell-1-0")
+        .expect("single-line cell rendered");
+
+    assert!(
+        broken.size.height > single_line.size.height,
+        "<br> must render as a line break rather than literal text, got broken={:?} single={:?}",
+        broken.size,
+        single_line.size
+    );
+}
+
+#[gpui::test]
+async fn test_table_cells_fill_their_row(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | Stone | Provenance |
+        | --- | --- |
+        | Duan | Lower rock, purple-brown with banded eyes<br>Zhaoqing, Guangdong, quarried 1782 |
+    "});
+    cx.executor().run_until_parked();
+
+    let short = cx
+        .cx
+        .debug_bounds("mdlp-cell-0-0")
+        .expect("short cell rendered");
+    let tall = cx
+        .cx
+        .debug_bounds("mdlp-cell-0-1")
+        .expect("tall cell rendered");
+
+    // A short cell must stretch to its row rather than sit centered at its own
+    // content height, which would leave the grid lines ragged.
+    assert_eq!(
+        short.size.height, tall.size.height,
+        "cells in one row must share a height, got short={:?} tall={:?}",
+        short.size, tall.size
+    );
+}
+
+#[test]
+fn test_wikilink_display_text_in_cells() {
+    // Matches what `scan_wikilinks` conceals to outside a table.
+    assert_eq!(wikilink_display_text("[[reading-list]]"), "reading-list");
+    assert_eq!(wikilink_display_text("[[note|alias]]"), "alias");
+    assert_eq!(wikilink_display_text("[[Note#heading]]"), "Note#heading");
+    // Inside a pipe table the alias separator must be escaped or it splits the
+    // cell, so this is the form that actually reaches a cell renderer.
+    assert_eq!(wikilink_display_text(r"[[note\|alias]]"), "alias");
+    assert_eq!(
+        wikilink_display_text("see [[duan-ratios]] and [[a|b]] here"),
+        "see duan-ratios and b here"
+    );
+
+    // Left raw, same as the concealment path.
+    assert_eq!(wikilink_display_text("![[embed.png]]"), "![[embed.png]]");
+    assert_eq!(wikilink_display_text("`[[literal]]`"), "`[[literal]]`");
+    assert_eq!(wikilink_display_text("``a `[[x]]` b``"), "``a `[[x]]` b``");
+    assert_eq!(wikilink_display_text("[[]]"), "[[]]");
+    assert_eq!(wikilink_display_text("[[unclosed"), "[[unclosed");
+
+    // Untouched text is borrowed rather than rebuilt.
+    assert!(matches!(
+        wikilink_display_text("no links here"),
+        std::borrow::Cow::Borrowed(_)
+    ));
+
+    // A code span must not shield a wikilink that sits outside it.
+    assert_eq!(
+        wikilink_display_text("`code` then [[note]]"),
+        "`code` then note"
+    );
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than
