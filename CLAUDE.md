@@ -23,6 +23,7 @@ The fork's own changes are small and additive:
 | Area | Files |
 | --- | --- |
 | Live preview (the feature) | `crates/markdown_live_preview/` |
+| LaTeX math rendering for live preview | `crates/math_render/` |
 | PDF viewer (adopted from zed#51040) | `crates/pdf_viewer/` |
 | Live Typst/LaTeX preview | `crates/typeset_preview/` |
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs` |

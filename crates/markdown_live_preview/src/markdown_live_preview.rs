@@ -19,12 +19,13 @@ use editor::{
     },
 };
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, Focusable as _, FontWeight, HighlightStyle,
+    App, AppContext as _, Context, Empty, Entity, Focusable as _, FontWeight, HighlightStyle, Hsla,
     ImageSource, IntoElement, MouseButton, Resource, SharedString, SharedUri, StrikethroughStyle,
-    Subscription, TextStyleRefinement, WeakEntity, Window, actions, rems,
+    Subscription, TextStyleRefinement, WeakEntity, Window, actions, img, rems,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use math_render::{MathStyle, MathTheme};
 use multi_buffer::{
     Anchor, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset as _, ToPoint as _,
 };
@@ -75,21 +76,23 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     }
 
     let mut subscriptions = Vec::new();
-    subscriptions.push(cx.subscribe_self(|editor, event: &EditorEvent, cx| match event {
-        EditorEvent::Reparsed(_) => recompute(editor, cx),
-        EditorEvent::SelectionsChanged { .. } => {
-            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
-                let resizing = addon
-                    .last_resize_at
-                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500));
-                if !resizing {
-                    addon.selected_image = None;
+    subscriptions.push(
+        cx.subscribe_self(|editor, event: &EditorEvent, cx| match event {
+            EditorEvent::Reparsed(_) => recompute(editor, cx),
+            EditorEvent::SelectionsChanged { .. } => {
+                if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                    let resizing = addon
+                        .last_resize_at
+                        .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500));
+                    if !resizing {
+                        addon.selected_image = None;
+                    }
                 }
+                apply_decorations(editor, cx);
             }
-            apply_decorations(editor, cx);
-        }
-        _ => {}
-    }));
+            _ => {}
+        }),
+    );
 
     subscriptions.push(cx.observe_global::<theme::GlobalTheme>(|editor, cx| {
         let markers = editor
@@ -104,9 +107,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
             weak_editor
                 .update(cx, |editor, cx| {
                     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
-                        let enabled = addon.enabled_override.unwrap_or_else(|| {
-                            MarkdownLivePreviewSettings::get_global(cx).enabled
-                        });
+                        let enabled = addon
+                            .enabled_override
+                            .unwrap_or_else(|| MarkdownLivePreviewSettings::get_global(cx).enabled);
                         addon.enabled_override = Some(!enabled);
                     }
                     recompute(editor, cx);
@@ -121,7 +124,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     subscriptions.push(
         editor.register_action::<editor::actions::Paste>(move |_, _window, cx| {
             let handled = weak_editor
-                .update(cx, |editor, cx| editor::items::paste_clipboard_image(editor, cx))
+                .update(cx, |editor, cx| {
+                    editor::items::paste_clipboard_image(editor, cx)
+                })
                 .unwrap_or(false);
             if !handled {
                 cx.propagate();
@@ -132,13 +137,13 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     // Backspace/Delete removes a selected table row/column (Obsidian-style)
     // instead of editing text; without a selection they pass through.
     let weak_editor = cx.weak_entity();
-    subscriptions.push(
-        editor.register_action::<editor::actions::Backspace>(move |_, _window, cx| {
+    subscriptions.push(editor.register_action::<editor::actions::Backspace>(
+        move |_, _window, cx| {
             if !delete_selected_table_unit(&weak_editor, cx) {
                 cx.propagate();
             }
-        }),
-    );
+        },
+    ));
     let weak_editor = cx.weak_entity();
     subscriptions.push(
         editor.register_action::<editor::actions::Delete>(move |_, _window, cx| {
@@ -268,6 +273,16 @@ enum InlineKind {
         /// The range of the `[ ]`/`[x]` marker itself, edited on toggle.
         marker_range: Range<Anchor>,
     },
+    /// A LaTeX formula (`$x$` or `$$x$$`), rendered as a typeset image.
+    ///
+    /// Rendering is asynchronous, so the placeholder reads whatever the shared
+    /// [`MathCache`] holds for `source`; until that resolves it falls back to
+    /// the LaTeX source, which is also what a formula that fails to parse keeps
+    /// showing.
+    Math {
+        source: SharedString,
+        style: MathStyle,
+    },
 }
 
 struct BlockMarker {
@@ -300,6 +315,14 @@ enum BlockRenderKind {
         display_width: Option<f32>,
         destination: Option<String>,
         alt: String,
+    },
+    /// Display math (`$$...$$` alone on its lines), rendered as a centered
+    /// typeset formula. Unlike other blocks, revealing its source does not
+    /// remove the widget: the rendering stays below the source lines and
+    /// live-updates while the formula is edited, following Obsidian.
+    Math {
+        /// The LaTeX between the delimiters.
+        source: String,
     },
 }
 
@@ -375,6 +398,9 @@ struct ActiveTableCell {
 struct AppliedBlock {
     range: Range<Anchor>,
     source: String,
+    /// True when the widget is placed below its source lines instead of
+    /// replacing them — display math while its source is revealed.
+    below: bool,
     block_id: CustomBlockId,
 }
 
@@ -418,7 +444,11 @@ const CITATION: usize = 6;
 /// bold/italic styling, overriding the theme's source-mode markup colors
 /// (e.g. blue non-slanted italics, orange bold), plus a real line-through for
 /// strikethrough, which themes color but never strike.
-fn apply_emphasis_highlights(editor: &mut Editor, markers: Option<&MarkerSet>, cx: &mut Context<Editor>) {
+fn apply_emphasis_highlights(
+    editor: &mut Editor,
+    markers: Option<&MarkerSet>,
+    cx: &mut Context<Editor>,
+) {
     let text_color = cx.theme().colors().text;
     let accent_color = cx.theme().colors().text_accent;
     let muted_color = cx.theme().colors().text_muted;
@@ -550,15 +580,33 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         // the rest of the line rendered.
         let reveal_span = match &marker.kind {
             InlineKind::Hide { reveal_span } => reveal_span,
-            InlineKind::Bullet | InlineKind::Checkbox { .. } => &marker.range,
+            // Math reveals when the selection touches the formula, so putting
+            // the cursor in it hands back the LaTeX to edit.
+            InlineKind::Bullet | InlineKind::Checkbox { .. } | InlineKind::Math { .. } => {
+                &marker.range
+            }
         };
-        let span =
-            reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
+        let span = reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
         let revealed = selection_offsets
             .iter()
             .any(|selection| selection.start <= span.end && span.start <= selection.end);
         if revealed {
             continue;
+        }
+        // Start the render here rather than in the placeholder closure, which
+        // runs every frame; by the time it draws, the cache holds at least a
+        // pending entry.
+        if let InlineKind::Math { source, style } = &marker.kind {
+            let text_color = cx.theme().colors().editor_foreground;
+            request_math_render(
+                MathKey {
+                    source: source.clone(),
+                    style: *style,
+                    color: u32::from(gpui::Rgba::from(text_color)),
+                },
+                text_color,
+                cx,
+            );
         }
         concealments.push(Concealment {
             range: marker.range.clone(),
@@ -570,13 +618,15 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
 
     // --- Block widgets ---
 
-    let mut desired_blocks: HashMap<(usize, usize), (&BlockMarker, String)> = HashMap::default();
+    let mut desired_blocks: HashMap<(usize, usize), (&BlockMarker, String, bool)> =
+        HashMap::default();
     for marker in &markers.blocks {
         let start = marker.range.start.to_point(&snapshot);
         let end = marker.range.end.to_point(&snapshot);
         if start > end {
             continue;
         }
+        let mut below = false;
         if rows_intersect(&selection_rows, start.row, end.row) {
             // Casual clicks land the cursor on widget rows constantly, which
             // made tables and images explode into source; those two reveal
@@ -590,7 +640,12 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 let revealed_end = revealed.end.to_point(&snapshot).row;
                 revealed_start <= end.row && start.row <= revealed_end
             });
-            if !needs_explicit_reveal || explicitly_revealed {
+            if matches!(marker.kind, BlockRenderKind::Math { .. }) {
+                // Editing display math keeps the rendering on screen: the
+                // widget moves below the revealed source and live-updates
+                // as the formula is typed, following Obsidian.
+                below = true;
+            } else if !needs_explicit_reveal || explicitly_revealed {
                 continue;
             }
         }
@@ -610,7 +665,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             source.push_str("\n\n");
             source.push_str(&markers.definitions);
         }
-        desired_blocks.insert((start_offset.0, end_offset.0), (marker, source));
+        desired_blocks.insert((start_offset.0, end_offset.0), (marker, source, below));
     }
 
     let mut new_applied_blocks = Vec::new();
@@ -620,7 +675,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         let end = applied.range.end.to_offset(&snapshot).0;
         let keep = desired_blocks
             .get(&(start, end))
-            .is_some_and(|(_, source)| *source == applied.source);
+            .is_some_and(|(_, source, below)| *source == applied.source && *below == applied.below);
         if keep {
             desired_blocks.remove(&(start, end));
             new_applied_blocks.push(applied);
@@ -639,7 +694,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         .read(cx)
         .as_singleton()
         .and_then(|buffer| buffer.read(cx).language_registry());
-    for (marker, source) in desired_blocks.into_values() {
+    for (marker, source, below) in desired_blocks.into_values() {
         let render = match &marker.kind {
             BlockRenderKind::Markdown => {
                 let markdown = cx.new(|cx| {
@@ -735,22 +790,46 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     SharedString::from(alt.clone()),
                 )
             }
-            BlockRenderKind::Rule => {
-                render_rule_block(weak_editor.clone(), marker.range.clone(), marker.indent_columns)
-            }
+            BlockRenderKind::Rule => render_rule_block(
+                weak_editor.clone(),
+                marker.range.clone(),
+                marker.indent_columns,
+            ),
             BlockRenderKind::Frontmatter => {
                 render_frontmatter_block(weak_editor.clone(), marker.range.clone(), source.clone())
             }
-
+            BlockRenderKind::Math { source } => {
+                let text_color = cx.theme().colors().editor_foreground;
+                request_math_render(
+                    MathKey {
+                        source: SharedString::from(source.clone()),
+                        style: MathStyle::Display,
+                        color: u32::from(gpui::Rgba::from(text_color)),
+                    },
+                    text_color,
+                    cx,
+                );
+                render_math_block(
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    SharedString::from(source.clone()),
+                    below,
+                )
+            }
+        };
+        let placement = if below {
+            BlockPlacement::Below(marker.range.end)
+        } else {
+            BlockPlacement::Replace(marker.range.start..=marker.range.end)
         };
         blocks_to_insert.push(BlockProperties {
-            placement: BlockPlacement::Replace(marker.range.start..=marker.range.end),
+            placement,
             height: Some(marker.height_estimate),
             style: BlockStyle::Flex,
             render,
             priority: 0,
         });
-        pending_applied.push((marker.range.clone(), source));
+        pending_applied.push((marker.range.clone(), source, below));
     }
 
     if !block_ids_to_remove.is_empty() {
@@ -758,10 +837,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     }
     if !blocks_to_insert.is_empty() {
         let block_ids = editor.insert_blocks(blocks_to_insert, None, cx);
-        for ((range, source), block_id) in pending_applied.into_iter().zip(block_ids) {
+        for ((range, source, below), block_id) in pending_applied.into_iter().zip(block_ids) {
             new_applied_blocks.push(AppliedBlock {
                 range,
                 source,
+                below,
                 block_id,
             });
         }
@@ -860,13 +940,125 @@ fn rows_intersect(selection_rows: &[Range<u32>], start_row: u32, end_row: u32) -
         .any(|rows| rows.start <= end_row && start_row <= rows.end)
 }
 
+/// Identity of a rendered formula. Two formulas that agree on every field
+/// rasterize identically, so the cache is shared across editors: the same
+/// equation in two panes is typeset once.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MathKey {
+    source: SharedString,
+    style: MathStyle,
+    /// Packed RGBA, since `Hsla` is not hashable and the color is baked into
+    /// the SVG's fill.
+    color: u32,
+}
+
+enum MathEntry {
+    /// A background render is in flight; callers show the LaTeX source.
+    Pending,
+    Ready {
+        image: Arc<gpui::RenderImage>,
+        /// Fraction of the image's height that sits below the text baseline.
+        baseline_fraction: f32,
+        /// Width of the image in ems, used to size the inline element so it
+        /// takes exactly the space the glyphs occupy.
+        width_em: f32,
+        height_em: f32,
+    },
+    /// The formula does not parse. Callers keep showing the source, which is
+    /// also what the user needs to see in order to fix it.
+    Failed,
+}
+
+/// Rasterized formulas, keyed by content.
+///
+/// This is a global rather than per-editor state because rendering depends
+/// only on [`MathKey`], and because the placeholder closure that reads it
+/// receives just an `&mut App`.
+#[derive(Default)]
+struct MathCache {
+    entries: HashMap<MathKey, MathEntry>,
+}
+
+impl gpui::Global for MathCache {}
+
+/// Em size the SVG is rasterized at. Larger than any realistic buffer font so
+/// the outlines stay crisp when the element scales them down to the line's
+/// actual size.
+const MATH_RASTER_EM: f32 = 64.0;
+
+/// Formulas render at this multiple of the buffer font size. The KaTeX fonts
+/// have a visibly smaller x-height than code fonts, so at 1:1 math looks
+/// shrunken next to prose; this is the same ratio KaTeX's own stylesheet
+/// applies (`.katex { font-size: 1.21em }`).
+const MATH_FONT_SCALE: f32 = 1.21;
+
+/// Ensures a render for `key` is in flight or complete, and returns whether
+/// the cache already holds a finished image.
+///
+/// Called from `apply_decorations` rather than from the placeholder closure:
+/// kicking off work during render would spawn a task on every frame.
+fn request_math_render(key: MathKey, text_color: Hsla, cx: &mut App) {
+    if cx.default_global::<MathCache>().entries.contains_key(&key) {
+        return;
+    }
+    cx.global_mut::<MathCache>()
+        .entries
+        .insert(key.clone(), MathEntry::Pending);
+
+    let svg_renderer = cx.svg_renderer();
+    let theme = MathTheme {
+        text_color,
+        font_size: MATH_RASTER_EM,
+    };
+    cx.spawn(async move |cx| {
+        let rendered = cx
+            .background_spawn({
+                let key = key.clone();
+                async move {
+                    let rendered = math_render::render_to_svg(&key.source, key.style, &theme)?;
+                    let image = svg_renderer
+                        .render_single_frame(rendered.svg.as_bytes(), 1.0)
+                        .map_err(|error| anyhow::anyhow!("{error}"))?;
+                    anyhow::Ok((rendered, image))
+                }
+            })
+            .await;
+
+        cx.update(|cx| {
+            let entry = match rendered {
+                Ok((rendered, image)) => {
+                    let total_em = rendered.height_em + rendered.depth_em;
+                    let size = image.size(0);
+                    let width_em = if total_em > 0.0 && size.height.0 > 0 {
+                        size.width.0 as f32 / size.height.0 as f32 * total_em
+                    } else {
+                        0.0
+                    };
+                    MathEntry::Ready {
+                        image,
+                        baseline_fraction: rendered.baseline_fraction(),
+                        width_em,
+                        height_em: total_em,
+                    }
+                }
+                Err(_) => MathEntry::Failed,
+            };
+            cx.global_mut::<MathCache>().entries.insert(key, entry);
+            // The placeholder closures read the cache during render, so every
+            // open editor needs a repaint to pick the new image up.
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
 fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPlaceholder {
     // Pure hides collapse to zero-width text; bullets and checkboxes keep the
     // default placeholder text, whose visual is replaced by the rendered
     // element at its measured width.
     let collapsed_text = match &marker.kind {
         InlineKind::Hide { .. } => Some(SharedString::new_static("")),
-        InlineKind::Bullet | InlineKind::Checkbox { .. } => None,
+        InlineKind::Bullet | InlineKind::Checkbox { .. } | InlineKind::Math { .. } => None,
     };
     let render: Arc<dyn Send + Sync + Fn(_, _, &mut App) -> gpui::AnyElement> = match &marker.kind {
         InlineKind::Hide { .. } => Arc::new(|_, _, _| Empty.into_any_element()),
@@ -902,6 +1094,82 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                 .into_any_element()
             })
         }
+        InlineKind::Math { source, style } => {
+            let source = source.clone();
+            let style = *style;
+            Arc::new(move |_, _, cx: &mut App| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                let font_size = theme_settings.buffer_font_size(cx);
+                let buffer_font = theme_settings.buffer_font.clone();
+                let text_color = cx.theme().colors().editor_foreground;
+                let key = MathKey {
+                    source: source.clone(),
+                    style,
+                    color: u32::from(gpui::Rgba::from(text_color)),
+                };
+                let line_height = font_size * theme_settings.line_height();
+                let text_system = cx.text_system().clone();
+                let font_id = text_system.resolve_font(&buffer_font);
+                let ascent = text_system.ascent(font_id, font_size);
+                // `TextSystem::descent` is negative on macOS (a signed offset
+                // below the baseline), while the painted baseline's formula
+                // (`gpui::paint_line`) works in magnitudes — feeding the
+                // signed value into `baseline_offset` lands 2×descent too
+                // low, so compute the baseline from magnitudes directly.
+                let descent = text_system.descent(font_id, font_size).abs();
+                let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
+
+                match cx.default_global::<MathCache>().entries.get(&key) {
+                    Some(MathEntry::Ready {
+                        image,
+                        baseline_fraction,
+                        width_em,
+                        height_em,
+                    }) => {
+                        let math_em = font_size * MATH_FONT_SCALE;
+                        let height = math_em * *height_em;
+                        let width = math_em * *width_em;
+                        // The editor centers inline elements in the line
+                        // (element top lands at `(line_height - height) / 2`),
+                        // while text baselines sit at `baseline_offset`. Shift
+                        // the image by the difference so the formula's
+                        // baseline lands exactly on the text's.
+                        let formula_ascent = height * (1.0 - *baseline_fraction);
+                        let shift = text_baseline - (line_height - height) / 2.0 - formula_ascent;
+                        // The centering offsets a padded element by half its
+                        // padding, so doubling the needed shift as one-sided
+                        // padding moves the image by exactly `shift` without
+                        // relying on inset positioning.
+                        let (pad_top, pad_bottom) = if shift >= gpui::px(0.) {
+                            (shift * 2.0, gpui::px(0.))
+                        } else {
+                            (gpui::px(0.), shift * -2.0)
+                        };
+                        div()
+                            .h(height + pad_top + pad_bottom)
+                            .w(width)
+                            .pt(pad_top)
+                            .pb(pad_bottom)
+                            .child(
+                                img(ImageSource::Render(image.clone()))
+                                    .h(height)
+                                    .w(width),
+                            )
+                            .into_any_element()
+                    }
+                    // While a render is in flight — and permanently for a
+                    // formula that does not parse — fall back to the LaTeX
+                    // source, so the text never disappears out from under
+                    // the user.
+                    Some(MathEntry::Pending) | Some(MathEntry::Failed) | None => div()
+                        .font(buffer_font)
+                        .text_size(font_size)
+                        .text_color(text_color)
+                        .child(source.clone())
+                        .into_any_element(),
+                }
+            })
+        }
     };
     FoldPlaceholder {
         render,
@@ -917,6 +1185,17 @@ fn marker_content_key(kind: &InlineKind) -> u64 {
         InlineKind::Hide { .. } => 0,
         InlineKind::Bullet => 1,
         InlineKind::Checkbox { checked, .. } => 2 + u64::from(*checked),
+        // Editing a formula changes what its placeholder must draw even though
+        // its range is unchanged, so the source has to take part in the key or
+        // the concealment is reused with a stale image.
+        InlineKind::Math { source, style } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            source.hash(&mut hasher);
+            style.hash(&mut hasher);
+            // Keep clear of the discriminants above.
+            4 + hasher.finish()
+        }
     }
 }
 
@@ -990,7 +1269,6 @@ fn render_markdown_block(
             .into_any_element()
     })
 }
-
 
 /// Per-column flex weights approximating content-based column sizing.
 /// Byte ranges of CommonMark code spans: a run of N backticks opens one and the
@@ -1080,10 +1358,14 @@ fn wikilink_display_text(text: &str) -> Cow<'_, str> {
 }
 
 fn table_column_weights(structure: &TableStructure, snapshot: &MultiBufferSnapshot) -> Vec<f32> {
-    let columns = structure
-        .header
-        .len()
-        .max(structure.rows.iter().map(|row| row.len()).max().unwrap_or(0));
+    let columns = structure.header.len().max(
+        structure
+            .rows
+            .iter()
+            .map(|row| row.len())
+            .max()
+            .unwrap_or(0),
+    );
     let mut weights = vec![3.0_f32; columns];
     let mut measure = |cells: &[Range<Anchor>]| {
         for (index, range) in cells.iter().enumerate() {
@@ -1188,24 +1470,22 @@ fn start_cell_edit(
             },
         ));
         let weak = weak_editor.clone();
-        subscriptions.push(editor.register_action::<editor::actions::Tab>(
-            move |_, window, cx| {
+        subscriptions.push(
+            editor.register_action::<editor::actions::Tab>(move |_, window, cx| {
                 let next = next_cell.clone();
                 weak.update(cx, |editor, cx| {
                     commit_active_cell(editor, cx);
                 })
                 .log_err();
                 match next {
-                    Some(next) => {
-                        start_cell_edit(weak.clone(), next, window, cx)
-                    }
+                    Some(next) => start_cell_edit(weak.clone(), next, window, cx),
                     None => {
                         weak.update(cx, |editor, cx| refocus_main_editor(editor, window, cx))
                             .log_err();
                     }
                 }
-            },
-        ));
+            }),
+        );
         let weak = weak_editor.clone();
         subscriptions.push(editor.register_action::<editor::actions::Cancel>(
             move |_, window, cx| {
@@ -1443,8 +1723,8 @@ fn parse_table_at(
     }
     // The block may over-extend into adjacent prose that happens to contain a
     // pipe; anchor on the delimiter row and take the line above as header.
-    let delimiter_row = (first_row + 1..=last_row)
-        .find(|row| is_delimiter_row(&line_at(*row).0))?;
+    let delimiter_row =
+        (first_row + 1..=last_row).find(|row| is_delimiter_row(&line_at(*row).0))?;
     let header_row = delimiter_row - 1;
 
     let split_row = |row: u32| -> Vec<Range<Anchor>> {
@@ -1473,7 +1753,9 @@ fn parse_table_at(
     let mut rows: Vec<Vec<Range<Anchor>>> = (delimiter_row + 1..=last_row).map(split_row).collect();
 
     let mut header = header;
-    let columns = header.len().max(rows.iter().map(|row| row.len()).max().unwrap_or(0));
+    let columns = header
+        .len()
+        .max(rows.iter().map(|row| row.len()).max().unwrap_or(0));
     let sentinel = || Anchor::Min..Anchor::Min;
     header.resize_with(columns, sentinel);
     for row in &mut rows {
@@ -1481,7 +1763,8 @@ fn parse_table_at(
     }
 
     let table_start = Point::new(header_row, 0).to_offset(snapshot);
-    let table_end = Point::new(last_row, snapshot.line_len(MultiBufferRow(last_row))).to_offset(snapshot);
+    let table_end =
+        Point::new(last_row, snapshot.line_len(MultiBufferRow(last_row))).to_offset(snapshot);
     Some((
         table_start..table_end,
         TableStructure {
@@ -1496,8 +1779,14 @@ fn parse_table_at(
 enum TableStructuralChange {
     AddColumn,
     AddRow,
-    MoveRow { from: usize, to: usize },
-    MoveColumn { from: usize, to: usize },
+    MoveRow {
+        from: usize,
+        to: usize,
+    },
+    MoveColumn {
+        from: usize,
+        to: usize,
+    },
     DeleteRow(usize),
     DeleteColumn(usize),
     /// Rewrites the table without structural additions, materializing any
@@ -1527,7 +1816,9 @@ fn apply_table_structural_change(
 ) {
     commit_active_cell(editor, cx);
     let Some((table_offsets, structure)) = fresh_table_at(editor, stale_table_range, cx) else {
-        log::warn!("markdown live preview: no table found at click position; ignoring structural change");
+        log::warn!(
+            "markdown live preview: no table found at click position; ignoring structural change"
+        );
         return;
     };
     let structure = &structure;
@@ -1750,7 +2041,9 @@ fn render_table_block(
                 (Some(TableUnit::Column(_)), Some(TableBoundary::Column(boundary))) => {
                     if boundary == column {
                         Some(false)
-                    } else if boundary == structure.header.len() && column + 1 == structure.header.len() {
+                    } else if boundary == structure.header.len()
+                        && column + 1 == structure.header.len()
+                    {
                         Some(true)
                     } else {
                         None
@@ -1778,7 +2071,9 @@ fn render_table_block(
                 .debug_selector(|| {
                     format!(
                         "mdlp-cell-{}-{column}",
-                        data_row.map(|row| row.to_string()).unwrap_or_else(|| "h".into())
+                        data_row
+                            .map(|row| row.to_string())
+                            .unwrap_or_else(|| "h".into())
                     )
                 })
                 .flex_grow(1.)
@@ -1800,7 +2095,8 @@ fn render_table_block(
                     _ => this,
                 })
                 .when(is_header, |this| {
-                    this.bg(colors.elevated_surface_background).font_weight(FontWeight::BOLD)
+                    this.bg(colors.elevated_surface_background)
+                        .font_weight(FontWeight::BOLD)
                 })
                 .when(in_selected_unit, |this| {
                     this.bg(colors.element_selected)
@@ -1848,21 +2144,20 @@ fn render_table_block(
                 // in normalized form so the cell exists to edit.
                 let weak = editor.clone();
                 let normalize_range = table_range.clone();
-                cell = cell.cursor_text().on_mouse_down(
-                    MouseButton::Left,
-                    move |_, _window, cx| {
-                        cx.stop_propagation();
-                        weak.update(cx, |editor, cx| {
-                            apply_table_structural_change(
-                                editor,
-                                &normalize_range,
-                                TableStructuralChange::Normalize,
-                                cx,
-                            );
-                        })
-                        .log_err();
-                    },
-                );
+                cell =
+                    cell.cursor_text()
+                        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                            cx.stop_propagation();
+                            weak.update(cx, |editor, cx| {
+                                apply_table_structural_change(
+                                    editor,
+                                    &normalize_range,
+                                    TableStructuralChange::Normalize,
+                                    cx,
+                                );
+                            })
+                            .log_err();
+                        });
             } else {
                 let weak = editor.clone();
                 let cell_range = cell_range.clone();
@@ -1950,61 +2245,63 @@ fn render_table_block(
 
         let mut grid = v_flex().flex_grow(1.);
         // Column handles.
-        grid = grid.child(
-            h_flex().child(div().w(handle_width)).children(
-                structure.header.iter().enumerate().map(|(column, _)| {
-                    let weight = column_weights.get(column).copied().unwrap_or(8.);
-                    let selected = selected_unit == Some(TableUnit::Column(column));
-                    div()
-                        .id(("mdlp-column-handle", column))
-                        .debug_selector(|| format!("mdlp-column-handle-{column}"))
-                        .flex_grow(1.)
-                        .flex_basis(gpui::px(weight * 8.))
-                        .min_w(gpui::px(48.))
-                        .h(gpui::px(10.))
-                        .px_2()
-                        .cursor_pointer()
-                        .child(handle_pill(selected).w_full().h(gpui::px(4.)).mt(gpui::px(3.)))
-                        .on_mouse_down(MouseButton::Left, record_press.clone())
-                        .on_mouse_up(MouseButton::Left, select_unit(TableUnit::Column(column)))
-                        .on_drag_move::<TableColumnDrag>({
-                            let weak = editor.clone();
-                            let strip_table_range = table_range.clone();
-                            move |event, _, cx| {
-                                if !event.bounds.contains(&event.event.position) {
-                                    return;
-                                }
-                                if event.drag(cx).table_start != strip_table_range.start {
-                                    return;
-                                }
-                                let after = event.event.position.x > event.bounds.center().x;
-                                let boundary =
-                                    TableBoundary::Column(column + usize::from(after));
-                                set_drop_boundary(&weak, &strip_table_range, boundary, cx);
+        grid = grid.child(h_flex().child(div().w(handle_width)).children(
+            structure.header.iter().enumerate().map(|(column, _)| {
+                let weight = column_weights.get(column).copied().unwrap_or(8.);
+                let selected = selected_unit == Some(TableUnit::Column(column));
+                div()
+                    .id(("mdlp-column-handle", column))
+                    .debug_selector(|| format!("mdlp-column-handle-{column}"))
+                    .flex_grow(1.)
+                    .flex_basis(gpui::px(weight * 8.))
+                    .min_w(gpui::px(48.))
+                    .h(gpui::px(10.))
+                    .px_2()
+                    .cursor_pointer()
+                    .child(
+                        handle_pill(selected)
+                            .w_full()
+                            .h(gpui::px(4.))
+                            .mt(gpui::px(3.)),
+                    )
+                    .on_mouse_down(MouseButton::Left, record_press.clone())
+                    .on_mouse_up(MouseButton::Left, select_unit(TableUnit::Column(column)))
+                    .on_drag_move::<TableColumnDrag>({
+                        let weak = editor.clone();
+                        let strip_table_range = table_range.clone();
+                        move |event, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
                             }
-                        })
-                        .on_drag(
-                            TableColumnDrag {
-                                table_start: table_range.start,
-                                column,
-                            },
-                            {
-                                let weak = editor.clone();
-                                let drag_table_range = table_range.clone();
-                                move |_, _, _, cx| {
-                                    record_drag_source(
-                                        &weak,
-                                        &drag_table_range,
-                                        TableUnit::Column(column),
-                                        cx,
-                                    );
-                                    cx.new(|_| EmptyDragPreview)
-                                }
-                            },
-                        )
-                }),
-            ),
-        );
+                            if event.drag(cx).table_start != strip_table_range.start {
+                                return;
+                            }
+                            let after = event.event.position.x > event.bounds.center().x;
+                            let boundary = TableBoundary::Column(column + usize::from(after));
+                            set_drop_boundary(&weak, &strip_table_range, boundary, cx);
+                        }
+                    })
+                    .on_drag(
+                        TableColumnDrag {
+                            table_start: table_range.start,
+                            column,
+                        },
+                        {
+                            let weak = editor.clone();
+                            let drag_table_range = table_range.clone();
+                            move |_, _, _, cx| {
+                                record_drag_source(
+                                    &weak,
+                                    &drag_table_range,
+                                    TableUnit::Column(column),
+                                    cx,
+                                );
+                                cx.new(|_| EmptyDragPreview)
+                            }
+                        },
+                    )
+            }),
+        ));
         let row_handle = |data_row: Option<usize>| {
             let container = div().w(handle_width).py_1().pr(gpui::px(4.)).flex();
             match data_row {
@@ -2104,16 +2401,21 @@ fn render_table_block(
                 })
                 .on_drag_move::<TableRowDrag>(row_track_drag(None))
                 .child(row_handle(None))
-                .child(h_flex().items_stretch().flex_grow(1.).children(
-                    header_markdown.iter().enumerate().map(|(column, markdown)| {
-                        let empty = Range {
-                            start: Anchor::Min,
-                            end: Anchor::Min,
-                        };
-                        let range = structure.header.get(column).unwrap_or(&empty);
-                        render_cell(range, markdown, column, None)
-                    }),
-                )),
+                .child(
+                    h_flex().items_stretch().flex_grow(1.).children(
+                        header_markdown
+                            .iter()
+                            .enumerate()
+                            .map(|(column, markdown)| {
+                                let empty = Range {
+                                    start: Anchor::Min,
+                                    end: Anchor::Min,
+                                };
+                                let range = structure.header.get(column).unwrap_or(&empty);
+                                render_cell(range, markdown, column, None)
+                            }),
+                    ),
+                ),
         );
         for (row_index, row_markdown) in rows_markdown.iter().enumerate() {
             grid = grid.child(
@@ -2134,22 +2436,20 @@ fn render_table_block(
                     })
                     .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
                     .child(row_handle(Some(row_index)))
-                    .child(
-                        h_flex().items_stretch().flex_grow(1.).children(row_markdown.iter().enumerate().map(
-                            |(column, markdown)| {
-                                let empty = Range {
-                                    start: Anchor::Min,
-                                    end: Anchor::Min,
-                                };
-                                let range = structure
-                                    .rows
-                                    .get(row_index)
-                                    .and_then(|row| row.get(column))
-                                    .unwrap_or(&empty);
-                                render_cell(range, markdown, column, Some(row_index))
-                            },
-                        )),
-                    ),
+                    .child(h_flex().items_stretch().flex_grow(1.).children(
+                        row_markdown.iter().enumerate().map(|(column, markdown)| {
+                            let empty = Range {
+                                start: Anchor::Min,
+                                end: Anchor::Min,
+                            };
+                            let range = structure
+                                .rows
+                                .get(row_index)
+                                .and_then(|row| row.get(column))
+                                .unwrap_or(&empty);
+                            render_cell(range, markdown, column, Some(row_index))
+                        }),
+                    )),
             );
         }
 
@@ -2160,42 +2460,48 @@ fn render_table_block(
         let reveal_source_editor = editor.clone();
         let reveal_source_range = table_range.clone();
 
-        let unit_button = |id: &'static str,
-                           icon: IconName,
-                           action: Option<(TableStructuralChange, Option<TableUnit>)>| {
-            let weak = editor.clone();
-            let action_range = table_range.clone();
-            let enabled = action.is_some();
-            div()
-                .id(id)
-                .px_1()
-                .py_0p5()
-                .rounded_sm()
-                .child(Icon::new(icon).size(IconSize::XSmall).color(if enabled {
-                    Color::Muted
-                } else {
-                    Color::Disabled
-                }))
-                .when_some(action, move |this, (change, new_unit)| {
-                    this.cursor_pointer()
-                        .hover(|this| this.bg(colors.element_hover))
-                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                            cx.stop_propagation();
-                            weak.update(cx, |editor, cx| {
-                                apply_table_structural_change(editor, &action_range, change, cx);
-                                if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
-                                    addon.selected_table_unit =
-                                        new_unit.map(|unit| TableUnitSelection {
-                                            table_range: action_range.clone(),
-                                            unit,
-                                        });
-                                }
-                                cx.notify();
+        let unit_button =
+            |id: &'static str,
+             icon: IconName,
+             action: Option<(TableStructuralChange, Option<TableUnit>)>| {
+                let weak = editor.clone();
+                let action_range = table_range.clone();
+                let enabled = action.is_some();
+                div()
+                    .id(id)
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(if enabled {
+                        Color::Muted
+                    } else {
+                        Color::Disabled
+                    }))
+                    .when_some(action, move |this, (change, new_unit)| {
+                        this.cursor_pointer()
+                            .hover(|this| this.bg(colors.element_hover))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                weak.update(cx, |editor, cx| {
+                                    apply_table_structural_change(
+                                        editor,
+                                        &action_range,
+                                        change,
+                                        cx,
+                                    );
+                                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                                        addon.selected_table_unit =
+                                            new_unit.map(|unit| TableUnitSelection {
+                                                table_range: action_range.clone(),
+                                                unit,
+                                            });
+                                    }
+                                    cx.notify();
+                                })
+                                .log_err();
                             })
-                            .log_err();
-                        })
-                })
-        };
+                    })
+            };
         let controls = selected_unit.map(|unit| {
             let rows_len = structure.rows.len();
             let columns_len = structure.header.len();
@@ -2206,11 +2512,11 @@ fn render_table_block(
                 TableUnit::Column(column) => (columns_len > 1 && column < columns_len)
                     .then_some((TableStructuralChange::DeleteColumn(column), None)),
             };
-            h_flex()
-                .gap_1()
-                .pb_1()
-                .pl(handle_width)
-                .child(unit_button("mdlp-unit-delete", IconName::Trash, delete))
+            h_flex().gap_1().pb_1().pl(handle_width).child(unit_button(
+                "mdlp-unit-delete",
+                IconName::Trash,
+                delete,
+            ))
         });
 
         let apply_boundary_drop = |weak: WeakEntity<Editor>,
@@ -2316,89 +2622,86 @@ fn render_table_block(
                     .max_w(max_width * 0.95)
                     .children(controls)
                     .child(
-                        h_flex()
-                            .items_stretch()
-                            .child(grid)
-                            .child(
-                                v_flex()
-                                    .w(gpui::px(22.))
-                                    .child(
-                                        // Reveal the table's markdown source.
-                                        div()
-                                            .id("mdlp-table-source")
-                                            .h(gpui::px(22.))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .text_color(colors.text_muted)
-                                            .opacity(0.)
-                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
-                                            .hover(|this| this.opacity(1.))
-                                            .child(
-                                                Icon::new(IconName::Code)
-                                                    .size(IconSize::XSmall)
-                                                    .color(Color::Muted),
-                                            )
-                                            .tooltip(ui::Tooltip::text("Edit table source"))
-                                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                                cx.stop_propagation();
-                                                reveal_source_editor
-                                                    .update(cx, |editor, cx| {
-                                                        if let Some(addon) =
-                                                            editor.addon_mut::<LivePreviewAddon>()
-                                                        {
-                                                            addon.source_revealed =
-                                                                Some(reveal_source_range.clone());
-                                                        }
-                                                        let snapshot =
-                                                            editor.buffer().read(cx).snapshot(cx);
-                                                        let offset = reveal_source_range
-                                                            .start
-                                                            .to_offset(&snapshot);
-                                                        editor.change_selections(
-                                                            Default::default(),
-                                                            window,
-                                                            cx,
-                                                            |selections| {
-                                                                selections
-                                                                    .select_ranges([offset..offset]);
-                                                            },
-                                                        );
-                                                    })
-                                                    .log_err();
-                                            }),
-                                    )
-                                    .child(
-                                        // Add column to the right.
-                                        div()
-                                            .id("mdlp-add-column")
-                                            .flex_grow(1.)
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .cursor_pointer()
-                                            .text_color(colors.text_muted)
-                                            .opacity(0.)
-                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
-                                            .hover(|this| this.opacity(1.))
-                                            .child("+")
-                                            .tooltip(ui::Tooltip::text("Add column to the right"))
-                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                                cx.stop_propagation();
-                                                add_column_editor
-                                                    .update(cx, |editor, cx| {
-                                                        apply_table_structural_change(
-                                                            editor,
-                                                            &add_column_range,
-                                                            TableStructuralChange::AddColumn,
-                                                            cx,
-                                                        );
-                                                    })
-                                                    .log_err();
-                                            }),
-                                    ),
-                            ),
+                        h_flex().items_stretch().child(grid).child(
+                            v_flex()
+                                .w(gpui::px(22.))
+                                .child(
+                                    // Reveal the table's markdown source.
+                                    div()
+                                        .id("mdlp-table-source")
+                                        .h(gpui::px(22.))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .text_color(colors.text_muted)
+                                        .opacity(0.)
+                                        .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                        .hover(|this| this.opacity(1.))
+                                        .child(
+                                            Icon::new(IconName::Code)
+                                                .size(IconSize::XSmall)
+                                                .color(Color::Muted),
+                                        )
+                                        .tooltip(ui::Tooltip::text("Edit table source"))
+                                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            reveal_source_editor
+                                                .update(cx, |editor, cx| {
+                                                    if let Some(addon) =
+                                                        editor.addon_mut::<LivePreviewAddon>()
+                                                    {
+                                                        addon.source_revealed =
+                                                            Some(reveal_source_range.clone());
+                                                    }
+                                                    let snapshot =
+                                                        editor.buffer().read(cx).snapshot(cx);
+                                                    let offset = reveal_source_range
+                                                        .start
+                                                        .to_offset(&snapshot);
+                                                    editor.change_selections(
+                                                        Default::default(),
+                                                        window,
+                                                        cx,
+                                                        |selections| {
+                                                            selections
+                                                                .select_ranges([offset..offset]);
+                                                        },
+                                                    );
+                                                })
+                                                .log_err();
+                                        }),
+                                )
+                                .child(
+                                    // Add column to the right.
+                                    div()
+                                        .id("mdlp-add-column")
+                                        .flex_grow(1.)
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .text_color(colors.text_muted)
+                                        .opacity(0.)
+                                        .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                        .hover(|this| this.opacity(1.))
+                                        .child("+")
+                                        .tooltip(ui::Tooltip::text("Add column to the right"))
+                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                            cx.stop_propagation();
+                                            add_column_editor
+                                                .update(cx, |editor, cx| {
+                                                    apply_table_structural_change(
+                                                        editor,
+                                                        &add_column_range,
+                                                        TableStructuralChange::AddColumn,
+                                                        cx,
+                                                    );
+                                                })
+                                                .log_err();
+                                        }),
+                                ),
+                        ),
                     )
                     .child(
                         // Add row below.
@@ -2505,7 +2808,10 @@ fn render_image_block(
             .upgrade()
             .map(|editor_entity| {
                 let editor_ref = editor_entity.read(block_cx.app);
-                let snapshot = editor_ref.buffer().read(block_cx.app).snapshot(block_cx.app);
+                let snapshot = editor_ref
+                    .buffer()
+                    .read(block_cx.app)
+                    .snapshot(block_cx.app);
                 editor_ref
                     .addon::<LivePreviewAddon>()
                     .and_then(|addon| addon.selected_image.as_ref())
@@ -2569,48 +2875,38 @@ fn render_image_block(
                 }
             })
             .when_some(content_width, |this, width| this.w(width))
-            .when(content_width.is_none(), |this| {
-                this.max_w(max_width * 0.66)
-            })
+            .when(content_width.is_none(), |this| this.max_w(max_width * 0.66))
             .child(image_content);
 
         if selected {
             content = content
                 .child(
                     // Reveal-source button, top right.
-                    div()
-                        .absolute()
-                        .top_1()
-                        .right_1()
-                        .child(
-                            IconButton::new("mdlp-show-source", IconName::Code)
-                                .style(ButtonStyle::Filled)
-                                .on_click(move |_, window, cx| {
-                                    cx.stop_propagation();
-                                    reveal_editor
-                                        .update(cx, |editor, cx| {
-                                            if let Some(addon) =
-                                                editor.addon_mut::<LivePreviewAddon>()
-                                            {
-                                                addon.source_revealed =
-                                                    Some(reveal_range.clone());
-                                            }
-                                            let snapshot =
-                                                editor.buffer().read(cx).snapshot(cx);
-                                            let offset = start.to_offset(&snapshot);
-                                            editor.change_selections(
-                                                Default::default(),
-                                                window,
-                                                cx,
-                                                |selections| {
-                                                    selections
-                                                        .select_ranges([offset..offset]);
-                                                },
-                                            );
-                                        })
-                                        .log_err();
-                                }),
-                        ),
+                    div().absolute().top_1().right_1().child(
+                        IconButton::new("mdlp-show-source", IconName::Code)
+                            .style(ButtonStyle::Filled)
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                reveal_editor
+                                    .update(cx, |editor, cx| {
+                                        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
+                                        {
+                                            addon.source_revealed = Some(reveal_range.clone());
+                                        }
+                                        let snapshot = editor.buffer().read(cx).snapshot(cx);
+                                        let offset = start.to_offset(&snapshot);
+                                        editor.change_selections(
+                                            Default::default(),
+                                            window,
+                                            cx,
+                                            |selections| {
+                                                selections.select_ranges([offset..offset]);
+                                            },
+                                        );
+                                    })
+                                    .log_err();
+                            }),
+                    ),
                 )
                 .child(
                     // Resize handle, bottom right.
@@ -2655,10 +2951,9 @@ fn render_image_block(
             })
             .on_drag_move::<ImageResizeDrag>(move |event, _window, cx| {
                 let drag = event.drag(cx);
-                let width = (event.event.position.x
-                    - event.bounds.left()
-                    - drag.content_left_offset)
-                    .max(gpui::px(64.));
+                let width =
+                    (event.event.position.x - event.bounds.left() - drag.content_left_offset)
+                        .max(gpui::px(64.));
                 let width = (f32::from(width) / 4.).round() * 4.;
                 let drag_range = drag.range.clone();
                 drag_editor
@@ -2734,6 +3029,87 @@ fn render_rule_block(
                     .log_err();
             })
             .child(div().flex_1().h(gpui::px(2.)).bg(border_color))
+            .into_any_element()
+    })
+}
+
+/// Renders display math as a centered formula.
+///
+/// In replace mode (`below == false`) the widget stands in for the source
+/// lines, so while the render is pending — or permanently, if the LaTeX does
+/// not parse — it shows the source text instead: the buffer content must
+/// never disappear. In below mode the source lines are already visible above
+/// the widget, so those states render nothing.
+fn render_math_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    source: SharedString,
+    below: bool,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let editor = editor.clone();
+        let start = range.start;
+        let cx = &mut *block_cx.app;
+        let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+        let font_size = theme_settings.buffer_font_size(cx);
+        let buffer_font = theme_settings.buffer_font.clone();
+        let text_color = cx.theme().colors().editor_foreground;
+        let key = MathKey {
+            source: source.clone(),
+            style: MathStyle::Display,
+            color: u32::from(gpui::Rgba::from(text_color)),
+        };
+
+        let content = match cx.default_global::<MathCache>().entries.get(&key) {
+            Some(MathEntry::Ready {
+                image,
+                width_em,
+                height_em,
+                ..
+            }) => {
+                let math_em = font_size * MATH_FONT_SCALE;
+                let height = math_em * *height_em;
+                let width = math_em * *width_em;
+                img(ImageSource::Render(image.clone()))
+                    .h(height)
+                    .w(width)
+                    .into_any_element()
+            }
+            _ if below => Empty.into_any_element(),
+            _ => div()
+                .font(buffer_font)
+                .text_size(font_size)
+                .text_color(text_color)
+                .child(source.clone())
+                .into_any_element(),
+        };
+
+        div()
+            .w(block_cx.max_width)
+            .py(block_cx.line_height * 0.25)
+            .flex()
+            .justify_center()
+            .items_center()
+            .when(!below, |this| {
+                this.cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        editor
+                            .update(cx, |editor, cx| {
+                                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                                let offset = start.to_offset(&snapshot);
+                                editor.change_selections(
+                                    Default::default(),
+                                    window,
+                                    cx,
+                                    |selections| {
+                                        selections.select_ranges([offset..offset]);
+                                    },
+                                );
+                            })
+                            .log_err();
+                    })
+            })
+            .child(content)
             .into_any_element()
     })
 }
@@ -2973,8 +3349,7 @@ impl Extraction<'_> {
     fn anchor_range(&self, range: Range<usize>) -> Range<Anchor> {
         // Bias the anchors inward so text inserted at the boundaries falls
         // outside the hidden range rather than growing it.
-        self.snapshot
-            .anchor_after(MultiBufferOffset(range.start))
+        self.snapshot.anchor_after(MultiBufferOffset(range.start))
             ..self.snapshot.anchor_before(MultiBufferOffset(range.end))
     }
 
@@ -2986,6 +3361,96 @@ impl Extraction<'_> {
                     reveal_span: self.anchor_range(reveal_span),
                 },
             });
+        }
+    }
+
+    /// Claims a `latex_block` node (`$x$` or `$$x$$`) as a math marker
+    /// spanning the delimiters as well as the body, so concealing it replaces
+    /// the whole construct with one typeset image.
+    ///
+    /// The grammar treats a run of one or more `$` as the delimiter, so the
+    /// opening run's length is what separates inline from display math.
+    /// Following Obsidian, `$...$` requires a non-space immediately inside
+    /// each delimiter — so prose like "cost $5 and $10" stays prose — while
+    /// `$$...$$` tolerates padding. Display math that sits alone on its lines
+    /// becomes a centered block; mid-line `$$...$$` renders inline (in
+    /// compact text style) because a block replacement would swallow its
+    /// neighbors and display-style layout cannot fit within a line.
+    fn latex(&mut self, node: tree_sitter::Node) {
+        let mut delimiters = Vec::new();
+        for index in 0..node.child_count() as u32 {
+            let Some(child) = node.child(index) else {
+                continue;
+            };
+            if child.kind() == "latex_span_delimiter" {
+                delimiters.push(child);
+            }
+        }
+        // An unterminated `$` parses without a closing delimiter; leave it as
+        // plain text so typing a lone dollar sign does not flicker.
+        let (Some(open), Some(close)) = (delimiters.first(), delimiters.last()) else {
+            return;
+        };
+        if delimiters.len() < 2 || open.end_byte() > close.start_byte() {
+            return;
+        }
+
+        let Some(source) = self.text.get(open.end_byte()..close.start_byte()) else {
+            return;
+        };
+        if source.trim().is_empty() {
+            return;
+        }
+
+        let display = open.byte_range().len() >= 2;
+        if !display
+            && (source.starts_with(|c: char| c.is_whitespace())
+                || source.ends_with(|c: char| c.is_whitespace()))
+        {
+            return;
+        }
+
+        if display && self.node_is_alone_on_its_lines(node) {
+            let (start_row, end_row) = self.node_rows(node);
+            let height_estimate = (end_row - start_row + 1).max(2);
+            self.push_block_rows(
+                start_row,
+                end_row,
+                height_estimate,
+                BlockRenderKind::Math {
+                    source: source.to_string(),
+                },
+            );
+            return;
+        }
+
+        self.inline.push(InlineMarker {
+            range: self.anchor_range(node.byte_range()),
+            kind: InlineKind::Math {
+                source: SharedString::from(source.to_string()),
+                // Mid-line `$$...$$` also uses inline (text) style: display
+                // style stacks limits and full-size fractions, which cannot
+                // fit within a fixed-height editor line.
+                style: MathStyle::Inline,
+            },
+        });
+    }
+
+    /// Whether only whitespace shares the node's first and last lines with it.
+    fn node_is_alone_on_its_lines(&self, node: tree_sitter::Node) -> bool {
+        let line_start = self.text[..node.start_byte()]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let line_end = self.text[node.end_byte()..]
+            .find('\n')
+            .map_or(self.text.len(), |index| node.end_byte() + index);
+        let before = self.text.get(line_start..node.start_byte());
+        let after = self.text.get(node.end_byte()..line_end);
+        match (before, after) {
+            (Some(before), Some(after)) => {
+                before.chars().all(char::is_whitespace) && after.chars().all(char::is_whitespace)
+            }
+            _ => false,
         }
     }
 
@@ -3055,8 +3520,9 @@ impl Extraction<'_> {
                             let end_row = offsets.end.to_point(self.snapshot).row;
                             // One textual table can contain several table
                             // nodes; only the first one produces the block.
-                            let claimed =
-                                self.last_table_end_row.is_some_and(|last| start_row <= last);
+                            let claimed = self
+                                .last_table_end_row
+                                .is_some_and(|last| start_row <= last);
                             if !claimed {
                                 self.last_table_end_row = Some(end_row);
                                 self.push_block_rows(
@@ -3217,6 +3683,9 @@ impl Extraction<'_> {
                         }
                     }
                     push_children(node, &mut stack);
+                }
+                "latex_block" => {
+                    self.latex(node);
                 }
                 "code_span" => {
                     self.code_spans.push(node.byte_range());
