@@ -986,6 +986,12 @@ impl gpui::Global for MathCache {}
 /// actual size.
 const MATH_RASTER_EM: f32 = 64.0;
 
+/// Formulas render at this multiple of the buffer font size. The KaTeX fonts
+/// have a visibly smaller x-height than code fonts, so at 1:1 math looks
+/// shrunken next to prose; this is the same ratio KaTeX's own stylesheet
+/// applies (`.katex { font-size: 1.21em }`).
+const MATH_FONT_SCALE: f32 = 1.21;
+
 /// Ensures a render for `key` is in flight or complete, and returns whether
 /// the cache already holds a finished image.
 ///
@@ -1101,6 +1107,17 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                     style,
                     color: u32::from(gpui::Rgba::from(text_color)),
                 };
+                let line_height = font_size * theme_settings.line_height();
+                let text_system = cx.text_system().clone();
+                let font_id = text_system.resolve_font(&buffer_font);
+                let ascent = text_system.ascent(font_id, font_size);
+                // `TextSystem::descent` is negative on macOS (a signed offset
+                // below the baseline), while the painted baseline's formula
+                // (`gpui::paint_line`) works in magnitudes — feeding the
+                // signed value into `baseline_offset` lands 2×descent too
+                // low, so compute the baseline from magnitudes directly.
+                let descent = text_system.descent(font_id, font_size).abs();
+                let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
 
                 match cx.default_global::<MathCache>().entries.get(&key) {
                     Some(MathEntry::Ready {
@@ -1109,22 +1126,34 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                         width_em,
                         height_em,
                     }) => {
-                        let height = font_size * *height_em;
-                        let width = font_size * *width_em;
-                        // Shift down by the part of the formula that hangs
-                        // below the baseline, so the typeset baseline lands on
-                        // the surrounding text's baseline instead of the
-                        // image floating mid-line.
-                        let descent = height * *baseline_fraction;
+                        let math_em = font_size * MATH_FONT_SCALE;
+                        let height = math_em * *height_em;
+                        let width = math_em * *width_em;
+                        // The editor centers inline elements in the line
+                        // (element top lands at `(line_height - height) / 2`),
+                        // while text baselines sit at `baseline_offset`. Shift
+                        // the image by the difference so the formula's
+                        // baseline lands exactly on the text's.
+                        let formula_ascent = height * (1.0 - *baseline_fraction);
+                        let shift = text_baseline - (line_height - height) / 2.0 - formula_ascent;
+                        // The centering offsets a padded element by half its
+                        // padding, so doubling the needed shift as one-sided
+                        // padding moves the image by exactly `shift` without
+                        // relying on inset positioning.
+                        let (pad_top, pad_bottom) = if shift >= gpui::px(0.) {
+                            (shift * 2.0, gpui::px(0.))
+                        } else {
+                            (gpui::px(0.), shift * -2.0)
+                        };
                         div()
-                            .h(height)
+                            .h(height + pad_top + pad_bottom)
                             .w(width)
+                            .pt(pad_top)
+                            .pb(pad_bottom)
                             .child(
                                 img(ImageSource::Render(image.clone()))
                                     .h(height)
-                                    .w(width)
-                                    .relative()
-                                    .top(descent),
+                                    .w(width),
                             )
                             .into_any_element()
                     }
@@ -3038,8 +3067,9 @@ fn render_math_block(
                 height_em,
                 ..
             }) => {
-                let height = font_size * *height_em;
-                let width = font_size * *width_em;
+                let math_em = font_size * MATH_FONT_SCALE;
+                let height = math_em * *height_em;
+                let width = math_em * *width_em;
                 img(ImageSource::Render(image.clone()))
                     .h(height)
                     .w(width)
@@ -3343,8 +3373,9 @@ impl Extraction<'_> {
     /// Following Obsidian, `$...$` requires a non-space immediately inside
     /// each delimiter — so prose like "cost $5 and $10" stays prose — while
     /// `$$...$$` tolerates padding. Display math that sits alone on its lines
-    /// becomes a centered block; mid-line `$$...$$` renders inline (in display
-    /// style) because a block replacement would swallow its neighbors.
+    /// becomes a centered block; mid-line `$$...$$` renders inline (in
+    /// compact text style) because a block replacement would swallow its
+    /// neighbors and display-style layout cannot fit within a line.
     fn latex(&mut self, node: tree_sitter::Node) {
         let mut delimiters = Vec::new();
         for index in 0..node.child_count() as u32 {
@@ -3397,11 +3428,10 @@ impl Extraction<'_> {
             range: self.anchor_range(node.byte_range()),
             kind: InlineKind::Math {
                 source: SharedString::from(source.to_string()),
-                style: if display {
-                    MathStyle::Display
-                } else {
-                    MathStyle::Inline
-                },
+                // Mid-line `$$...$$` also uses inline (text) style: display
+                // style stacks limits and full-size fractions, which cannot
+                // fit within a fixed-height editor line.
+                style: MathStyle::Inline,
             },
         });
     }
