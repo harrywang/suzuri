@@ -1773,7 +1773,17 @@ fn render_table_block(
                 let weak = editor.clone();
                 let cell_range = cell_range.clone();
                 cell = cell
-                    .child(MarkdownElement::new(markdown.clone(), style.clone()))
+                    // `min_w_0` is load-bearing: as a flex item the markdown
+                    // container would otherwise take its min-content width,
+                    // which for text measured without a definite width is the
+                    // whole unwrapped line. The cell itself still shrinks to
+                    // its column share, so long content spills over the border
+                    // instead of wrapping.
+                    .child(
+                        div()
+                            .min_w_0()
+                            .child(MarkdownElement::new(markdown.clone(), style.clone())),
+                    )
                     .cursor_text()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         cx.stop_propagation();
