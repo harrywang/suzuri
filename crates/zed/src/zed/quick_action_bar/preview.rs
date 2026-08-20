@@ -11,7 +11,9 @@ enum PreviewTarget {
     Markdown(Entity<Editor>),
     Svg(Entity<MultiBuffer>),
     TabularData(Entity<Editor>),
-    Typeset(Entity<Editor>),
+    /// Carries its own label: Typst and LaTeX preview as a PDF in a split,
+    /// HTML opens in the browser.
+    Typeset(Entity<Editor>, &'static str),
 }
 
 impl QuickActionBar {
@@ -35,9 +37,9 @@ impl QuickActionBar {
         {
             PreviewTarget::TabularData(editor.clone())
         } else if let Some(editor) = editor
-            && typeset_preview::is_typeset_editor(&editor, cx)
+            && let Some(label) = typeset_preview::preview_label_for_editor(&editor, cx)
         {
-            PreviewTarget::Typeset(editor)
+            PreviewTarget::Typeset(editor, label)
         } else {
             return None;
         };
@@ -58,9 +60,9 @@ impl QuickActionBar {
                 "Preview Tabular Data",
                 &tabular_data_preview::OpenPreview as &dyn gpui::Action,
             ),
-            PreviewTarget::Typeset(_) => (
+            PreviewTarget::Typeset(_, label) => (
                 "open-typeset-preview",
-                "Open Live PDF Preview",
+                *label,
                 &typeset_preview::OpenLivePreview as &dyn gpui::Action,
             ),
         };
@@ -134,7 +136,7 @@ impl QuickActionBar {
                                     );
                                 }
                             }
-                            PreviewTarget::Typeset(editor) => {
+                            PreviewTarget::Typeset(editor, _) => {
                                 typeset_preview::open_live_preview_for_editor(
                                     workspace,
                                     editor.clone(),

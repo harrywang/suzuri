@@ -1151,14 +1151,11 @@ impl ProjectPanel {
                     entry.path.as_std_path(),
                     project.languages(),
                 );
-            let is_typeset = !is_dir
-                && entry
-                    .path
-                    .extension()
-                    .is_some_and(|extension| {
-                        let extension = extension.to_ascii_lowercase();
-                        extension == "typ" || extension == "tex" || extension == "latex"
-                    });
+            // Single source of truth for what is previewable and what the
+            // entry should be called — HTML opens in a browser, not a PDF.
+            let typeset_label = (!is_dir)
+                .then(|| typeset_preview::preview_label(entry.path.as_std_path()))
+                .flatten();
 
             let settings = ProjectPanelSettings::get_global(cx);
             let visible_worktrees_count = project.visible_worktrees(cx).count();
@@ -1190,8 +1187,8 @@ impl ProjectPanel {
                         menu.when(is_markdown, |menu| {
                             menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                         })
-                        .when(is_typeset, |menu| {
-                            menu.action("Open Live PDF Preview", Box::new(OpenTypesetPreview))
+                        .when_some(typeset_label, |menu, label| {
+                            menu.action(label, Box::new(OpenTypesetPreview))
                         })
                         .when(is_dir, |menu| {
                             menu.action("Search Inside", Box::new(NewSearchInDirectory))
@@ -1213,8 +1210,8 @@ impl ProjectPanel {
                             .when(is_markdown, |menu| {
                                 menu.action("Open Markdown Preview", Box::new(OpenMarkdownPreview))
                             })
-                            .when(is_typeset, |menu| {
-                                menu.action("Open Live PDF Preview", Box::new(OpenTypesetPreview))
+                            .when_some(typeset_label, |menu, label| {
+                                menu.action(label, Box::new(OpenTypesetPreview))
                             })
                             .when(is_dir, |menu| {
                                 menu.separator()

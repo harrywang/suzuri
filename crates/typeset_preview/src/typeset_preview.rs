@@ -1,5 +1,6 @@
 //! Live typeset preview: write Typst or LaTeX in one pane and watch the
-//! compiled PDF in another.
+//! compiled PDF in another. HTML opens in the system browser instead —
+//! GPUI has no webview, and a real browser beats any approximation.
 //!
 //! `typeset_preview::OpenLivePreview` compiles the active buffer's file and
 //! opens the resulting PDF in a split. From then on, every save of that file
@@ -24,8 +25,8 @@ use workspace::{Toast, Workspace};
 actions!(
     typeset_preview,
     [
-        /// Compiles the current Typst or LaTeX file and opens its PDF in a
-        /// split; keeps recompiling on every save.
+        /// Previews the current file: Typst and LaTeX compile to a PDF in a
+        /// split and recompile on every save; HTML opens in the browser.
         OpenLivePreview
     ]
 );
@@ -45,6 +46,9 @@ impl Global for LiveCompileRegistry {}
 enum Typesetter {
     Typst,
     Latex,
+    /// GPUI has no webview, so HTML opens in the system browser rather than
+    /// being rendered in a pane — a real browser beats any approximation.
+    Html,
 }
 
 fn typesetter_for(path: &Path) -> Option<Typesetter> {
@@ -56,9 +60,11 @@ fn typesetter_for(path: &Path) -> Option<Typesetter> {
     {
         Some("typ") => Some(Typesetter::Typst),
         Some("tex") | Some("latex") => Some(Typesetter::Latex),
+        Some("html") | Some("htm") => Some(Typesetter::Html),
         _ => None,
     }
 }
+
 
 pub fn init(cx: &mut App) {
     cx.set_global(LiveCompileRegistry::default());
@@ -97,13 +103,22 @@ fn editor_file_path(editor: &Editor, cx: &App) -> Option<PathBuf> {
     Some(file.as_local()?.abs_path(cx))
 }
 
-/// Whether this editor is on a saved Typst or LaTeX file — the gate for
-/// showing live-preview affordances (toolbar button, context menu).
-pub fn is_typeset_editor(editor: &Entity<Editor>, cx: &App) -> bool {
+/// Label for this path's preview affordance, or `None` when the file is not
+/// previewable. Callers use it to decide whether to show a button or menu
+/// entry at all, and what to call it — HTML opens in a browser, so promising
+/// a PDF would be a lie.
+pub fn preview_label(path: &Path) -> Option<&'static str> {
+    match typesetter_for(path)? {
+        Typesetter::Html => Some("Open in Browser"),
+        Typesetter::Typst | Typesetter::Latex => Some("Open Live PDF Preview"),
+    }
+}
+
+/// `preview_label` for the file an editor is on.
+pub fn preview_label_for_editor(editor: &Entity<Editor>, cx: &App) -> Option<&'static str> {
     editor_file_path(editor.read(cx), cx)
         .as_deref()
-        .and_then(typesetter_for)
-        .is_some()
+        .and_then(preview_label)
 }
 
 fn open_live_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut Context<Workspace>) {
@@ -116,8 +131,8 @@ fn open_live_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
     open_live_preview_for_editor(workspace, editor, window, cx);
 }
 
-/// Compiles `editor`'s file and opens the PDF in a split, then keeps
-/// recompiling it on every save.
+/// Previews `editor`'s file: HTML goes to the browser, Typst and LaTeX
+/// compile to a PDF in a split that recompiles on every save.
 pub fn open_live_preview_for_editor(
     workspace: &mut Workspace,
     editor: Entity<Editor>,
@@ -132,13 +147,22 @@ pub fn open_live_preview_for_editor(
         );
         return;
     };
-    if typesetter_for(&path).is_none() {
-        show_toast(
-            workspace,
-            "Live preview works on Typst (.typ) and LaTeX (.tex) files.",
-            cx,
-        );
-        return;
+    match typesetter_for(&path) {
+        None => {
+            show_toast(
+                workspace,
+                "Live preview works on Typst (.typ), LaTeX (.tex), and HTML files.",
+                cx,
+            );
+            return;
+        }
+        // A browser renders HTML properly and keeps it interactive; reload
+        // the tab to see saved changes.
+        Some(Typesetter::Html) => {
+            cx.open_url(&format!("file://{}", path.display()));
+            return;
+        }
+        Some(_) => {}
     }
 
     cx.global_mut::<LiveCompileRegistry>()
@@ -269,6 +293,10 @@ struct CompileCommand {
     program: PathBuf,
     arguments: Vec<String>,
     working_directory: PathBuf,
+    /// Set when the program writes its output but may not exit on its own:
+    /// headless Chrome finishes `--print-to-pdf` and then keeps running. Wait
+    /// for the artifact instead of the exit status, then stop the process.
+    artifact: Option<PathBuf>,
 }
 
 /// Pinned compiler releases for auto-provisioning. PATH installs always take
@@ -337,6 +365,8 @@ fn pending_download_name(path: &Path) -> Option<&'static str> {
                 && !provisioned_binary("tectonic").ok()?.exists())
             .then_some("the Tectonic LaTeX compiler")
         }
+        // Browsers are never downloaded on the user's behalf.
+        Typesetter::Html => None,
     }
 }
 
@@ -353,7 +383,7 @@ async fn compile_command(
         .context("file has no name")?
         .to_string_lossy()
         .into_owned();
-    match typesetter_for(path).context("not a Typst or LaTeX file")? {
+    match typesetter_for(path).context("not a previewable document")? {
         Typesetter::Typst => {
             let program = match which::which("typst") {
                 Ok(program) => program,
@@ -363,6 +393,7 @@ async fn compile_command(
                 program,
                 arguments: vec!["compile".into(), file],
                 working_directory,
+                artifact: None,
             })
         }
         Typesetter::Latex => {
@@ -371,6 +402,7 @@ async fn compile_command(
                     program,
                     arguments: vec![file],
                     working_directory,
+                    artifact: None,
                 })
             } else if let Ok(program) = which::which("latexmk") {
                 Ok(CompileCommand {
@@ -382,6 +414,7 @@ async fn compile_command(
                         file,
                     ],
                     working_directory,
+                    artifact: None,
                 })
             } else {
                 let program = ensure_tectonic(http).await?;
@@ -389,9 +422,13 @@ async fn compile_command(
                     program,
                     arguments: vec![file],
                     working_directory,
+                    artifact: None,
                 })
             }
         }
+        // HTML never reaches here: `open_live_preview_for_editor` hands it
+        // to the browser instead of a compiler.
+        Typesetter::Html => bail!("HTML previews open in a browser"),
     }
 }
 
@@ -554,6 +591,9 @@ async fn fetch_verified(
 }
 
 async fn run_compile(command: CompileCommand) -> Result<()> {
+    if let Some(artifact) = command.artifact.clone() {
+        return run_until_artifact(command, artifact);
+    }
     let output = util::command::new_std_command(&command.program)
         .args(&command.arguments)
         .current_dir(&command.working_directory)
@@ -569,6 +609,52 @@ async fn run_compile(command: CompileCommand) -> Result<()> {
         }
         bail!("{message}")
     }
+}
+
+/// Runs a program that writes `artifact` and may never exit, giving up after
+/// a minute. The artifact counts as finished once it is newer than the run
+/// and its size has stopped changing.
+fn run_until_artifact(command: CompileCommand, artifact: PathBuf) -> Result<()> {
+    use std::time::{Duration, Instant};
+
+    let previously_modified = std::fs::metadata(&artifact)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let started = Instant::now();
+    let mut child = util::command::new_std_command(&command.program)
+        .args(&command.arguments)
+        .current_dir(&command.working_directory)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("running {}", command.program.display()))?;
+
+    let mut last_size = None;
+    let result = loop {
+        let exited = child.try_wait().ok().flatten().is_some();
+        let fresh = std::fs::metadata(&artifact).ok().and_then(|metadata| {
+            let modified = metadata.modified().ok()?;
+            let is_new = previously_modified.is_none_or(|previous| modified > previous);
+            is_new.then_some(metadata.len())
+        });
+        match fresh {
+            // Two equal readings mean the write has settled.
+            Some(size) if size > 0 && last_size == Some(size) => break Ok(()),
+            Some(size) => last_size = Some(size),
+            None if exited => break Err(anyhow::anyhow!("{} wrote no output", command.program.display())),
+            None => {}
+        }
+        if started.elapsed() > Duration::from_secs(60) {
+            break Err(anyhow::anyhow!(
+                "{} did not finish within 60s",
+                command.program.display()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    };
+    child.kill().ok();
+    child.wait().ok();
+    result
 }
 
 fn show_toast(workspace: &mut Workspace, message: &str, cx: &mut Context<Workspace>) {
