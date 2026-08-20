@@ -559,7 +559,6 @@ async fn test_linked_image_renders_as_block(cx: &mut TestAppContext) {
     }
 }
 
-
 #[gpui::test]
 async fn test_images_section_context(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
@@ -601,7 +600,10 @@ async fn test_images_section_context(cx: &mut TestAppContext) {
     // Inline image, reference image, and linked image; the heading is
     // revealed because the cursor sits on it.
     assert_eq!(blocks, 3, "applied block rows: {rows:?}");
-    assert!(rows.contains(&(12, 12)), "linked image row missing: {rows:?}");
+    assert!(
+        rows.contains(&(12, 12)),
+        "linked image row missing: {rows:?}"
+    );
 }
 
 #[gpui::test]
@@ -747,9 +749,18 @@ async fn test_wikilinks_conceal(cx: &mut TestAppContext) {
     "});
     cx.executor().run_until_parked();
     let display = cx.display_text();
-    assert!(display.contains("see CLAUDE and the plan here"), "{display}");
-    assert!(display.contains("embed stays raw: ![[image.png]]"), "{display}");
-    assert!(display.contains("code stays raw: [[not a link]]"), "{display}");
+    assert!(
+        display.contains("see CLAUDE and the plan here"),
+        "{display}"
+    );
+    assert!(
+        display.contains("embed stays raw: ![[image.png]]"),
+        "{display}"
+    );
+    assert!(
+        display.contains("code stays raw: [[not a link]]"),
+        "{display}"
+    );
 }
 
 #[gpui::test]
@@ -969,7 +980,11 @@ async fn test_table_structural_changes(cx: &mut TestAppContext) {
         apply_table_structural_change(editor, &range, TableStructuralChange::AddColumn, cx);
     });
     cx.executor().run_until_parked();
-    assert!(cx.buffer_text().contains("| A | B |   |"), "{}", cx.buffer_text());
+    assert!(
+        cx.buffer_text().contains("| A | B |   |"),
+        "{}",
+        cx.buffer_text()
+    );
 
     // Reuse the now-stale range on purpose: structural ops must re-resolve the
     // table from the live tree, since widget closures outlive edits.
@@ -981,12 +996,13 @@ async fn test_table_structural_changes(cx: &mut TestAppContext) {
     let table_lines: Vec<&str> = text.lines().filter(|line| line.starts_with('|')).collect();
     assert_eq!(table_lines.len(), 4, "{text}");
     assert!(
-        text.lines().filter(|line| line.starts_with('|')).all(|line| line.matches('|').count() == 4),
+        text.lines()
+            .filter(|line| line.starts_with('|'))
+            .all(|line| line.matches('|').count() == 4),
         "every table line should have 3 columns after the changes: {text}"
     );
     assert_eq!(table_lines.len(), 4, "{text}");
 }
-
 
 #[gpui::test]
 async fn test_add_row_no_outer_pipes(cx: &mut TestAppContext) {
@@ -1030,7 +1046,10 @@ async fn test_add_row_no_outer_pipes(cx: &mut TestAppContext) {
         ],
         "full text: {text:?}"
     );
-    assert!(text.contains("\n\nafter"), "must not eat the blank line: {text:?}");
+    assert!(
+        text.contains("\n\nafter"),
+        "must not eat the blank line: {text:?}"
+    );
 }
 
 #[gpui::test]
@@ -1189,7 +1208,10 @@ async fn test_table_reveals_only_via_button(cx: &mut TestAppContext) {
             .and_then(|addon| addon.source_revealed.clone())
             .is_none()
     });
-    assert!(cleared, "reveal must clear when the selection leaves the block");
+    assert!(
+        cleared,
+        "reveal must clear when the selection leaves the block"
+    );
 }
 
 #[gpui::test]
@@ -1254,7 +1276,10 @@ async fn test_move_and_delete_rows_columns(cx: &mut TestAppContext) {
     let text = cx.buffer_text();
     assert!(text.contains("| B | A |"), "{text}");
     assert!(text.contains("| y | x |"), "{text}");
-    assert!(!text.contains("| 1 |"), "deleted row should be gone: {text}");
+    assert!(
+        !text.contains("| 1 |"),
+        "deleted row should be gone: {text}"
+    );
 }
 
 #[gpui::test]
@@ -1304,8 +1329,15 @@ async fn test_drag_row_reorders_via_mouse(cx: &mut TestAppContext) {
             addon.drop_boundary.as_ref().map(|(_, boundary)| *boundary),
         )
     });
-    assert!(drag_active, "drag should be active after moving past threshold");
-    assert_eq!(source_set, Some(TableUnit::Row(0)), "source should be recorded");
+    assert!(
+        drag_active,
+        "drag should be active after moving past threshold"
+    );
+    assert_eq!(
+        source_set,
+        Some(TableUnit::Row(0)),
+        "source should be recorded"
+    );
     assert_eq!(
         boundary_set,
         Some(TableBoundary::Row(2)),
@@ -1370,8 +1402,8 @@ async fn test_drag_row_drop_anywhere_on_table(cx: &mut TestAppContext) {
         gpui::MouseButton::Left,
         gpui::Modifiers::none(),
     );
-    let handle_lower = target_handle.center()
-        + gpui::point(gpui::px(0.), target_handle.size.height * 0.3);
+    let handle_lower =
+        target_handle.center() + gpui::point(gpui::px(0.), target_handle.size.height * 0.3);
     cx.cx.simulate_mouse_move(
         handle_lower,
         gpui::MouseButton::Left,
@@ -1423,16 +1455,10 @@ async fn test_drag_column_release_on_handle_strip(cx: &mut TestAppContext) {
         gpui::Modifiers::none(),
     );
     let right_half = target.center() + gpui::point(target.size.width * 0.3, gpui::px(0.));
-    cx.cx.simulate_mouse_move(
-        right_half,
-        gpui::MouseButton::Left,
-        gpui::Modifiers::none(),
-    );
-    cx.cx.simulate_mouse_up(
-        right_half,
-        gpui::MouseButton::Left,
-        gpui::Modifiers::none(),
-    );
+    cx.cx
+        .simulate_mouse_move(right_half, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx
+        .simulate_mouse_up(right_half, gpui::MouseButton::Left, gpui::Modifiers::none());
     cx.executor().run_until_parked();
 
     let text = cx.buffer_text();
@@ -1516,7 +1542,10 @@ async fn test_drag_column_between_others(cx: &mut TestAppContext) {
         .cx
         .debug_bounds("mdlp-column-handle-0")
         .expect("column handle rendered");
-    let target = cx.cx.debug_bounds("mdlp-cell-h-2").expect("header C rendered");
+    let target = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-2")
+        .expect("header C rendered");
 
     let start = source.center();
     cx.cx
@@ -1528,11 +1557,8 @@ async fn test_drag_column_between_others(cx: &mut TestAppContext) {
     );
     // Left half of column C targets the boundary between B and C.
     let left_half = target.center() - gpui::point(target.size.width * 0.3, gpui::px(0.));
-    cx.cx.simulate_mouse_move(
-        left_half,
-        gpui::MouseButton::Left,
-        gpui::Modifiers::none(),
-    );
+    cx.cx
+        .simulate_mouse_move(left_half, gpui::MouseButton::Left, gpui::Modifiers::none());
     let boundary = cx.update_editor(|editor, _, _| {
         editor
             .addon::<LivePreviewAddon>()
@@ -1584,6 +1610,155 @@ async fn test_table_cell_wraps_long_content(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+async fn test_inline_math_conceals_and_reveals(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // Off-cursor, the whole `$...$` construct is concealed behind one widget.
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        energy is $E = mc^2$ here
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            energy is ⋯ here
+        "}
+    );
+
+    // Cursor inside the formula reveals the LaTeX for editing.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        energy is $E = mˇc^2$ here
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            energy is $E = mc^2$ here
+        "}
+    );
+
+    // Cursor elsewhere on the same line does not reveal it.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        energy iˇs $E = mc^2$ here
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            energy is ⋯ here
+        "}
+    );
+}
+
+#[gpui::test]
+async fn test_inline_math_requires_tight_delimiters(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // Following Obsidian, `$` with whitespace immediately inside is not math,
+    // so dollar amounts in prose stay prose.
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        $ a = b $
+        it costs $5 and $10 today
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            $ a = b $
+            it costs $5 and $10 today
+        "}
+    );
+}
+
+#[gpui::test]
+async fn test_display_math_renders_as_block(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        $$ a = b $$
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    // The delimiters on their own lines — the common research-note format.
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        $$
+        a = b
+        $$
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    assert!(
+        !cx.display_text().contains("a = b"),
+        "multi-line display math should be replaced by its widget: {}",
+        cx.display_text()
+    );
+
+    // Mid-line display math cannot replace its lines without swallowing the
+    // surrounding text, so it renders inline instead.
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        before $$ a = b $$ after
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 0);
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            before ⋯ after
+        "}
+    );
+}
+
+#[gpui::test]
+async fn test_display_math_keeps_rendering_while_editing(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // Cursor inside the formula: the source is revealed, but the rendered
+    // widget stays as a block below it instead of disappearing, so the
+    // typeset result remains visible while editing (Obsidian behavior).
+    cx.set_state(indoc::indoc! {"
+        plain line
+
+        $$ a =ˇ b $$
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    assert!(
+        cx.display_text().contains("$$ a = b $$"),
+        "revealed display math must show its source: {}",
+        cx.display_text()
+    );
+
+    // Cursor back outside: the block replaces the source lines again.
+    cx.set_state(indoc::indoc! {"
+        plainˇ line
+
+        $$ a = b $$
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    assert!(
+        !cx.display_text().contains("$$ a = b $$"),
+        "unrevealed display math must not show its source: {}",
+        cx.display_text()
+    );
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than
@@ -1612,10 +1787,7 @@ async fn test_highlight_key_namespaces_are_independent(cx: &mut TestAppContext) 
     assert!(highlighted(&mut cx, ITALIC) > 0);
 
     cx.update_editor(|editor, _, cx| {
-        editor.clear_highlights(
-            HighlightKey::MarkdownLivePreview(BOLD),
-            cx,
-        );
+        editor.clear_highlights(HighlightKey::MarkdownLivePreview(BOLD), cx);
     });
 
     assert_eq!(highlighted(&mut cx, BOLD), 0);
@@ -1623,4 +1795,16 @@ async fn test_highlight_key_namespaces_are_independent(cx: &mut TestAppContext) 
         highlighted(&mut cx, ITALIC) > 0,
         "clearing one highlight key dropped another key's ranges"
     );
+}
+
+/// Math markers come from the `latex_block` node that tree-sitter-md's inline
+/// grammar only emits when it was generated with its latex extension enabled.
+/// An upstream bump to a build of the grammar without that extension would
+/// silently turn all math back into plain text; this fails instead.
+#[gpui::test]
+async fn test_markdown_inline_grammar_emits_latex_block(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇsome $E = mc^2$ math\n");
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(cx.display_text(), "some ⋯ math\n");
 }

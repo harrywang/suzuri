@@ -10981,6 +10981,7 @@ dependencies = [
 name = "markdown_live_preview"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "collections",
  "editor",
  "gpui",
@@ -10988,6 +10989,7 @@ dependencies = [
  "language",
  "log",
  "markdown",
+ "math_render",
  "multi_buffer",
  "pretty_assertions",
  "project",

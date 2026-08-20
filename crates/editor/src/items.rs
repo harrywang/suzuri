@@ -2638,7 +2638,7 @@ pub fn paste_clipboard_image(editor: &Editor, cx: &mut App) -> bool {
         .trim_matches('/')
         .to_string();
     let attachments_directory = if attachments_folder.is_empty() {
-        note_directory.clone()
+        note_directory
     } else {
         note_directory.join(&attachments_folder)
     };
