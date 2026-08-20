@@ -1554,6 +1554,36 @@ async fn test_drag_column_between_others(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+async fn test_table_cell_wraps_long_content(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | Field | Path |
+        | --- | --- |
+        | Curriculum vitae | `~/Documents/CV/HarryWang-CV-Oct-2025.pdf` or enter `https://harrywang.me` in the website field, then attach the same file again so the archive copy stays in sync |
+        | Report | x |
+    "});
+    cx.executor().run_until_parked();
+
+    let long = cx
+        .cx
+        .debug_bounds("mdlp-cell-0-1")
+        .expect("long cell rendered");
+    let short = cx
+        .cx
+        .debug_bounds("mdlp-cell-1-1")
+        .expect("short cell rendered");
+
+    assert!(
+        long.size.height > short.size.height,
+        "long cell content must wrap inside its column and grow the row, got long={:?} short={:?}",
+        long.size,
+        short.size
+    );
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than
