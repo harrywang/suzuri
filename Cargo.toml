@@ -136,6 +136,7 @@ members = [
     "crates/markdown",
     "crates/markdown_live_preview",
     "crates/markdown_preview",
+    "crates/math_render",
     "crates/media",
     "crates/menu",
     "crates/mermaid_render",
@@ -405,6 +406,7 @@ lsp_locations = { path = "crates/lsp_locations" }
 markdown = { path = "crates/markdown" }
 markdown_live_preview = { path = "crates/markdown_live_preview" }
 markdown_preview = { path = "crates/markdown_preview" }
+math_render = { path = "crates/math_render" }
 media = { path = "crates/media" }
 menu = { path = "crates/menu" }
 mermaid_render = { path = "crates/mermaid_render" }
@@ -767,6 +769,10 @@ pulldown-cmark = { version = "0.13.0", default-features = false }
 quick-xml = "0.38"
 quote = "1.0.9"
 rand = "0.9"
+ratex-layout = "0.1.14"
+ratex-parser = "0.1.14"
+ratex-svg = "0.1.14"
+ratex-types = "0.1.14"
 raw-window-handle = "0.6"
 rayon = "1.8"
 regex = "1.5"

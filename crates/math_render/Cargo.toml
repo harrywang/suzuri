@@ -1,0 +1,24 @@
+[package]
+name = "math_render"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/math_render.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+ratex-layout.workspace = true
+ratex-parser.workspace = true
+ratex-svg = { workspace = true, features = ["embed-fonts"] }
+ratex-types.workspace = true
+
+[dev-dependencies]
+usvg.workspace = true
