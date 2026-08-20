@@ -23,10 +23,15 @@ The fork's own changes are small and additive:
 | Area | Files |
 | --- | --- |
 | Live preview (the feature) | `crates/markdown_live_preview/` |
-| Concealment + highlight hooks it needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs` |
-| Markdown drag-and-drop attachments | `crates/editor/src/items.rs` |
-| Project panel header (file/sort/collapse buttons) | `crates/project_panel/src/project_panel.rs` |
+| PDF viewer (adopted from zed#51040) | `crates/pdf_viewer/` |
+| Live Typst/LaTeX preview | `crates/typeset_preview/` |
+| Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs` |
+| Markdown attachments: drag-and-drop and clipboard paste | `crates/editor/src/items.rs` |
+| Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
+| Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
+| Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
 | Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
+| Branding, CLI name, release infrastructure | `crates/zed/Cargo.toml` (bundle metadata), `crates/zed/resources/app-icon-suzuri*`, `crates/zed/resources/windows/app-icon-suzuri.ico`, `assets/images/suzuri_logo.svg`, `crates/install_cli/src/install_cli_binary.rs`, `script/bundle-mac`, `script/bundle-windows.ps1`, `.github/workflows/suzuri-release.yml` |
 
 `git log --author="Harry Wang" --name-only` is the authoritative list of touched files.
 When editing anything outside that set, assume you are modifying upstream code and keep
@@ -114,14 +119,31 @@ whenever you start depending on a new upstream behavior.
 
 ## Upstream merges
 
-Merging `upstream/main` is routine and the conflict-free case is the dangerous one — a
-41-commit merge landed clean and still failed to compile because `image_resolver` had gained
-an `&App` parameter. Order the checks accordingly:
+Merge weekly. Zed lands roughly 15 commits a day, and conflict pain grows faster than
+linearly with drift: reconciling three separate refactors of the same function at once is
+far worse than three merges of one refactor each. Treat a month as the hard ceiling.
 
-1. `cargo check -p markdown_live_preview` first — signature drift in `editor`/`markdown`/`gpui`
-   surfaces here and nowhere earlier.
-2. `cargo nextest run -p markdown_live_preview` — the contract tests catch semantic drift.
-3. `cargo nextest run -p editor -p project_panel` — the shared files the fork patches.
+Merge on a branch (`git checkout -b merge-upstream-YYYY-MM-DD`), never straight onto `main`.
+The conflict-free case is the dangerous one — a 41-commit merge landed clean and still failed
+to compile because `image_resolver` had gained an `&App` parameter. Order the checks so drift
+surfaces early:
+
+1. `cargo check -p markdown_live_preview -p pdf_viewer -p typeset_preview -p languages` first
+   — signature drift in `editor`/`markdown`/`gpui`/`workspace` surfaces in the fork's own
+   crates and nowhere earlier.
+2. `cargo check -p zed -p editor -p project_panel` — the shared files the fork patches.
+3. `cargo nextest run -p markdown_live_preview -p pdf_viewer -p typeset_preview` — the
+   contract tests catch semantic drift a clean compile hides.
+4. `cargo nextest run -p project_panel -p languages`. Note `undo_create_dirty_file` in
+   `project_panel` fails on a clean upstream tree too; verify by stashing before blaming a merge.
+5. Bundle and smoke-test the real app: live preview, a PDF, a Typst preview, the panel's
+   refresh button.
+
+Conflicts recur in the same handful of registration points (`Cargo.toml` members and paths,
+`crates/zed/src/main.rs` init calls, `crates/zed/src/zed.rs` toolbar block,
+`quick_action_bar/preview.rs`). `git rerere` is enabled, so a resolution once recorded
+replays itself. `README.md` carries `merge=ours` in `.gitattributes` and never conflicts —
+that driver needs `git config merge.ours.driver true` once per clone.
 
 ## Adding a setting
 
