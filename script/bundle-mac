@@ -237,8 +237,10 @@ function sign_app_binaries() {
         open "$app_path"
     fi
 
-    if [[ "$target_dir" = "debug" ]]; then
-        echo "Debug build detected - skipping DMG creation and signing"
+    # A local install has already moved the bundle into /Applications, so there
+    # is nothing left in the build directory for hdiutil to package.
+    if [[ "$target_dir" = "debug" || "$local_install" = true ]]; then
+        echo "Skipping DMG creation and signing"
         if [ "$local_install" = false ]; then
             echo "Created application bundle:"
             echo "$app_path"
