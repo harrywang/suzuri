@@ -8,3 +8,4 @@ crates/zed/resources/windows/zed.sh text eol=lf
 # "ours" merge driver must be enabled once per clone:
 #   git config merge.ours.driver true
 README.md merge=ours
+.github/FUNDING.yml merge=ours

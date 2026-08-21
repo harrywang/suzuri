@@ -139,6 +139,10 @@ surfaces early:
 5. Bundle and smoke-test the real app: live preview, a PDF, a Typst preview, the panel's
    refresh button.
 
+`.github/workflows/` is deleted down to `suzuri-release.yml` alone, so every conflict there
+resolves the same way — keep our deletion — and upstream's *newly added* workflows merge
+clean and must be swept separately. The `sync-upstream` skill carries both one-liners.
+
 Conflicts recur in the same handful of registration points (`Cargo.toml` members and paths,
 `crates/zed/src/main.rs` init calls, `crates/zed/src/zed.rs` toolbar block,
 `quick_action_bar/preview.rs`). `git rerere` is enabled, so a resolution once recorded

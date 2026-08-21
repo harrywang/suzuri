@@ -79,6 +79,30 @@ commit first (`git log upstream/main -1 -- <file>`).
 `README.md` carries `merge=ours` and never conflicts; that driver needs
 `git config merge.ours.driver true` once per clone.
 
+### GitHub workflows: resolve by policy, not by judgment
+
+Suzuri keeps exactly one workflow, `suzuri-release.yml`; all 46 of Zed's others are
+deleted (they target Namespace/self-hosted runners this fork lacks, or automate
+zed-industries org resources). So every conflict under `.github/workflows/` has the
+same answer — keep our deletion — and needs no thought:
+
+```sh
+# Upstream modified a workflow we deleted ("deleted by us"). Keep the deletion.
+git diff --name-only --diff-filter=U -- .github/workflows | xargs -r git rm -q
+
+# Upstream ADDED a workflow. This merges cleanly, conflicts with nothing, and would
+# quietly start running. Easy to miss — sweep it too.
+git ls-files .github/workflows | grep -v '/suzuri-release\.yml$' | xargs -r git rm -q
+```
+
+Run them in that order, and re-run the second one any time `git status` shows a new
+file under `.github/workflows/`. Both are idempotent.
+
+`merge=ours` cannot do this for you. Custom merge drivers are only invoked for
+content-level 3-way merges, when the blob exists on both sides; a modify/delete
+conflict is settled at the tree level and bypasses the driver. That is why the trick
+works for `README.md` (still present in our tree) and not here.
+
 ## 4. Verify, in this order
 
 ```sh
