@@ -2089,6 +2089,25 @@ mod tests {
     // with no error anywhere. Fail loudly here instead.
     //
     // When upstream enables notebooks by default, delete this along with the override.
+    // SUZURI: `init` runs during app startup, which may be before `FeatureFlagStore`
+    // is installed as a global. `has_flag` must still resolve true then, via the
+    // `has_flag_default` fallback — otherwise registration is skipped for the whole
+    // process lifetime and `.ipynb` silently opens as a language-less JSON buffer,
+    // because the `observe_flag` path in `init` never fires without a store either.
+    #[gpui::test]
+    fn suzuri_notebook_flag_resolves_before_the_store_exists(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            assert!(
+                cx.try_global::<feature_flags::FeatureFlagStore>().is_none(),
+                "precondition: this test is about the no-store path"
+            );
+            assert!(
+                cx.has_flag::<NotebookFeatureFlag>(),
+                "notebooks must resolve on before the feature flag store exists"
+            );
+        });
+    }
+
     #[test]
     fn suzuri_notebooks_are_enabled_without_a_feature_flag() {
         assert!(
