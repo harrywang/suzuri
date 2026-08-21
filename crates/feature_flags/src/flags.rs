@@ -5,6 +5,21 @@ pub struct NotebookFeatureFlag;
 impl FeatureFlag for NotebookFeatureFlag {
     const NAME: &'static str = "notebooks";
     type Value = PresenceFlag;
+
+    // SUZURI: notebooks are a first-class document type in a research writing
+    // environment, so `.ipynb` must open as a notebook in release builds. Upstream
+    // still gates this, and its overrides are themselves staff-gated, so forcing the
+    // flag here is the only lever that works in a shipped build.
+    //
+    // Deliberately the *only* fork change needed to turn the feature on: it flows
+    // through upstream's own `register_project_item` call, so there is exactly one
+    // registration. Registering from Suzuri's `main.rs` instead would push a second
+    // opener onto `build_project_item_for_path_fns` once upstream flips the flag.
+    //
+    // Delete this method when upstream enables notebooks by default.
+    fn enabled_for_all() -> bool {
+        true
+    }
 }
 register_feature_flag!(NotebookFeatureFlag);
 

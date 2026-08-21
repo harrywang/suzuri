@@ -31,6 +31,7 @@ The fork's own changes are small and additive:
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
+| Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
 | Branding, CLI name, release infrastructure | `crates/zed/Cargo.toml` (bundle metadata), `crates/zed/resources/app-icon-suzuri*`, `crates/zed/resources/windows/app-icon-suzuri.ico`, `assets/images/suzuri_logo.svg`, `crates/install_cli/src/install_cli_binary.rs`, `script/bundle-mac`, `script/bundle-windows.ps1`, `.github/workflows/suzuri-release.yml` |
 
@@ -145,6 +146,37 @@ Conflicts recur in the same handful of registration points (`Cargo.toml` members
 `quick_action_bar/preview.rs`). `git rerere` is enabled, so a resolution once recorded
 replays itself. `README.md` carries `merge=ours` in `.gitattributes` and never conflicts —
 that driver needs `git config merge.ours.driver true` once per clone.
+
+## Jupyter notebooks (temporary fork delta)
+
+Upstream builds the `.ipynb` notebook editor but gates it behind the unreleased
+`notebooks` feature flag. That flag cannot be turned on in a shipped build — staff rules
+do not apply and `settings.json` overrides are themselves staff-gated
+(`FeatureFlagStore::overrides_enabled`) — so `.ipynb` opens as a language-less JSON
+buffer. **The whole fork delta exists only to bridge the gap until upstream ships this,
+and is designed to be deleted, not maintained.** All three hunks are tagged `SUZURI:`.
+
+1. `crates/feature_flags/src/flags.rs` — `NotebookFeatureFlag::enabled_for_all() -> true`.
+   This is deliberately the only lever used to turn the feature on, so registration still
+   flows through upstream's own `notebook::init`. Do **not** call
+   `register_project_item::<NotebookEditor>` from Suzuri code instead:
+   `ProjectItemRegistry::register` *pushes* onto `build_project_item_for_path_fns`, so
+   that would leave a duplicate opener the moment upstream flips the flag.
+2. `crates/repl/src/repl_editor.rs` — `install_ipykernel_and_assign` split into a
+   reusable `install_ipykernel_with(.., on_ready)`. Pure refactor, no behavior change.
+3. `crates/repl/src/notebook/notebook_ui.rs` — the notebook's kernel picker now installs
+   `ipykernel` when the chosen environment lacks it, matching the toolbar REPL menu.
+   Needed because that toolbar menu is hidden for `.ipynb` (no language on the buffer
+   means `SessionSupport::Unsupported`), leaving notebooks with no way to recover.
+
+`suzuri_notebooks_are_enabled_without_a_feature_flag` in `notebook_ui.rs` pins item 1, so
+a merge that drops the override fails loudly instead of silently reverting to raw JSON.
+
+**When upstream enables notebooks by default**, delete item 1 and its contract test and
+take upstream's `flags.rs` wholesale — nothing else is required, because the notebook
+editor itself was never forked. Items 2 and 3 are worth upstreaming as a PR; until they
+land, they are the only part of this that needs conflict resolution, and
+`notebook_ui.rs` is actively developed upstream, so expect to redo hunk 3 occasionally.
 
 ## Adding a setting
 

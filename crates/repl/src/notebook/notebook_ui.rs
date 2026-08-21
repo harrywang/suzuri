@@ -1310,11 +1310,35 @@ impl NotebookEditor {
             .child(
                 KernelSelector::new(
                     Box::new(move |spec: KernelSpecification, window, cx| {
-                        if let Some(view) = view.upgrade() {
-                            view.update(cx, |this, cx| {
-                                this.change_kernel(spec, window, cx);
-                            });
+                        // SUZURI: mirror the toolbar REPL menu, which installs
+                        // `ipykernel` when the chosen environment lacks it. Without this
+                        // the picker lists such environments (dimmed, labelled
+                        // "ipykernel not installed") but selecting one just fails to
+                        // launch, and the notebook offers no way to fix it — the toolbar
+                        // menu that normally does is hidden for `.ipynb`, whose buffer has
+                        // no language.
+                        if spec.has_ipykernel() {
+                            if let Some(view) = view.upgrade() {
+                                view.update(cx, |this, cx| {
+                                    this.change_kernel(spec, window, cx);
+                                });
+                            }
+                            return;
                         }
+
+                        let view = view.clone();
+                        crate::repl_editor::install_ipykernel_with(
+                            spec,
+                            window,
+                            cx,
+                            move |spec, window, cx| {
+                                if let Some(view) = view.upgrade() {
+                                    view.update(cx, |this, cx| {
+                                        this.change_kernel(spec, window, cx);
+                                    });
+                                }
+                            },
+                        );
                     }),
                     worktree_id,
                     Button::new("kernel-selector", kernel_name.clone())
@@ -2054,7 +2078,26 @@ impl KernelSession for NotebookEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use feature_flags::FeatureFlag as _;
     use gpui::TestAppContext;
+
+    // SUZURI: contract test. `init` only registers `NotebookEditor` as the handler for
+    // `.ipynb` when this resolves true, and in a release build `enabled_for_all` is the
+    // only input that can make it so — staff rules do not apply and settings overrides
+    // are themselves staff-gated. If an upstream merge drops the fork's
+    // `enabled_for_all` override, notebooks silently fall back to opening as raw JSON
+    // with no error anywhere. Fail loudly here instead.
+    //
+    // When upstream enables notebooks by default, delete this along with the override.
+    #[test]
+    fn suzuri_notebooks_are_enabled_without_a_feature_flag() {
+        assert!(
+            NotebookFeatureFlag::enabled_for_all(),
+            "Suzuri opens .ipynb as notebooks in release builds; \
+             restore `enabled_for_all` on NotebookFeatureFlag in crates/feature_flags/src/flags.rs"
+        );
+    }
+
     use project::{FakeFs, Project, ProjectItem as _};
     use serde_json::json;
     use settings::SettingsStore;
