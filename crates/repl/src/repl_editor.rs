@@ -8,6 +8,7 @@ use editor::{Editor, MultiBufferOffset};
 use gpui::{App, Entity, WeakEntity, Window, prelude::*};
 use language::{BufferSnapshot, Language, LanguageName, Point};
 use project::{ProjectItem as _, WorktreeId};
+use util::ResultExt as _;
 use workspace::{Workspace, notifications::NotificationId};
 
 use crate::kernels::PythonEnvKernelSpecification;
@@ -81,8 +82,30 @@ pub fn install_ipykernel_and_assign(
     window: &mut Window,
     cx: &mut App,
 ) -> Result<()> {
+    install_ipykernel_with(kernel_specification, window, cx, move |spec, window, cx| {
+        assign_kernelspec(spec, weak_editor, window, cx).log_err();
+    });
+    Ok(())
+}
+
+/// Installs `ipykernel` into the Python environment backing `kernel_specification`,
+/// then hands the updated spec to `on_ready`.
+///
+/// Specs that cannot be missing `ipykernel` (Jupyter, remote) are passed through
+/// untouched. Progress and failure are reported as workspace toasts.
+///
+/// Callers that own an [`Editor`] want [`install_ipykernel_and_assign`]; this exists
+/// so the notebook editor, which assigns kernels through its own path rather than
+/// through `assign_kernelspec`, can reuse the same install.
+pub fn install_ipykernel_with(
+    kernel_specification: KernelSpecification,
+    window: &mut Window,
+    cx: &mut App,
+    on_ready: impl FnOnce(KernelSpecification, &mut Window, &mut App) + 'static,
+) {
     let KernelSpecification::PythonEnv(ref env_spec) = kernel_specification else {
-        return assign_kernelspec(kernel_specification, weak_editor, window, cx);
+        on_ready(kernel_specification, window, cx);
+        return;
     };
 
     let python_path = env_spec.path.clone();
@@ -171,7 +194,7 @@ pub fn install_ipykernel_and_assign(
                                 has_ipykernel: true,
                                 ..env_spec
                             });
-                        assign_kernelspec(updated_spec, weak_editor, window, cx).ok();
+                        on_ready(updated_spec, window, cx);
                     })
                     .ok();
             }
@@ -197,8 +220,6 @@ pub fn install_ipykernel_and_assign(
         }
     })
     .detach();
-
-    Ok(())
 }
 
 pub fn run(
