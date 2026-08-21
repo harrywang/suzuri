@@ -64,7 +64,9 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("About Zed", zed_actions::About),
-                MenuItem::action("Check for Updates", auto_update::Check),
+                // Not `auto_update::Check`: that asks Zed's release server about
+                // Zed's builds, which would offer to install Zed over Suzuri.
+                MenuItem::action("Check for Updates", suzuri_update::CheckForUpdates),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
                     MenuItem::action("Open Settings", zed_actions::OpenSettings),

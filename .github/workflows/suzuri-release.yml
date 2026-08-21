@@ -21,7 +21,41 @@ permissions:
   contents: write
 
 jobs:
+  # The version a build reports at runtime is SUZURI_VERSION, compiled in, and
+  # it is what suzuri_update compares against the newest GitHub release. A tag
+  # that runs ahead of the constant ships a build that never learns it is out of
+  # date, so refuse to build one — in seconds, rather than after three hours of
+  # compilation.
+  #
+  # Note this is NOT crates/zed/Cargo.toml's version: that one is upstream Zed's,
+  # and every upstream merge moves it.
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare tag with SUZURI_VERSION
+        run: |
+          if [ "${GITHUB_REF_TYPE}" != "tag" ]; then
+            echo "Not a tag build; skipping the version check."
+            exit 0
+          fi
+          source_file=crates/suzuri_update/src/suzuri_update.rs
+          tag_version="${GITHUB_REF_NAME#suzuri-v}"
+          code_version=$(sed -n 's/^pub const SUZURI_VERSION: &str = "\(.*\)";$/\1/p' "$source_file")
+          if [ -z "${code_version}" ]; then
+            echo "::error::Could not read SUZURI_VERSION out of ${source_file}."
+            exit 1
+          fi
+          if [ "${tag_version}" != "${code_version}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match SUZURI_VERSION ${code_version} in ${source_file}."
+            echo "Bump the constant (or retag) so the shipped build reports the version it was released as."
+            exit 1
+          fi
+          echo "Tag and SUZURI_VERSION agree: ${code_version}"
+
   build-mac:
+    needs: check-version
     strategy:
       fail-fast: false
       matrix:
@@ -67,6 +101,7 @@ jobs:
           path: target/${{ matrix.target }}/release/suzuri-*.dmg
 
   build-windows:
+    needs: check-version
     # windows-2022 specifically: it ships ISCC (Inno Setup) on PATH, which
     # bundle-windows.ps1 relies on; windows-2025 images currently do not.
     runs-on: windows-2022
