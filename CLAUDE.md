@@ -147,6 +147,44 @@ Conflicts recur in the same handful of registration points (`Cargo.toml` members
 replays itself. `README.md` carries `merge=ours` in `.gitattributes` and never conflicts —
 that driver needs `git config merge.ours.driver true` once per clone.
 
+## Contributing fixes upstream
+
+Bugs found while working here are usually *upstream Zed* bugs in vendor files, not
+Suzuri bugs. Fixing them in the fork converts someone else's bug into a permanent merge
+conflict surface; fixing them upstream means the patch returns as ordinary vendor code on
+the next weekly merge, at zero fork delta. So fix them upstream — but do the work in this
+repo, which already has `upstream` wired, rather than a second clone. Add the PR remote
+once:
+
+```sh
+git remote add zed-fork https://github.com/harrywang/zed.git
+```
+
+Two guardrails matter, and both are easy to get wrong.
+
+**1. Always branch from `upstream/main`, never from Suzuri's `main`.** This is the single
+way the workflow goes wrong: branching off `main` drags the fork's entire history into the
+pull request.
+
+```sh
+git fetch upstream
+git worktree add ../suzuri-upstream <branch-name> upstream/main
+```
+
+**2. Use a separate worktree; never switch branches in place.** Suzuri's target dir is
+~63G and a feature worktree's is ~68G. Checking out an upstream branch in the main
+checkout invalidates that incremental build, and checking back invalidates it again — two
+near-full rebuilds per fix. A worktree gets its own target dir. Reuse **one** long-lived
+upstream worktree across fixes, resetting it to a fresh `upstream/main` each time, rather
+than spawning one per bug: the disk cost is per-worktree and it adds up fast.
+
+Carry a fix locally only when waiting for review actually hurts — data loss, or an error
+message so misleading it costs debugging time. Cosmetic fixes should just come back
+through the merge. When carrying one, do **not** tag it `SUZURI:`; that marker means
+deliberate fork behavior. Note it under a "pending upstream" heading with its PR link, so
+a later merge knows to drop the local copy instead of preserving it. If review reshapes
+the patch, the merge conflicts against your local copy — resolve by taking upstream's.
+
 ## Jupyter notebooks (temporary fork delta)
 
 Upstream builds the `.ipynb` notebook editor but gates it behind the unreleased
