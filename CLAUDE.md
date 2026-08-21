@@ -31,6 +31,7 @@ The fork's own changes are small and additive:
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
+| Update notifications | `crates/suzuri_update/`, `crates/zed/src/zed/app_menus.rs` (the Check for Updates entry) |
 | Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
 | Branding, CLI name, release infrastructure | `crates/zed/Cargo.toml` (bundle metadata), `crates/zed/resources/app-icon-suzuri*`, `crates/zed/resources/windows/app-icon-suzuri.ico`, `assets/images/suzuri_logo.svg`, `crates/install_cli/src/install_cli_binary.rs`, `script/bundle-mac`, `script/bundle-windows.ps1`, `.github/workflows/suzuri-release.yml` |
 
@@ -159,3 +160,33 @@ The chain is spread across crates and the compiler only catches part of it:
 4. `assets/settings/default.json` — the default value plus its user-facing comment.
 5. `crates/settings_ui/src/page_data.rs` if it should appear in the settings UI, and
    `docs/src/reference/all-settings.md` if it should be documented.
+
+## Cutting a release
+
+Suzuri ships on the **dev** release channel, which is what keeps Zed's auto-updater
+dormant (`ReleaseChannel::poll_for_updates` returns false for `Dev`) and what makes
+`[package.metadata.bundle]` — the block carrying Suzuri's branding — the one
+`script/bundle-mac` selects. Do not switch the channel casually: `bundle-stable` is
+still Zed's own metadata, so a stable build would install itself as `Zed.app`.
+
+To release:
+
+1. Bump `SUZURI_VERSION` in `crates/suzuri_update/src/suzuri_update.rs`.
+2. Tag `suzuri-v<that same version>` and push the tag.
+
+The two must agree: `SUZURI_VERSION` is what a running build compares against the
+newest GitHub release, so a tag ahead of the constant ships a build that never
+learns it is out of date. The `check-version` job in
+`.github/workflows/suzuri-release.yml` fails the release early rather than letting
+that happen.
+
+**Suzuri's version is not the `version` in `crates/zed/Cargo.toml`.** That one is
+upstream Zed's own (`Bump Zed to v1.17.0`), which upstream bumps on its own cadence
+and every merge brings along — it tracks the Zed base this fork is built on, not
+Suzuri's releases, and the two number lines are unrelated. `SUZURI_VERSION` lives in
+a fork-owned file precisely so no merge can move it.
+
+`suzuri_update` only *notifies*; it never installs. Zed's installer (`auto_update`)
+is not wired up, and adopting it would need, at minimum, its hardcoded `Zed` DMG
+mount path in `install_release_macos` reconciled with `bundle-mac`'s `-volname Suzuri`,
+plus signing secrets present on every release build.

@@ -202,6 +202,7 @@ members = [
     "crates/sqlez_macros",
     "crates/streaming_diff",
     "crates/sum_tree",
+    "crates/suzuri_update",
     "crates/svg_preview",
     "crates/syntax_theme",
     "crates/system_specs",
@@ -471,6 +472,7 @@ sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 streaming_diff = { path = "crates/streaming_diff" }
 sum_tree = { path = "crates/sum_tree" }
+suzuri_update = { path = "crates/suzuri_update" }
 svg_preview = { path = "crates/svg_preview" }
 syntax_theme = { path = "crates/syntax_theme" }
 system_specs = { path = "crates/system_specs" }

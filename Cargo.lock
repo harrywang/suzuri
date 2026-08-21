@@ -18292,6 +18292,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "suzuri_update"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "http_client",
+ "log",
+ "semver",
+ "settings",
+ "workspace",
+]
+
+[[package]]
 name = "sval"
 version = "2.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -23835,6 +23848,7 @@ dependencies = [
  "smol",
  "snippet_provider",
  "snippets_ui",
+ "suzuri_update",
  "svg_preview",
  "sysinfo 0.37.2",
  "system_specs",
