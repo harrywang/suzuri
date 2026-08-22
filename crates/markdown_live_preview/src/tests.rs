@@ -1,9 +1,9 @@
 use super::*;
 use editor::test::editor_test_context::EditorTestContext;
-use gpui::TestAppContext;
+use gpui::{Modifiers, TestAppContext};
 use language::{Language, LanguageConfig};
 use settings::SettingsStore;
-use std::sync::Arc;
+use std::{cell::Cell, rc::Rc, sync::Arc};
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -1901,4 +1901,59 @@ async fn test_markdown_inline_grammar_emits_latex_block(cx: &mut TestAppContext)
     cx.set_state("ˇsome $E = mc^2$ math\n");
     cx.executor().run_until_parked();
     pretty_assertions::assert_eq!(cx.display_text(), "some ⋯ math\n");
+}
+
+/// A block widget's click-to-reveal defers to buttons rendered inside it by
+/// checking `window.default_prevented()`, which `ButtonLike` sets on left mouse
+/// down. If upstream stopped setting it, pressing a rendered code block's copy
+/// button would tear the widget down mid-click and reveal source instead of
+/// copying.
+#[gpui::test]
+fn test_buttons_prevent_default_on_mouse_down(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    struct ButtonInsideWidget(Rc<Cell<Option<bool>>>);
+
+    impl Render for ButtonInsideWidget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let prevented = self.0.clone();
+            div()
+                .size_full()
+                .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                    prevented.set(Some(window.default_prevented()));
+                })
+                .child(
+                    div().debug_selector(|| "BUTTON".into()).child(
+                        ui::Button::new("copy", "Copy")
+                            .full_width()
+                            .on_click(|_, _, _| {}),
+                    ),
+                )
+        }
+    }
+
+    let prevented = Rc::new(Cell::new(None));
+    let (_view, cx) = cx.add_window_view({
+        let prevented = prevented.clone();
+        move |_window, _cx| ButtonInsideWidget(prevented)
+    });
+    cx.run_until_parked();
+
+    let bounds = cx
+        .debug_bounds("BUTTON")
+        .expect("the button should have been laid out");
+    cx.simulate_event(MouseDownEvent {
+        position: bounds.center(),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+
+    pretty_assertions::assert_eq!(
+        prevented.get(),
+        Some(true),
+        "a button no longer prevents the default mouse-down action, so a block \
+         widget's click-to-reveal will fire on button presses"
+    );
 }
