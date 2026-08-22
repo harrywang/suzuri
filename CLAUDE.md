@@ -186,6 +186,21 @@ deliberate fork behavior. Note it under a "pending upstream" heading with its PR
 a later merge knows to drop the local copy instead of preserving it. If review reshapes
 the patch, the merge conflicts against your local copy — resolve by taking upstream's.
 
+### Pending upstream
+
+Fixes carried locally while their pull request is in review. These are **not** fork
+behavior — do not tag them `SUZURI:`, and drop the local copy once the merge brings the
+patch back as vendor code. If review reshapes a patch, the merge conflicts against the
+local copy; resolve by taking upstream's.
+
+| Fix | Files | PR |
+| --- | --- | --- |
+| Notebook save destroyed rich outputs (`display_data` images, HTML tables, JSON) and rewrote `execute_result` as `display_data`; cell source also gained a trailing newline, churning every cell | `crates/repl/src/notebook/cell.rs`, `crates/repl/src/outputs.rs` | [zed#63064](https://github.com/zed-industries/zed/pull/63064) |
+
+Carried because it is silent data loss: a notebook with plots or tables lost them on
+save with no error, which is exactly the case the "carry it locally" rule above exists
+for.
+
 ## Jupyter notebooks (temporary fork delta)
 
 Upstream builds the `.ipynb` notebook editor but gates it behind the unreleased
