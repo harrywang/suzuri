@@ -179,12 +179,32 @@ near-full rebuilds per fix. A worktree gets its own target dir. Reuse **one** lo
 upstream worktree across fixes, resetting it to a fresh `upstream/main` each time, rather
 than spawning one per bug: the disk cost is per-worktree and it adds up fast.
 
-Carry a fix locally only when waiting for review actually hurts — data loss, or an error
-message so misleading it costs debugging time. Cosmetic fixes should just come back
-through the merge. When carrying one, do **not** tag it `SUZURI:`; that marker means
-deliberate fork behavior. Note it under a "pending upstream" heading with its PR link, so
-a later merge knows to drop the local copy instead of preserving it. If review reshapes
-the patch, the merge conflicts against your local copy — resolve by taking upstream's.
+**Carrying a fix locally.** An upstream PR can sit in review for weeks, so you may also
+cherry-pick it onto Suzuri's `main` to get the fix now. That is not free: the local copy
+is a delta on a vendor file, and when upstream merges the same patch, the next weekly
+merge collides with it. So carry only when waiting actually hurts — data loss, or an
+error message so misleading it costs debugging time. Cosmetic fixes should just come back
+through the merge.
+
+When carrying one:
+
+- Cherry-pick the upstream commit **unchanged**, so a later merge can recognize it.
+- Do **not** tag it `SUZURI:`. That marker means deliberate fork behavior and tells a
+  future merge to *preserve* the hunk — the opposite of what you want. A carried fix is
+  meant to be deleted the moment upstream's version lands.
+- Add a row to the "Pending upstream" table below, with the PR link, so a later merge
+  knows to drop the local copy instead of keeping it.
+- If review reshapes the patch, the merge conflicts against your local copy — resolve by
+  taking upstream's.
+
+### Pending upstream
+
+Fixes carried locally while their pull request is in review, per the rule above. Drop
+the local copy once a merge brings the patch back as vendor code, and clear the row.
+
+| Fix | Files | PR |
+| --- | --- | --- |
+| Notebook save destroyed rich outputs (`display_data` images, HTML tables, JSON) and rewrote `execute_result` as `display_data`; cell source also gained a trailing newline, churning every cell | `crates/repl/src/notebook/cell.rs`, `crates/repl/src/outputs.rs` | [zed#63064](https://github.com/zed-industries/zed/pull/63064) |
 
 ## Jupyter notebooks (temporary fork delta)
 
