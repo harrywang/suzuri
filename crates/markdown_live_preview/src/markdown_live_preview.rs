@@ -20,8 +20,8 @@ use editor::{
 };
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, Focusable as _, FontWeight, HighlightStyle, Hsla,
-    ImageSource, IntoElement, MouseButton, Resource, SharedString, SharedUri, StrikethroughStyle,
-    Subscription, TextStyleRefinement, WeakEntity, Window, actions, img, rems,
+    ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource, SharedString, SharedUri,
+    StrikethroughStyle, Subscription, TextStyleRefinement, WeakEntity, Window, actions, img, rems,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -1229,6 +1229,35 @@ fn buffer_base_directory(editor: &Editor, cx: &App) -> Option<PathBuf> {
     Some(path)
 }
 
+/// Click-to-reveal for a block widget: puts the cursor at the block's first
+/// offset, which makes `recompute` drop the widget and show the raw markdown.
+///
+/// Clicks that a child button already claimed are skipped. `ButtonLike` calls
+/// `window.prevent_default()` on left mouse down for exactly this reason, and
+/// the editor's own `mouse_left_down` honors it — without the same check here,
+/// pressing a rendered code block's copy button tore the widget down before
+/// the mouse up could complete the click, so it revealed source instead of
+/// copying.
+fn reveal_source_on_mouse_down(
+    editor: WeakEntity<Editor>,
+    start: Anchor,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if window.default_prevented() {
+            return;
+        }
+        editor
+            .update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = start.to_offset(&snapshot);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([offset..offset]);
+                });
+            })
+            .log_err();
+    }
+}
+
 fn render_markdown_block(
     markdown: Entity<Markdown>,
     editor: WeakEntity<Editor>,
@@ -1248,17 +1277,10 @@ fn render_markdown_block(
             .pl(gutter_width)
             .w(max_width)
             .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                editor
-                    .update(cx, |editor, cx| {
-                        let snapshot = editor.buffer().read(cx).snapshot(cx);
-                        let offset = start.to_offset(&snapshot);
-                        editor.change_selections(Default::default(), window, cx, |selections| {
-                            selections.select_ranges([offset..offset]);
-                        });
-                    })
-                    .log_err();
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
             .child(
                 MarkdownElement::new(markdown.clone(), style).image_resolver(
                     move |destination, _cx| {
@@ -3017,17 +3039,10 @@ fn render_rule_block(
             .flex()
             .items_center()
             .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                editor
-                    .update(cx, |editor, cx| {
-                        let snapshot = editor.buffer().read(cx).snapshot(cx);
-                        let offset = start.to_offset(&snapshot);
-                        editor.change_selections(Default::default(), window, cx, |selections| {
-                            selections.select_ranges([offset..offset]);
-                        });
-                    })
-                    .log_err();
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
             .child(div().flex_1().h(gpui::px(2.)).bg(border_color))
             .into_any_element()
     })
@@ -3091,23 +3106,10 @@ fn render_math_block(
             .justify_center()
             .items_center()
             .when(!below, |this| {
-                this.cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                        editor
-                            .update(cx, |editor, cx| {
-                                let snapshot = editor.buffer().read(cx).snapshot(cx);
-                                let offset = start.to_offset(&snapshot);
-                                editor.change_selections(
-                                    Default::default(),
-                                    window,
-                                    cx,
-                                    |selections| {
-                                        selections.select_ranges([offset..offset]);
-                                    },
-                                );
-                            })
-                            .log_err();
-                    })
+                this.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    reveal_source_on_mouse_down(editor, start),
+                )
             })
             .child(content)
             .into_any_element()
@@ -3144,17 +3146,10 @@ fn render_frontmatter_block(
             .w(block_cx.max_width)
             .py(gpui::px(2.))
             .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                editor
-                    .update(cx, |editor, cx| {
-                        let snapshot = editor.buffer().read(cx).snapshot(cx);
-                        let offset = start.to_offset(&snapshot);
-                        editor.change_selections(Default::default(), window, cx, |selections| {
-                            selections.select_ranges([offset..offset]);
-                        });
-                    })
-                    .log_err();
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
             .child(
                 v_flex()
                     .rounded_md()
