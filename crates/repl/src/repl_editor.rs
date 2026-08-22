@@ -146,9 +146,9 @@ pub fn install_ipykernel_with(
     let workspace = Workspace::for_window(window, cx);
 
     // PEP 668: an externally managed interpreter turns every installer away, so say what
-    // would actually work instead of starting an install that cannot finish. Callers
-    // discard this function's `Result`, so the explanation has to reach the user as a
-    // toast rather than an error return.
+    // would actually work instead of starting an install that cannot finish. This sits in
+    // the shared helper so the notebook kernel picker is covered too, and it reports
+    // through a toast because neither caller surfaces an error return.
     if !env_spec.can_install_ipykernel {
         if let Some(workspace) = &workspace {
             workspace.update(cx, |workspace, cx| {
@@ -166,7 +166,7 @@ pub fn install_ipykernel_with(
                 );
             });
         }
-        return Ok(());
+        return;
     }
 
     if let Some(workspace) = &workspace {
