@@ -20,8 +20,9 @@ use editor::{
 };
 use gpui::{
     App, AppContext as _, Context, Empty, Entity, Focusable as _, FontWeight, HighlightStyle, Hsla,
-    ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource, SharedString, SharedUri,
-    StrikethroughStyle, Subscription, TextStyleRefinement, WeakEntity, Window, actions, img, rems,
+    ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource, RetainAllImageCache,
+    SharedString, SharedUri, StrikethroughStyle, Subscription, TextStyleRefinement, WeakEntity,
+    Window, actions, img, rems,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -29,6 +30,7 @@ use math_render::{MathStyle, MathTheme};
 use multi_buffer::{
     Anchor, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset as _, ToPoint as _,
 };
+use project::PathChange;
 use settings::{RegisterSetting, Settings};
 use text::Point;
 use ui::{Checkbox, ToggleState, prelude::*};
@@ -153,8 +155,53 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         }),
     );
 
+    // Local images are cached by path, so overwriting a file in place (say,
+    // re-cropping a screenshot) would otherwise keep serving the bitmap
+    // decoded on first render for the life of the process: gpui's app-level
+    // asset cache is never evicted, and outlives the document. Owning the
+    // cache lets a change on disk drop just that entry, and lets closing the
+    // editor release every image it decoded.
+    let image_cache = RetainAllImageCache::new(cx);
+    if let Some(project) = editor.project().cloned() {
+        subscriptions.push(cx.subscribe_in(&project, window, {
+            let image_cache = image_cache.clone();
+            move |_editor, project, event, window, cx| {
+                let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
+                    return;
+                };
+                let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
+                    return;
+                };
+                let changed_images: Vec<PathBuf> = {
+                    let worktree = worktree.read(cx);
+                    changes
+                        .iter()
+                        // `Loaded` is the initial scan reporting what was
+                        // already there, not a change; acting on it would
+                        // re-decode every image in the project on open.
+                        .filter(|(_, _, change)| *change != PathChange::Loaded)
+                        .filter(|(path, _, _)| path.extension().is_some_and(is_image_extension))
+                        .map(|(path, _, _)| worktree.absolutize(path))
+                        .collect()
+                };
+                if changed_images.is_empty() {
+                    return;
+                }
+                image_cache.update(cx, |image_cache, cx| {
+                    for path in changed_images {
+                        image_cache.remove(&Resource::Path(Arc::from(path.as_path())), window, cx);
+                    }
+                });
+                // The widgets keep their blocks; they just need to redraw so
+                // the evicted images are fetched again.
+                cx.notify();
+            }
+        }));
+    }
+
     editor.register_addon(LivePreviewAddon {
         enabled_override: None,
+        image_cache,
         markers: None,
         applied_blocks: Vec::new(),
         selected_image: None,
@@ -181,6 +228,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
 struct LivePreviewAddon {
     /// Per-editor override set by the toggle action; falls back to the setting.
     enabled_override: Option<bool>,
+    /// Cache backing every local image this editor renders, so a file changed
+    /// on disk can be evicted from it. See `register_editor`.
+    image_cache: Entity<RetainAllImageCache>,
     markers: Option<Arc<MarkerSet>>,
     applied_blocks: Vec<AppliedBlock>,
     /// The image widget currently selected (Obsidian-style click state),
@@ -538,6 +588,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         return;
     };
     let markers = addon.markers.clone();
+    let image_cache = addon.image_cache.clone();
     let applied_blocks = std::mem::take(&mut addon.applied_blocks);
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -716,6 +767,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     marker.range.clone(),
                     base_directory.clone(),
                     marker.indent_columns,
+                    image_cache.clone(),
                 )
             }
             BlockRenderKind::Table(structure) => {
@@ -788,6 +840,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     *display_width,
                     destination.clone(),
                     SharedString::from(alt.clone()),
+                    image_cache.clone(),
                 )
             }
             BlockRenderKind::Rule => render_rule_block(
@@ -1264,12 +1317,14 @@ fn render_markdown_block(
     range: Range<Anchor>,
     base_directory: Option<PathBuf>,
     indent_columns: u32,
+    image_cache: Entity<RetainAllImageCache>,
 ) -> RenderBlock {
     Arc::new(move |block_cx| {
         let style = block_markdown_style(block_cx.window, block_cx.app);
         let editor = editor.clone();
         let start = range.start;
         let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
         let max_width = block_cx.max_width;
@@ -1284,7 +1339,7 @@ fn render_markdown_block(
             .child(
                 MarkdownElement::new(markdown.clone(), style).image_resolver(
                     move |destination, _cx| {
-                        resolve_image_source(destination, base_directory.as_deref())
+                        resolve_image_source(destination, base_directory.as_deref(), &image_cache)
                     },
                 ),
             )
@@ -2806,6 +2861,7 @@ fn render_image_block(
     display_width: Option<f32>,
     destination: Option<String>,
     alt: SharedString,
+    image_cache: Entity<RetainAllImageCache>,
 ) -> RenderBlock {
     Arc::new(move |block_cx| {
         let mut style = block_markdown_style(block_cx.window, block_cx.app);
@@ -2814,6 +2870,7 @@ fn render_image_block(
         style.height_is_multiple_of_line_height = true;
         let start = range.start;
         let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
         let max_width = block_cx.max_width;
@@ -2854,9 +2911,9 @@ fn render_image_block(
         // A direct image element lets the selection border hug the image
         // exactly; reference-style images (no inline destination) fall back
         // to the markdown renderer.
-        let resolved = destination
-            .as_deref()
-            .and_then(|destination| resolve_image_source(destination, base_directory.as_deref()));
+        let resolved = destination.as_deref().and_then(|destination| {
+            resolve_image_source(destination, base_directory.as_deref(), &image_cache)
+        });
         let muted = block_cx.app.theme().colors().text_muted;
         let image_content: gpui::AnyElement = match (&destination, resolved) {
             (Some(_), Some(source)) => {
@@ -2880,7 +2937,7 @@ fn render_image_block(
                 .into_any_element(),
             (None, _) => MarkdownElement::new(markdown.clone(), style)
                 .image_resolver(move |destination, _cx| {
-                    resolve_image_source(destination, base_directory.as_deref())
+                    resolve_image_source(destination, base_directory.as_deref(), &image_cache)
                 })
                 .into_any_element(),
         };
@@ -3177,9 +3234,19 @@ fn render_frontmatter_block(
     })
 }
 
+/// Extensions live preview treats as images. Shared by the `![[embed]]`
+/// scanner and the on-disk change watcher so the two agree on what counts.
+fn is_image_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp"
+    )
+}
+
 fn resolve_image_source(
     destination: &str,
     base_directory: Option<&std::path::Path>,
+    image_cache: &Entity<RetainAllImageCache>,
 ) -> Option<ImageSource> {
     if destination.starts_with("data:") {
         return None;
@@ -3199,8 +3266,21 @@ fn resolve_image_source(
     } else {
         base_directory?.join(path)
     };
-    path.exists()
-        .then(|| ImageSource::Resource(Resource::Path(Arc::from(path.as_path()))))
+    if !path.exists() {
+        return None;
+    }
+    // Deliberately not `ImageSource::Resource`: that reads through gpui's
+    // app-level asset cache, which has no eviction, so a file rewritten in
+    // place would keep serving its first-decoded bitmap. Routing every local
+    // image through the editor's own cache is what makes the eviction in
+    // `register_editor` possible.
+    let resource = Resource::Path(Arc::from(path.as_path()));
+    let image_cache = image_cache.clone();
+    Some(ImageSource::Custom(Arc::new(move |window, cx| {
+        image_cache.update(cx, |image_cache, cx| {
+            image_cache.load(&resource, window, cx)
+        })
+    })))
 }
 
 fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
@@ -3864,12 +3944,7 @@ impl Extraction<'_> {
         let is_image = std::path::Path::new(target)
             .extension()
             .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(
-                    extension.to_ascii_lowercase().as_str(),
-                    "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp"
-                )
-            });
+            .is_some_and(is_image_extension);
         if !is_image {
             return;
         }

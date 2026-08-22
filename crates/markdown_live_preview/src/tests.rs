@@ -3,7 +3,11 @@ use editor::test::editor_test_context::EditorTestContext;
 use gpui::{Modifiers, TestAppContext};
 use language::{Language, LanguageConfig};
 use settings::SettingsStore;
-use std::{cell::Cell, rc::Rc, sync::Arc};
+use std::{
+    cell::Cell,
+    rc::Rc,
+    sync::{Arc, Mutex},
+};
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -664,8 +668,8 @@ async fn test_concealments_invisible_to_fold_machinery(cx: &mut TestAppContext) 
     assert_eq!(folded_rows, Vec::<u32>::new());
 }
 
-#[test]
-fn test_image_source_resolution_decodes_percent_encoding() {
+#[gpui::test]
+fn test_image_source_resolution_decodes_percent_encoding(cx: &mut TestAppContext) {
     let dir = std::env::temp_dir().join("mdlp-resolver-test");
     std::fs::create_dir_all(&dir).unwrap();
     // macOS screenshot names mix ASCII spaces (percent-encoded in links)
@@ -673,12 +677,13 @@ fn test_image_source_resolution_decodes_percent_encoding() {
     let file_name = "Screenshot 2026-08-09 at 11.38.37\u{202f}AM.png";
     std::fs::write(dir.join(file_name), b"png").unwrap();
 
+    let image_cache = cx.update(RetainAllImageCache::new);
     let destination = "Screenshot%202026-08-09%20at%2011.38.37\u{202f}AM.png";
     assert!(
-        resolve_image_source(destination, Some(&dir)).is_some(),
+        resolve_image_source(destination, Some(&dir), &image_cache).is_some(),
         "percent-encoded path failed to resolve"
     );
-    assert!(resolve_image_source("missing%20file.png", Some(&dir)).is_none());
+    assert!(resolve_image_source("missing%20file.png", Some(&dir), &image_cache).is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -1956,4 +1961,121 @@ fn test_buttons_prevent_default_on_mouse_down(cx: &mut TestAppContext) {
         "a button no longer prevents the default mouse-down action, so a block \
          widget's click-to-reveal will fire on button presses"
     );
+}
+
+/// The whole reason local images do not use `ImageSource::Resource`: gpui's
+/// app-level asset cache is keyed on the path alone and has no eviction, so a
+/// file rewritten in place — re-cropping a screenshot over its own name — keeps
+/// serving the bitmap decoded on first render for the life of the process, and
+/// reopening the document cannot help because that cache outlives the document.
+///
+/// This pins the whole chain: that the staleness is real, that live preview
+/// therefore routes local files through a cache it owns, and that evicting the
+/// rewritten path from it is what brings the new bitmap back.
+// The probe below wraps the resolved `ImageSource`, and `ImageSource::Custom`
+// holds an `Arc<dyn Fn>` with no `Send`/`Sync` bound, so any wrapper of one
+// trips this lint by construction.
+#[allow(clippy::arc_with_non_send_sync)]
+#[gpui::test]
+async fn test_rewriting_an_image_in_place_reloads_it(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let directory = tempfile::tempdir().expect("failed to create a temp dir");
+    let path = directory.path().join("screenshot.png");
+    let write_image = |width: u32, height: u32| {
+        image::save_buffer(
+            &path,
+            &vec![0xff; (width * height * 4) as usize],
+            width,
+            height,
+            image::ColorType::Rgba8,
+        )
+        .expect("failed to write the test image");
+    };
+    write_image(4, 2);
+
+    let image_cache = cx.update(RetainAllImageCache::new);
+    let source = resolve_image_source("screenshot.png", Some(directory.path()), &image_cache)
+        .expect("an existing file next to the document should resolve");
+    assert!(
+        matches!(source, ImageSource::Custom(_)),
+        "a local image resolved to an app-level asset source, which cannot be \
+         evicted when the file changes on disk"
+    );
+
+    // Record what each draw actually decoded, by wrapping the resolved source.
+    let drawn = Arc::new(Mutex::new(None));
+    let probe = ImageSource::Custom(Arc::new({
+        let drawn = drawn.clone();
+        move |window, cx| {
+            let ImageSource::Custom(load) = &source else {
+                unreachable!("checked above");
+            };
+            let loaded = load(window, cx);
+            if let Some(Ok(image)) = &loaded {
+                let size = image.size(0);
+                *drawn.lock().unwrap() = Some((size.width.0, size.height.0));
+            }
+            loaded
+        }
+    }));
+
+    struct ImageProbe(ImageSource);
+    impl Render for ImageProbe {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            img(self.0.clone())
+        }
+    }
+
+    let (view, mut cx) = cx.add_window_view(|_window, _cx| ImageProbe(probe));
+    let draw = |cx: &mut gpui::VisualTestContext| {
+        cx.run_until_parked();
+        cx.draw(
+            gpui::point(gpui::px(0.), gpui::px(0.)),
+            gpui::size(gpui::px(200.), gpui::px(200.)),
+            |_window, _cx| view.clone().into_any_element(),
+        );
+        cx.run_until_parked();
+    };
+
+    draw(&mut cx);
+    draw(&mut cx);
+    pretty_assertions::assert_eq!(
+        *drawn.lock().unwrap(),
+        Some((4, 2)),
+        "the image never finished loading"
+    );
+
+    write_image(8, 3);
+    draw(&mut cx);
+    pretty_assertions::assert_eq!(
+        *drawn.lock().unwrap(),
+        Some((4, 2)),
+        "an image cache that reloads on its own would make the eviction below \
+         dead code"
+    );
+
+    cx.update(|window, cx| {
+        image_cache.update(cx, |image_cache, cx| {
+            image_cache.remove(&Resource::Path(Arc::from(path.as_path())), window, cx);
+        });
+    });
+    draw(&mut cx);
+    draw(&mut cx);
+    pretty_assertions::assert_eq!(
+        *drawn.lock().unwrap(),
+        Some((8, 3)),
+        "evicting the rewritten path did not bring back the new bitmap, so a \
+         re-cropped screenshot still renders at its old size"
+    );
+}
+
+/// Remote images keep going through gpui's shared asset cache: nothing on disk
+/// changes under them, so the eviction path has nothing to do for them.
+#[gpui::test]
+fn test_remote_images_still_use_the_shared_asset_cache(cx: &mut TestAppContext) {
+    let image_cache = cx.update(RetainAllImageCache::new);
+    let source = resolve_image_source("https://example.com/a.png", None, &image_cache)
+        .expect("an http destination should resolve");
+    assert!(matches!(source, ImageSource::Resource(Resource::Uri(_))));
 }

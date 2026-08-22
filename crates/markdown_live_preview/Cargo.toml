@@ -21,6 +21,7 @@ language.workspace = true
 markdown.workspace = true
 math_render.workspace = true
 multi_buffer.workspace = true
+project.workspace = true
 settings.workspace = true
 text.workspace = true
 theme.workspace = true
@@ -33,11 +34,13 @@ util.workspace = true
 [dev-dependencies]
 editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
+image.workspace = true
 indoc.workspace = true
 language = { workspace = true, features = ["test-support"] }
 pretty_assertions.workspace = true
 project = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 theme = { workspace = true, features = ["test-support"] }
 theme_settings.workspace = true
 tree-sitter-md.workspace = true
