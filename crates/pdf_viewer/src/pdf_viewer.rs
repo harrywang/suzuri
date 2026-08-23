@@ -91,7 +91,9 @@ pub struct PdfViewer {
     focus_handle: FocusHandle,
     scroll_handle: ScrollHandle,
     metadata: Option<PdfMetadata>,
-    rendered_pages: HashMap<usize, (f32, Arc<RenderImage>)>,
+    /// Only ever mutated through `place_rendered_page` and
+    /// `take_rendered_pages`, so no page's atlas tile can be orphaned.
+    rendered_pages: RenderedPages,
     pages_in_flight: HashSet<usize>,
     cancel_token: Arc<AtomicBool>,
     render_task: Task<()>,
@@ -109,22 +111,87 @@ pub struct PdfViewer {
     is_selecting: bool,
 }
 
+/// The rendered page cache, keyed by page index, holding the scale each page
+/// was rasterised at alongside its image.
+type RenderedPages = HashMap<usize, (f32, Arc<RenderImage>)>;
+
+/// Places a freshly rendered page, returning the image it displaced so the
+/// caller can free that image's sprite-atlas tile with `App::drop_image`.
+///
+/// A `RenderImage`'s GPU tile is keyed by a process-unique id and lives until an
+/// explicit `drop_image`; dropping the `Arc` frees only the CPU bitmap, and the
+/// Metal atlas has no eviction. A page tile fills a whole atlas texture, so a
+/// page left behind holds that texture for the window's lifetime: about 10.5 MiB
+/// for a Letter page in a 730 px split on a Retina display, and about 28 MiB at
+/// a 1200 px pane, because `render_scale` grows with the pane.
+fn place_rendered_page(
+    rendered_pages: &mut RenderedPages,
+    page_index: usize,
+    scale: f32,
+    image: Arc<RenderImage>,
+) -> Option<Arc<RenderImage>> {
+    rendered_pages
+        .insert(page_index, (scale, image))
+        .map(|(_scale, displaced)| displaced)
+}
+
+/// Empties the rendered page cache, handing back every image so the caller can
+/// free the tiles. Used when the document is replaced on disk and when the tab
+/// is released.
+fn take_rendered_pages(rendered_pages: &mut RenderedPages) -> Vec<Arc<RenderImage>> {
+    rendered_pages
+        .drain()
+        .map(|(_index, (_scale, image))| image)
+        .collect()
+}
+
 impl PdfViewer {
+    /// Registers the two things every `PdfViewer` needs, wherever it is built.
+    ///
+    /// `clone_on_split` builds its view from a struct literal rather than going
+    /// through `new`, so anything registered only in `new` silently misses the
+    /// split: before this was factored out, a split pane never reloaded when the
+    /// file changed and never freed a tile when it closed.
+    fn register_subscriptions(pdf_item: &Entity<PdfItem>, cx: &mut Context<Self>) {
+        // Live-preview loop: the item reloads itself when the file changes
+        // on disk (e.g. a Typst/LaTeX recompile); rebuild rendering state
+        // but keep zoom and scroll so the document doesn't jump.
+        cx.subscribe(pdf_item, |this, _, event: &pdf_item::PdfItemEvent, cx| {
+            match event {
+                pdf_item::PdfItemEvent::Reloaded => this.reload_document(cx),
+            }
+        })
+        .detach();
+        // Free the sprite-atlas tiles of every page still displayed when the
+        // tab closes. Dropping the view frees the CPU bitmaps, but a
+        // RenderImage's GPU tile lives until drop_image, so without this every
+        // page ever shown leaks for the window's lifetime.
+        //
+        // `on_release`, not `on_release_in`: release callbacks run from
+        // `release_dropped_entities` with an `&mut App` and no window in hand,
+        // so the window is still in `App.windows` and `None` reaches it.
+        // `on_release_in` would run inside `update_window_id`, which takes the
+        // window out of the map, and `None` would then free nothing.
+        cx.on_release(|this, cx| {
+            // The render thread is detached (its JoinHandle is discarded) and
+            // holds the whole document as an Arc<[u8]>, so without this a closed
+            // tab leaves it rasterising a page nobody will see. It notices when
+            // the token flips or when its send fails, whichever comes first.
+            this.cancel_token.store(true, Ordering::Relaxed);
+            for image in take_rendered_pages(&mut this.rendered_pages) {
+                cx.drop_image(image, None);
+            }
+        })
+        .detach();
+    }
+
     pub fn new(
         pdf_item: Entity<PdfItem>,
         project: Entity<Project>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        // Live-preview loop: the item reloads itself when the file changes
-        // on disk (e.g. a Typst/LaTeX recompile); rebuild rendering state
-        // but keep zoom and scroll so the document doesn't jump.
-        cx.subscribe(&pdf_item, |this, _, event: &pdf_item::PdfItemEvent, cx| {
-            match event {
-                pdf_item::PdfItemEvent::Reloaded => this.reload_document(cx),
-            }
-        })
-        .detach();
+        Self::register_subscriptions(&pdf_item, cx);
         let mut this = Self {
             pdf_item,
             project,
@@ -155,7 +222,14 @@ impl PdfViewer {
         self.cancel_token.store(true, Ordering::Relaxed);
         self.cancel_token = Arc::new(AtomicBool::new(false));
         self.pages_in_flight.clear();
-        self.rendered_pages.clear();
+        // Every page is about to be re-rendered into a new RenderImage, so the
+        // outgoing ones must give their atlas tiles back. A typeset preview
+        // recompiles on each pause in typing and rewrites the same PDF, so this
+        // path runs constantly and dropping the images alone would orphan a
+        // texture per page per recompile.
+        for image in take_rendered_pages(&mut self.rendered_pages) {
+            cx.drop_image(image, None);
+        }
         self.text_layouts.clear();
         self.selection_start = None;
         self.selection_end = None;
@@ -177,7 +251,24 @@ impl PdfViewer {
                         "pdf_viewer: loaded metadata — {} pages",
                         metadata.page_count
                     );
+                    // Read the count before the move: PdfMetadata owns a Vec of
+                    // page dimensions, so it is not Copy.
+                    let page_count = metadata.page_count;
                     this.metadata = Some(metadata);
+                    // A recompile can shorten the document. Pages past the new
+                    // end would otherwise sit in the cache forever, holding a
+                    // texture each, because nothing re-renders or clears them.
+                    let dropped: Vec<_> = this
+                        .rendered_pages
+                        .keys()
+                        .copied()
+                        .filter(|index| *index >= page_count)
+                        .collect();
+                    for index in dropped {
+                        if let Some((_scale, image)) = this.rendered_pages.remove(&index) {
+                            cx.drop_image(image, None);
+                        }
+                    }
                     this.render_error = None;
                     log::debug!("pdf_viewer: kicking off text extraction");
                     this.extract_all_text(cx);
@@ -450,7 +541,13 @@ impl PdfViewer {
                 let scale = render_scale;
                 this.update(cx, |this, cx| {
                     this.pages_in_flight.remove(&page_index);
-                    this.rendered_pages.insert(page_index, (scale, image));
+                    // Re-rendering a page at a new scale displaces the previous
+                    // image, whose atlas tile is only freed explicitly.
+                    if let Some(displaced) =
+                        place_rendered_page(&mut this.rendered_pages, page_index, scale, image)
+                    {
+                        cx.drop_image(displaced, None);
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -844,27 +941,44 @@ impl Item for PdfViewer {
     where
         Self: Sized,
     {
-        Task::ready(Some(cx.new(|cx| Self {
-            pdf_item: self.pdf_item.clone(),
-            project: self.project.clone(),
-            focus_handle: cx.focus_handle(),
-            scroll_handle: ScrollHandle::new(),
-            metadata: self.metadata.clone(),
-            rendered_pages: self.rendered_pages.clone(),
-            pages_in_flight: HashSet::new(),
-            cancel_token: Arc::new(AtomicBool::new(false)),
-            render_task: Task::ready(()),
-            render_debounce: Task::ready(()),
-            render_error: self.render_error.clone(),
-            zoom_level: self.zoom_level,
-            render_scale: self.render_scale,
-            display_scale: self.display_scale,
-            pan_x: self.pan_x,
-            text_layouts: self.text_layouts.clone(),
-            text_extraction_task: Task::ready(()),
-            selection_start: None,
-            selection_end: None,
-            is_selecting: false,
+        Task::ready(Some(cx.new(|cx| {
+            let pdf_item = self.pdf_item.clone();
+            Self::register_subscriptions(&pdf_item, cx);
+            Self {
+                pdf_item,
+                project: self.project.clone(),
+                focus_handle: cx.focus_handle(),
+                scroll_handle: ScrollHandle::new(),
+                metadata: self.metadata.clone(),
+                // A page's image is owned by exactly one view, so the split
+                // starts empty and renders its own visible pages.
+                //
+                // Sharing the `Arc`s would be unsafe, not merely wasteful. A
+                // pane renders as a cached view, and a cached view that is not
+                // dirty replays its scene verbatim, tile ids included, without
+                // calling `paint_image`. `cx.notify()` marks only a view and its
+                // ancestors dirty, and a split is a sibling, so it never
+                // repaints. Meanwhile a two-way split only halves `fit_scale`,
+                // which the re-render hysteresis ignores, so the split would sit
+                // on shared images indefinitely. The primary's free empties the
+                // texture slot, and the split's next replay reads that slot back
+                // as `None`.
+                rendered_pages: RenderedPages::new(),
+                pages_in_flight: HashSet::new(),
+                cancel_token: Arc::new(AtomicBool::new(false)),
+                render_task: Task::ready(()),
+                render_debounce: Task::ready(()),
+                render_error: self.render_error.clone(),
+                zoom_level: self.zoom_level,
+                render_scale: self.render_scale,
+                display_scale: self.display_scale,
+                pan_x: self.pan_x,
+                text_layouts: self.text_layouts.clone(),
+                text_extraction_task: Task::ready(()),
+                selection_start: None,
+                selection_end: None,
+                is_selecting: false,
+            }
         })))
     }
 
@@ -905,4 +1019,81 @@ impl ProjectItem for PdfViewer {
 
 pub fn init(cx: &mut App) {
     workspace::register_project_item::<PdfViewer>(cx);
+}
+
+#[cfg(test)]
+mod rendered_page_tests {
+    //! Pins the sprite-atlas leak fix. Every image these helpers displace must
+    //! come back to the caller, because a `RenderImage`'s GPU tile outlives its
+    //! `Arc` and the Metal atlas never evicts. An image dropped without being
+    //! returned here holds a texture for the window's lifetime.
+    use super::*;
+    use image::Frame;
+    use smallvec::SmallVec;
+
+    fn test_image() -> Arc<RenderImage> {
+        // A 1x1 BGRA pixel. Only the process-unique id matters here.
+        let buffer = image::ImageBuffer::from_raw(1, 1, vec![0u8; 4]).expect("buffer");
+        Arc::new(RenderImage::new(SmallVec::from_elem(Frame::new(buffer), 1)))
+    }
+
+    #[test]
+    fn first_render_of_a_page_displaces_nothing() {
+        let mut pages = RenderedPages::default();
+        let displaced = place_rendered_page(&mut pages, 0, 2.0, test_image());
+        assert!(displaced.is_none(), "a fresh page slot displaces nothing");
+        assert_eq!(pages.len(), 1);
+    }
+
+    #[test]
+    fn re_rendering_a_page_returns_its_previous_image() {
+        let mut pages = RenderedPages::default();
+        let old = test_image();
+        let old_id = old.id;
+        place_rendered_page(&mut pages, 3, 2.0, old);
+
+        let new = test_image();
+        let new_id = new.id;
+        let displaced = place_rendered_page(&mut pages, 3, 4.0, new)
+            .expect("re-rendering a page must return the image it replaced");
+
+        assert_eq!(
+            displaced.id, old_id,
+            "the previous image must come back so its tile can be freed"
+        );
+        assert_eq!(pages[&3].1.id, new_id);
+        assert_eq!(pages[&3].0, 4.0, "the new scale must be recorded");
+    }
+
+    #[test]
+    fn taking_the_cache_returns_every_page_and_empties_it() {
+        let mut pages = RenderedPages::default();
+        let mut expected: Vec<_> = (0..5)
+            .map(|index| {
+                let image = test_image();
+                let id = image.id;
+                place_rendered_page(&mut pages, index, 2.0, image);
+                id
+            })
+            .collect();
+
+        let mut taken: Vec<_> = take_rendered_pages(&mut pages)
+            .iter()
+            .map(|image| image.id)
+            .collect();
+
+        taken.sort();
+        expected.sort();
+        assert_eq!(taken, expected, "every cached page must be handed back");
+        assert!(
+            pages.is_empty(),
+            "the cache must be empty so no page is freed twice"
+        );
+    }
+
+    #[test]
+    fn taking_an_empty_cache_returns_nothing() {
+        let mut pages = RenderedPages::default();
+        assert!(take_rendered_pages(&mut pages).is_empty());
+    }
 }
