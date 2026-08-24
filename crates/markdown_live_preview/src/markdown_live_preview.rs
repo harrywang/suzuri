@@ -181,7 +181,14 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                         // re-decode every image in the project on open.
                         .filter(|(_, _, change)| *change != PathChange::Loaded)
                         .filter(|(path, _, _)| path.extension().is_some_and(is_image_extension))
-                        .map(|(path, _, _)| worktree.absolutize(path))
+                        .map(|(path, _, _)| {
+                            let absolute = worktree.absolutize(path);
+                            // Matches how `resolve_image_source` keys the
+                            // cache. A just-deleted file cannot be
+                            // canonicalized; fall back to the literal path so
+                            // an exactly-spelled reference still evicts.
+                            std::fs::canonicalize(&absolute).unwrap_or(absolute)
+                        })
                         .collect()
                 };
                 if changed_images.is_empty() {
@@ -3266,9 +3273,13 @@ fn resolve_image_source(
     } else {
         base_directory?.join(path)
     };
-    if !path.exists() {
-        return None;
-    }
+    // Canonicalizing proves the file exists *and* collapses `..` and symlinks,
+    // so a note that spells its image `../images/x.png` keys the cache by the
+    // same path the worktree reports when that file changes. Without it the two
+    // spellings hash differently and the eviction below silently matches
+    // nothing — which is the common case, since a shared `images/` folder
+    // beside the notes is an ordinary vault layout.
+    let path = std::fs::canonicalize(&path).ok()?;
     // Deliberately not `ImageSource::Resource`: that reads through gpui's
     // app-level asset cache, which has no eviction, so a file rewritten in
     // place would keep serving its first-decoded bitmap. Routing every local
