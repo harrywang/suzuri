@@ -1976,15 +1976,16 @@ fn test_buttons_prevent_default_on_mouse_down(cx: &mut TestAppContext) {
 // holds an `Arc<dyn Fn>` with no `Send`/`Sync` bound, so any wrapper of one
 // trips this lint by construction.
 #[allow(clippy::arc_with_non_send_sync)]
-#[gpui::test]
-async fn test_rewriting_an_image_in_place_reloads_it(cx: &mut TestAppContext) {
-    init_test(cx);
-
-    let directory = tempfile::tempdir().expect("failed to create a temp dir");
-    let path = directory.path().join("screenshot.png");
+async fn image_sizes_across_eviction(
+    cx: &mut TestAppContext,
+    destination: &str,
+    base_directory: &std::path::Path,
+    image_path: &std::path::Path,
+    evict_path: &std::path::Path,
+) -> [Option<(i32, i32)>; 3] {
     let write_image = |width: u32, height: u32| {
         image::save_buffer(
-            &path,
+            image_path,
             &vec![0xff; (width * height * 4) as usize],
             width,
             height,
@@ -1995,8 +1996,8 @@ async fn test_rewriting_an_image_in_place_reloads_it(cx: &mut TestAppContext) {
     write_image(4, 2);
 
     let image_cache = cx.update(RetainAllImageCache::new);
-    let source = resolve_image_source("screenshot.png", Some(directory.path()), &image_cache)
-        .expect("an existing file next to the document should resolve");
+    let source = resolve_image_source(destination, Some(base_directory), &image_cache)
+        .expect("an existing image file should resolve");
     assert!(
         matches!(source, ImageSource::Custom(_)),
         "a local image resolved to an app-level asset source, which cannot be \
@@ -2040,33 +2041,85 @@ async fn test_rewriting_an_image_in_place_reloads_it(cx: &mut TestAppContext) {
 
     draw(&mut cx);
     draw(&mut cx);
-    pretty_assertions::assert_eq!(
-        *drawn.lock().unwrap(),
-        Some((4, 2)),
-        "the image never finished loading"
-    );
+    let initial = *drawn.lock().unwrap();
 
     write_image(8, 3);
     draw(&mut cx);
-    pretty_assertions::assert_eq!(
-        *drawn.lock().unwrap(),
-        Some((4, 2)),
-        "an image cache that reloads on its own would make the eviction below \
-         dead code"
-    );
+    let after_rewrite = *drawn.lock().unwrap();
 
     cx.update(|window, cx| {
         image_cache.update(cx, |image_cache, cx| {
-            image_cache.remove(&Resource::Path(Arc::from(path.as_path())), window, cx);
+            image_cache.remove(&Resource::Path(Arc::from(evict_path)), window, cx);
         });
     });
     draw(&mut cx);
     draw(&mut cx);
+    let after_eviction = *drawn.lock().unwrap();
+
+    [initial, after_rewrite, after_eviction]
+}
+
+#[gpui::test]
+async fn test_rewriting_an_image_in_place_reloads_it(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let directory = tempfile::tempdir().expect("failed to create a temp dir");
+    let path = directory.path().join("screenshot.png");
+    // What the fs-change handler would evict: the file's real, canonical path.
+    let evict_path = std::fs::canonicalize(directory.path())
+        .expect("temp dir should canonicalize")
+        .join("screenshot.png");
+
+    let [initial, after_rewrite, after_eviction] =
+        image_sizes_across_eviction(cx, "screenshot.png", directory.path(), &path, &evict_path)
+            .await;
+
+    pretty_assertions::assert_eq!(initial, Some((4, 2)), "the image never finished loading");
     pretty_assertions::assert_eq!(
-        *drawn.lock().unwrap(),
+        after_rewrite,
+        Some((4, 2)),
+        "an image cache that reloads on its own would make the eviction below \
+         dead code"
+    );
+    pretty_assertions::assert_eq!(
+        after_eviction,
         Some((8, 3)),
         "evicting the rewritten path did not bring back the new bitmap, so a \
          re-cropped screenshot still renders at its old size"
+    );
+}
+
+/// A vault that keeps its images in a folder beside its notes spells every
+/// reference `../images/x.png`. Joining that onto the note's directory keeps the
+/// `..` literally, while the worktree reports the file under its collapsed path
+/// — so unless both sides canonicalize, the two hash differently and eviction
+/// silently matches nothing. That layout is ordinary, not exotic: this pins it.
+#[gpui::test]
+async fn test_image_reference_climbing_out_of_its_folder_reloads(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let vault = tempfile::tempdir().expect("failed to create a temp dir");
+    let notes = vault.path().join("lectures");
+    let images = vault.path().join("images");
+    std::fs::create_dir_all(&notes).expect("failed to create the notes dir");
+    std::fs::create_dir_all(&images).expect("failed to create the images dir");
+    let path = images.join("screenshot.png");
+    // The worktree reports a changed file by its collapsed path, never with `..`.
+    let evict_path = std::fs::canonicalize(&images)
+        .expect("images dir should canonicalize")
+        .join("screenshot.png");
+
+    let [initial, after_rewrite, after_eviction] =
+        image_sizes_across_eviction(cx, "../images/screenshot.png", &notes, &path, &evict_path)
+            .await;
+
+    pretty_assertions::assert_eq!(initial, Some((4, 2)), "the image never finished loading");
+    pretty_assertions::assert_eq!(after_rewrite, Some((4, 2)), "the cache reloaded unprompted");
+    pretty_assertions::assert_eq!(
+        after_eviction,
+        Some((8, 3)),
+        "a `../images/x.png` reference did not pick up the rewritten file, so \
+         re-cropping a screenshot still needs the document reopened"
     );
 }
 
