@@ -3048,7 +3048,14 @@ fn render_image_block(
                     })
                     .log_err();
             })
-            .child(div().max_w(max_width).child(content))
+            // `flex()` is load-bearing: gpui's `div()` is `display: block`, so a
+            // block child fills its parent's width and the bordered container
+            // would stretch to its own `max_w` cap — leaving the selection
+            // border, the `</>` button and the resize handle floating out to the
+            // right of any image narrower than that cap. As a flex item it
+            // shrink-wraps the image instead. Pinned by
+            // `test_a_block_child_fills_its_parent_but_a_flex_child_hugs`.
+            .child(div().flex().max_w(max_width).child(content))
             .into_any_element()
     })
 }

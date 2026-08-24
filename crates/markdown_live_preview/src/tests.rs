@@ -2132,3 +2132,72 @@ fn test_remote_images_still_use_the_shared_asset_cache(cx: &mut TestAppContext) 
         .expect("an http destination should resolve");
     assert!(matches!(source, ImageSource::Resource(Resource::Uri(_))));
 }
+
+/// The image widget draws its selection border, its `</>` button and its resize
+/// handle on a container that is supposed to hug the image exactly. gpui's
+/// `div()` defaults to `display: block` (`Style::default`), and a block box with
+/// `width: auto` fills its containing block — so that container stretches to its
+/// own `max_w` cap and the border floats out to the right of any image narrower
+/// than the cap. Wrapping it in a flex parent makes it shrink-wrap instead.
+///
+/// Both halves are pinned here: an upstream change that made `div()` shrink-wrap
+/// by default, or that stopped flex items sizing to content, would silently move
+/// the border off the image again.
+#[gpui::test]
+async fn test_a_block_child_fills_its_parent_but_a_flex_child_hugs(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    const PARENT: gpui::Pixels = gpui::px(400.);
+    const CHILD: gpui::Pixels = gpui::px(80.);
+
+    struct Frames;
+    impl Render for Frames {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(PARENT)
+                // A block parent: the bordered child fills the whole width.
+                .child(
+                    div()
+                        .debug_selector(|| "BLOCK-PARENT".into())
+                        .child(div().w(CHILD).h(gpui::px(20.))),
+                )
+                // A flex parent: the same bordered child hugs its content.
+                .child(
+                    div().flex().child(
+                        div()
+                            .debug_selector(|| "FLEX-PARENT".into())
+                            .child(div().w(CHILD).h(gpui::px(20.))),
+                    ),
+                )
+        }
+    }
+
+    let (view, cx) = cx.add_window_view(|_window, _cx| Frames);
+    cx.run_until_parked();
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(600.), gpui::px(200.)),
+        |_window, _cx| view.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    let in_block = cx
+        .debug_bounds("BLOCK-PARENT")
+        .expect("the block-parented frame should have been laid out");
+    let in_flex = cx
+        .debug_bounds("FLEX-PARENT")
+        .expect("the flex-parented frame should have been laid out");
+
+    pretty_assertions::assert_eq!(
+        in_block.size.width,
+        PARENT,
+        "a block child no longer fills its parent, so the image widget's container \
+         may not need a flex parent to hug the image any more"
+    );
+    pretty_assertions::assert_eq!(
+        in_flex.size.width,
+        CHILD,
+        "a flex child no longer hugs its content, so the image widget's selection \
+         border will float out to the right of the image"
+    );
+}
