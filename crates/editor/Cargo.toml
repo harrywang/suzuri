@@ -84,6 +84,8 @@ telemetry.workspace = true
 text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
+# SUZURI: timestamped attachment filenames in items.rs; upstream dropped this dep in #62643
+time.workspace = true
 tree-sitter-c = { workspace = true, optional = true }
 tree-sitter-html = { workspace = true, optional = true }
 tree-sitter-rust = { workspace = true, optional = true }
