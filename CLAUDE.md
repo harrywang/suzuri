@@ -48,7 +48,7 @@ cargo run --profile release-fast           # the profile used day to day
 cargo run ~/path/to/other/project          # open a different folder (see note below)
 
 ./script/clippy                            # NOT cargo clippy; adds --release --all-targets
-                                           # --all-features --deny warnings, plus cargo-machete,
+                                           # --all-features --deny warnings, plus cargo-shear,
                                            # typos, and buf lint when installed locally
 cargo fmt --all -- --check
 
@@ -128,8 +128,10 @@ far worse than three merges of one refactor each. Treat a month as the hard ceil
 
 Merge on a branch (`git checkout -b merge-upstream-YYYY-MM-DD`), never straight onto `main`.
 The conflict-free case is the dangerous one — a 41-commit merge landed clean and still failed
-to compile because `image_resolver` had gained an `&App` parameter. Order the checks so drift
-surfaces early:
+to compile because `image_resolver` had gained an `&App` parameter. Dependency *removals*
+drift the same way: an upstream dep-cleanup can delete a shared crate's dependency that
+only fork code uses — also conflict-free, caught only by `cargo check`. Restore the dep
+with a `SUZURI:` tag so the next merge keeps it. Order the checks so drift surfaces early:
 
 1. `cargo check -p markdown_live_preview -p pdf_viewer -p typeset_preview -p languages` first
    — signature drift in `editor`/`markdown`/`gpui`/`workspace` surfaces in the fork's own
@@ -140,7 +142,9 @@ surfaces early:
 4. `cargo nextest run -p project_panel -p languages`. Note `undo_create_dirty_file` in
    `project_panel` fails on a clean upstream tree too; verify by stashing before blaming a merge.
 5. Bundle and smoke-test the real app: live preview, a PDF, a Typst preview, the panel's
-   refresh button.
+   refresh button. GUI behavior can also be verified without a human at the screen:
+   `VisualTestAppContext` (see `crates/zed/src/visual_test_runner.rs`) renders offscreen
+   with real Metal and captures screenshots without Screen Recording permission.
 
 Conflicts recur in the same handful of registration points (`Cargo.toml` members and paths,
 `crates/zed/src/main.rs` init calls, `crates/zed/src/zed.rs` toolbar block,
@@ -196,6 +200,12 @@ When carrying one:
   knows to drop the local copy instead of keeping it.
 - If review reshapes the patch, the merge conflicts against your local copy — resolve by
   taking upstream's.
+
+## External contributions
+
+The vendor-hygiene rule applies to incoming PRs too: functional changes belong in
+fork-owned crates. Ask contributors to drop commits that touch vendor files or offer
+them upstream instead, recording anything worth keeping in the PR description.
 
 ### Pending upstream
 
