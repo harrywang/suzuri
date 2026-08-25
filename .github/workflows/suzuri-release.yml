@@ -32,7 +32,7 @@ jobs:
   check-version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Compare tag with SUZURI_VERSION
         run: |
@@ -63,9 +63,9 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 180
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 20
 
@@ -95,7 +95,7 @@ jobs:
           mv "target/${{ matrix.target }}/release/Zed-${arch}.dmg" \
              "target/${{ matrix.target }}/release/suzuri-${arch}.dmg"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: dmg-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/suzuri-*.dmg
@@ -114,7 +114,7 @@ jobs:
       # debug info in a release installer anyway.
       CARGO_PROFILE_RELEASE_DEBUG: "false"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Derive version from tag
         shell: pwsh
@@ -150,7 +150,7 @@ jobs:
         shell: pwsh
         run: ./script/bundle-windows.ps1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: windows-installer
           path: target/suzuri-windows-x86_64.exe
@@ -159,7 +159,7 @@ jobs:
     needs: [build-mac, build-windows]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           path: artifacts
           merge-multiple: true
