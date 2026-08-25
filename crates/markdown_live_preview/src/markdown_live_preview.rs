@@ -2929,7 +2929,15 @@ fn render_image_block(
                     .id(("mdlp-image", f32::from(max_width) as u64))
                     .max_w_full()
                     .rounded_sm()
-                    .when(content_width.is_some(), |this| this.w_full())
+                    // The explicit width goes on the image itself, as an
+                    // absolute length, and the bordered container shrink-wraps
+                    // it. Sizing the container and giving the image `w_full()`
+                    // instead hits a gpui quirk: a percentage-width image with
+                    // auto height lays out at the file's natural height, not
+                    // the aspect-scaled one, so a widget stretched past the
+                    // file's natural width overflowed its container. Pinned by
+                    // `test_an_absolute_width_image_keeps_its_aspect_ratio`.
+                    .when_some(content_width, |this, width| this.w(width))
                     .with_fallback(move || {
                         div()
                             .text_color(muted)
@@ -2960,7 +2968,6 @@ fn render_image_block(
                     this.border_color(gpui::transparent_black())
                 }
             })
-            .when_some(content_width, |this, width| this.w(width))
             .when(content_width.is_none(), |this| this.max_w(max_width * 0.66))
             .child(image_content);
 

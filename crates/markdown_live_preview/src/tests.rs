@@ -2201,3 +2201,78 @@ async fn test_a_block_child_fills_its_parent_but_a_flex_child_hugs(cx: &mut Test
          border will float out to the right of the image"
     );
 }
+
+/// The image widget puts an explicit `|width` on the `img` element itself as an
+/// absolute length and lets the bordered container shrink-wrap it. That relies
+/// on gpui's `img` deriving its height from an absolute width via the file's
+/// aspect ratio — including widths *larger* than the file's natural size, the
+/// shape an in-place crop leaves behind. The tempting alternative — size the
+/// container and give the image `w_full()` — is broken: a fraction width with
+/// auto height makes `img` fall back to the file's natural pixel height, so
+/// the container sizes to that while the image itself lays out aspect-scaled,
+/// painting everything past the natural height over the lines below the block.
+#[gpui::test]
+fn test_an_absolute_width_image_keeps_its_aspect_ratio(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    // Natural size deliberately smaller than the displayed width.
+    const NATURAL_WIDTH: u32 = 200;
+    const NATURAL_HEIGHT: u32 = 100;
+    const DISPLAY_WIDTH: gpui::Pixels = gpui::px(800.);
+    const BORDER: gpui::Pixels = gpui::px(2.);
+
+    struct Widget(Arc<gpui::RenderImage>);
+    impl Render for Widget {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(gpui::px(1000.)).child(
+                div().flex().max_w(gpui::px(1000.)).child(
+                    div()
+                        .debug_selector(|| "IMAGE-CONTAINER".into())
+                        .border_2()
+                        .child(
+                            gpui::img(ImageSource::Render(self.0.clone()))
+                                .id("contract-img")
+                                .debug_selector(|| "IMAGE".into())
+                                .max_w_full()
+                                .rounded_sm()
+                                .w(DISPLAY_WIDTH),
+                        ),
+                ),
+            )
+        }
+    }
+
+    let image = Arc::new(gpui::RenderImage::new([image::Frame::new(
+        image::ImageBuffer::from_pixel(NATURAL_WIDTH, NATURAL_HEIGHT, image::Rgba([0, 0, 0, 255])),
+    )]));
+    let (view, cx) = cx.add_window_view(|_window, _cx| Widget(image));
+    cx.run_until_parked();
+    cx.draw(
+        gpui::point(gpui::px(0.), gpui::px(0.)),
+        gpui::size(gpui::px(1200.), gpui::px(900.)),
+        |_window, _cx| view.clone().into_any_element(),
+    );
+    cx.run_until_parked();
+
+    let image_bounds = cx
+        .debug_bounds("IMAGE")
+        .expect("the image should have been laid out");
+    let container_bounds = cx
+        .debug_bounds("IMAGE-CONTAINER")
+        .expect("the bordered container should have been laid out");
+
+    let expected_height = DISPLAY_WIDTH * (NATURAL_HEIGHT as f32 / NATURAL_WIDTH as f32);
+    pretty_assertions::assert_eq!(
+        image_bounds.size,
+        gpui::size(DISPLAY_WIDTH, expected_height),
+        "an image with an absolute width no longer lays out at its aspect-scaled \
+         height, so explicit `|width` sizes will render distorted or misplaced"
+    );
+    pretty_assertions::assert_eq!(
+        container_bounds.size,
+        gpui::size(DISPLAY_WIDTH + BORDER * 2., expected_height + BORDER * 2.),
+        "the bordered container no longer hugs the aspect-scaled image, so an \
+         image widened past its file's natural size will paint over the lines \
+         below its block"
+    );
+}
