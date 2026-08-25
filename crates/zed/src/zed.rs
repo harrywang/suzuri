@@ -1544,7 +1544,8 @@ fn initialize_pane(
 fn open_about_window(cx: &mut App) {
     fn about_window_icon(release_channel: ReleaseChannel) -> Arc<Image> {
         let bytes = match release_channel {
-            ReleaseChannel::Dev => include_bytes!("../resources/app-icon-dev.png").as_slice(),
+            // SUZURI: dev is Suzuri's shipping channel, so it gets the Suzuri icon.
+            ReleaseChannel::Dev => include_bytes!("../resources/app-icon-suzuri.png").as_slice(),
             ReleaseChannel::Nightly => {
                 include_bytes!("../resources/app-icon-nightly.png").as_slice()
             }
@@ -1570,7 +1571,6 @@ fn open_about_window(cx: &mut App) {
     impl AboutWindow {
         fn new(cx: &mut Context<Self>) -> Self {
             let release_channel = ReleaseChannel::global(cx);
-            let release_channel_name = release_channel.display_name();
             let full_version: SharedString = AppVersion::global(cx).to_string().into();
             let version = env!("CARGO_PKG_VERSION");
 
@@ -1579,7 +1579,13 @@ fn open_about_window(cx: &mut App) {
             } else {
                 ""
             };
-            let message: SharedString = format!("{release_channel_name} {version} {debug}").into();
+            // SUZURI: Suzuri ships on the dev channel, so display_name() would
+            // read "Zed Dev"; show Suzuri's own version with the Zed base.
+            let message: SharedString = format!(
+                "Suzuri {} (Zed {version}) {debug}",
+                suzuri_update::SUZURI_VERSION
+            )
+            .into();
             let commit = AppCommitSha::try_global(cx)
                 .map(|sha| sha.full())
                 .filter(|commit| !commit.is_empty())

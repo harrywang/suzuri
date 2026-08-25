@@ -1,7 +1,6 @@
 use super::register_zed_scheme;
 use anyhow::Result;
 use gpui::{AppContext as _, AsyncApp, Context, PromptLevel, Window, actions};
-use release_channel::ReleaseChannel;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use util::ResultExt;
@@ -100,7 +99,7 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
             // The user dismissed the administrator prompt; nothing to do.
             Ok(None) => return Ok(()),
             Err(error) => {
-                log::error!("failed to install zed CLI: {error:#}");
+                log::error!("failed to install suzuri CLI: {error:#}");
                 workspace.update(cx, |workspace, cx| {
                     struct CliInstallFailed;
 
@@ -110,10 +109,10 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                         |cx| {
                             cx.new(|cx| {
                                 MessageNotification::new(
-                                    "You can add `zed` to your PATH manually.",
+                                    "You can add `suzuri` to your PATH manually.",
                                     cx,
                                 )
-                                .with_title("Couldn't install the Zed CLI")
+                                .with_title("Couldn't install the Suzuri CLI")
                                 .more_info_message("Show me how")
                                 .more_info_url(CANT_INSTALL_DOCS_URL)
                             })
@@ -131,9 +130,8 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                 Toast::new(
                     NotificationId::unique::<InstalledZedCli>(),
                     format!(
-                        "Installed `zed` to {}. You can launch {} from your terminal.",
+                        "Installed `suzuri` to {}. You can launch Suzuri from your terminal.",
                         path.to_string_lossy(),
-                        ReleaseChannel::global(cx).display_name()
                     ),
                 ),
                 cx,
@@ -142,5 +140,5 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
         register_zed_scheme(cx).await.log_err();
         Ok(())
     })
-    .detach_and_prompt_err("Cannot install the Zed CLI", window, cx, |_, _, _| None);
+    .detach_and_prompt_err("Cannot install the Suzuri CLI", window, cx, |_, _, _| None);
 }

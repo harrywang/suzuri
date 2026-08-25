@@ -60,10 +60,11 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
 
     vec![
         Menu {
-            name: "Zed".into(),
+            // SUZURI: shown in the title-bar menu on Windows/Linux; macOS uses the bundle name.
+            name: "Suzuri".into(),
             disabled: false,
             items: vec![
-                MenuItem::action("About Zed", zed_actions::About),
+                MenuItem::action("About Suzuri", zed_actions::About),
                 // Not `auto_update::Check`: that asks Zed's release server about
                 // Zed's builds, which would offer to install Zed over Suzuri.
                 MenuItem::action("Check for Updates", suzuri_update::CheckForUpdates),
@@ -97,13 +98,13 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Install CLI", install_cli::InstallCliBinary),
                 MenuItem::separator(),
                 #[cfg(target_os = "macos")]
-                MenuItem::action("Hide Zed", super::Hide),
+                MenuItem::action("Hide Suzuri", super::Hide),
                 #[cfg(target_os = "macos")]
                 MenuItem::action("Hide Others", super::HideOthers),
                 #[cfg(target_os = "macos")]
                 MenuItem::action("Show All", super::ShowAll),
                 MenuItem::separator(),
-                MenuItem::action("Quit Zed", Quit),
+                MenuItem::action("Quit Suzuri", Quit),
             ],
         },
         Menu {

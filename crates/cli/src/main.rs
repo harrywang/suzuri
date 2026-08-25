@@ -47,22 +47,23 @@ trait InstalledApp {
 }
 
 #[derive(Parser, Debug)]
+// SUZURI: the CLI installs as `suzuri` (see install_cli), so the help says so.
 #[command(
-    name = "zed",
+    name = "suzuri",
     disable_version_flag = true,
-    before_help = "The Zed CLI binary.
-This CLI is a separate binary that invokes Zed.
+    before_help = "The Suzuri CLI binary.
+This CLI is a separate binary that invokes Suzuri.
 
 Examples:
-    `zed`
-          Simply opens Zed
-    `zed --foreground`
+    `suzuri`
+          Simply opens Suzuri
+    `suzuri --foreground`
           Runs in foreground (shows all logs)
-    `zed path-to-your-project`
-          Open your project in Zed
-    `zed -n path-to-file `
+    `suzuri path-to-your-project`
+          Open your project in Suzuri
+    `suzuri -n path-to-file `
           Open file/folder in a new window",
-    after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
+    after_help = "To read from stdin, append '-', e.g. 'ps axf | suzuri -'"
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
