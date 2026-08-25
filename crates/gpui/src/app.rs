@@ -689,6 +689,8 @@ pub struct App {
     platform_owned_drag: Option<PlatformOwnedDrag>,
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
+    #[cfg(feature = "profiler")]
+    foreground_journal: crate::profiler::journal::ForegroundJournal,
     pub(crate) entities: EntityMap,
     pub(crate) new_entity_observers: SubscriberSet<TypeId, NewEntityListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Box<Window>>>,
@@ -785,6 +787,8 @@ impl App {
             background_executor.is_main_thread(),
             "must construct App on main thread"
         );
+        #[cfg(feature = "profiler")]
+        let foreground_journal = crate::profiler::journal::install_foreground_journal();
         let synced_animation_epoch = background_executor.now();
 
         let text_system = Arc::new(TextSystem::new(platform.text_system()));
@@ -809,6 +813,8 @@ impl App {
                 platform_owned_drag: None,
                 background_executor,
                 foreground_executor,
+                #[cfg(feature = "profiler")]
+                foreground_journal,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
                 loading_assets: Default::default(),
                 asset_source,
@@ -912,8 +918,19 @@ impl App {
         platform.on_quit(Box::new({
             let cx = Rc::downgrade(&app);
             move || {
-                if let Some(cx) = cx.upgrade() {
-                    cx.borrow_mut().shutdown();
+                let Some(cx) = cx.upgrade() else {
+                    return true;
+                };
+                match cx.try_borrow_mut() {
+                    Ok(mut cx) => {
+                        cx.shutdown();
+                        true
+                    }
+                    Err(_) => {
+                        // Quit was requested while the AppCell was borrowed, so we can't shut down synchronously.
+                        // The platform decides how to proceed.
+                        false
+                    }
                 }
             }
         }));
@@ -1700,6 +1717,15 @@ impl App {
                 }
 
                 if self.pending_effects.is_empty() {
+                    for window in self.windows.values().filter_map(|window| window.as_deref()) {
+                        if window.invalidator.is_dirty()
+                            || window.needs_present.get()
+                            || !window.next_frame_callbacks.borrow().is_empty()
+                        {
+                            window.platform_window.schedule_frame();
+                        }
+                    }
+
                     self.event_arena.clear();
                     break;
                 }
@@ -1918,6 +1944,13 @@ impl App {
             panic!("Can't spawn on main thread after on_app_quit")
         };
         &self.foreground_executor
+    }
+
+    /// Returns the foreground work journal for this app's foreground thread.
+    /// Apps constructed on the same thread share the stream.
+    #[cfg(feature = "profiler")]
+    pub fn foreground_journal(&self) -> crate::profiler::journal::ForegroundJournal {
+        self.foreground_journal.clone()
     }
 
     /// Spawns the future returned by the given function on the main thread. The closure will be invoked
@@ -3062,12 +3095,43 @@ impl<'a, T> Drop for GpuiBorrow<'a, T> {
 
 #[cfg(test)]
 mod test {
-    use std::{cell::RefCell, ffi::OsString, path::PathBuf, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        ffi::OsString,
+        path::PathBuf,
+        rc::Rc,
+    };
 
     #[cfg(unix)]
     use std::os::unix::ffi::OsStringExt;
 
-    use crate::{AppContext, TestAppContext};
+    use crate::{AppContext, Context, Empty, IntoElement, Render, TestAppContext, Window};
+
+    struct RenderCounter(Rc<Cell<usize>>);
+
+    impl Render for RenderCounter {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(self.0.get() + 1);
+            Empty
+        }
+    }
+
+    #[gpui::test]
+    fn async_app_refresh_flushes_refresh_effect(cx: &mut TestAppContext) {
+        let render_count = Rc::new(Cell::new(0));
+
+        let _window = cx.add_window({
+            let render_count = render_count.clone();
+            move |_, _| RenderCounter(render_count)
+        });
+
+        cx.run_until_parked();
+        let render_count_before_refresh = render_count.get();
+
+        cx.to_async().refresh();
+
+        assert_eq!(render_count.get(), render_count_before_refresh + 1);
+    }
 
     #[test]
     fn test_gpui_borrow() {
