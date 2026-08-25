@@ -347,15 +347,15 @@ impl Render for Onboarding {
                                     .child(
                                         h_flex()
                                             .gap_4()
-                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
+                                            .child(Vector::square(VectorName::SuzuriLogo, rems(2.5)))
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Zed")
+                                                        Headline::new("Welcome to Suzuri")
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
-                                                        Label::new("The editor for what's next")
+                                                        Label::new("Code and write in one place")
                                                             .color(Color::Muted)
                                                             .size(LabelSize::Small)
                                                             .italic(),

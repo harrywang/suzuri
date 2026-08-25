@@ -19,6 +19,8 @@ pub enum VectorName {
     ProTrialStamp,
     ProUserStamp,
     StudentStamp,
+    // SUZURI: resolves to images/suzuri_logo.svg for branded surfaces.
+    SuzuriLogo,
     ZedLogo,
     ZedXCopilot,
 }
