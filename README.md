@@ -37,6 +37,10 @@ Or build from source, the same way Zed builds:
 - [Building for Linux](./docs/src/development/linux.md)
 - [Building for Windows](./docs/src/development/windows.md)
 
+## Testbed Data
+
+[suzuri-testbed](https://github.com/harrywang/suzuri-testbed) is a companion vault of test data for exercising Suzuri by hand. Each folder targets one rendering surface — markdown live preview (including image reloading), Python REPL and notebook execution, LaTeX and Typst preview, and the PDF viewer — and several fixtures are self-checking notes with a checklist at the top, so you can open them and verify behavior by eye. Clone it and open the folder in Suzuri to smoke-test a build or reproduce a rendering bug against known fixtures.
+
 ## Credits
 
 Suzuri stands on generous shoulders:
