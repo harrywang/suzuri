@@ -141,7 +141,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let weak_editor = cx.weak_entity();
     subscriptions.push(editor.register_action::<editor::actions::Backspace>(
         move |_, _window, cx| {
-            if !delete_selected_table_unit(&weak_editor, cx) {
+            if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_to_block(&weak_editor, false, cx)
+            {
                 cx.propagate();
             }
         },
@@ -149,7 +151,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let weak_editor = cx.weak_entity();
     subscriptions.push(
         editor.register_action::<editor::actions::Delete>(move |_, _window, cx| {
-            if !delete_selected_table_unit(&weak_editor, cx) {
+            if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_to_block(&weak_editor, true, cx)
+            {
                 cx.propagate();
             }
         }),
@@ -1380,11 +1384,13 @@ fn render_markdown_block(
         let style = block_markdown_style(block_cx.window, block_cx.app);
         let editor = editor.clone();
         let start = range.start;
+        let range = range.clone();
         let base_directory = base_directory.clone();
         let image_cache = image_cache.clone();
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
         let max_width = block_cx.max_width;
+        let source_click_editor = editor.clone();
         div()
             .pl(gutter_width)
             .w(max_width)
@@ -1394,14 +1400,64 @@ fn render_markdown_block(
                 reveal_source_on_mouse_down(editor, start),
             )
             .child(
-                MarkdownElement::new(markdown.clone(), style).image_resolver(
-                    move |destination, _cx| {
+                MarkdownElement::new(markdown.clone(), style)
+                    .image_resolver(move |destination, _cx| {
                         resolve_image_source(destination, base_directory.as_deref(), &image_cache)
-                    },
-                ),
+                    })
+                    // A click on the widget's own text never reaches the
+                    // wrapper's mouse-down handler: `MarkdownElement` claims
+                    // it for text selection and prevents default, which the
+                    // wrapper honors (it must, for code block copy buttons).
+                    // Claiming the click here instead reveals the source with
+                    // the cursor at the clicked character, Obsidian-style.
+                    .on_source_click(move |source_index, _click_count, window, cx| {
+                        // A prevented default at this point is a button
+                        // consuming the click (e.g. a code block's copy
+                        // button); revealing would tear the button down
+                        // before its mouse-up completes the click.
+                        if window.default_prevented() {
+                            return false;
+                        }
+                        reveal_at_source_index(
+                            &source_click_editor,
+                            &range,
+                            source_index,
+                            window,
+                            cx,
+                        )
+                    }),
             )
             .into_any_element()
     })
+}
+
+/// Reveals a widget's source with the cursor at `source_index`, an index into
+/// the markdown string the widget renders, which starts at the block's start
+/// offset. Returns false when the editor is gone so the widget can fall back
+/// to its own text selection.
+fn reveal_at_source_index(
+    editor: &WeakEntity<Editor>,
+    range: &Range<Anchor>,
+    source_index: usize,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    editor
+        .update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = range.start.to_offset(&snapshot).0;
+            let end = range.end.to_offset(&snapshot).0;
+            // The widget's mini-document can carry appended reference
+            // definitions past the block's own text; clamp to the block.
+            let offset = snapshot.clip_offset(
+                MultiBufferOffset((start + source_index).min(end)),
+                text::Bias::Left,
+            );
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([offset..offset]);
+            });
+        })
+        .is_ok()
 }
 
 /// Per-column flex weights approximating content-based column sizing.
@@ -1697,6 +1753,83 @@ fn record_drag_source(
             cx.notify();
         })
         .log_err();
+}
+
+/// Deletes a single character in buffer space when the deletion borders a
+/// rendered block widget, bypassing the editor's display-map-based deletion.
+///
+/// The editor's own backspace/delete compute their range with
+/// `movement::left`/`right` on the display map, and those clip *through*
+/// `BlockPlacement::Replace` rows: forward-deleting the empty line above a
+/// rendered heading swallowed the heading's entire replaced range along with
+/// the newline. Returns false when no rendered block borders the deletion,
+/// so the caller can propagate to the editor's normal handling (which is
+/// also what keeps indent-aware backspace and autoclose pairs working
+/// everywhere else).
+fn delete_adjacent_to_block(weak_editor: &WeakEntity<Editor>, forward: bool, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let block_ranges: Vec<Range<usize>> = editor
+            .addon::<LivePreviewAddon>()
+            .map(|addon| {
+                addon
+                    .applied_blocks
+                    .iter()
+                    .map(|block| {
+                        block.range.start.to_offset(&snapshot).0
+                            ..block.range.end.to_offset(&snapshot).0
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if block_ranges.is_empty() {
+            return false;
+        }
+        let selections = selection_offset_ranges(editor, &snapshot);
+        if selections.iter().any(|range| range.start != range.end) {
+            return false;
+        }
+        let deletions: Vec<Range<usize>> = selections
+            .iter()
+            .map(|caret| {
+                let head = caret.start;
+                if forward {
+                    head..snapshot
+                        .clip_offset(MultiBufferOffset(head + 1), text::Bias::Right)
+                        .0
+                } else {
+                    snapshot
+                        .clip_offset(MultiBufferOffset(head.saturating_sub(1)), text::Bias::Left)
+                        .0..head
+                }
+            })
+            .filter(|deletion| deletion.start < deletion.end)
+            .collect();
+        let borders_block = deletions.iter().any(|deletion| {
+            block_ranges
+                .iter()
+                .any(|block| deletion.start <= block.end && block.start <= deletion.end)
+        });
+        if !borders_block || deletions.is_empty() {
+            return false;
+        }
+        editor.buffer().update(cx, |multibuffer, cx| {
+            multibuffer.edit(
+                deletions.into_iter().map(|deletion| {
+                    (
+                        MultiBufferOffset(deletion.start)..MultiBufferOffset(deletion.end),
+                        "",
+                    )
+                }),
+                None,
+                cx,
+            );
+        });
+        true
+    })
 }
 
 /// Deletes the row/column currently selected via its handle, if any.

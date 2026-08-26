@@ -2433,3 +2433,127 @@ fn test_an_absolute_width_image_keeps_its_aspect_ratio(cx: &mut TestAppContext) 
          below its block"
     );
 }
+#[gpui::test]
+async fn test_heading_on_first_buffer_row(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // A heading on row 0 renders like any other.
+    cx.set_state(indoc::indoc! {"
+        # Suzuri
+
+        bodyˇ
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(
+        applied_block_count(&mut cx),
+        1,
+        "row-0 heading should render"
+    );
+
+    // Deleting a leading empty line from the heading's start (where the
+    // cursor lands when the rendered heading is clicked) must merge the
+    // empty line away, not eat the heading: the editor's own backspace
+    // computes its range through the display map, whose movement clips
+    // through replace blocks.
+    cx.set_state(indoc::indoc! {"
+
+        ˇ# Suzuri
+
+        body
+    "});
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.executor().run_until_parked();
+    assert_eq!(cx.buffer_text(), "# Suzuri\n\nbody\n");
+    // The cursor now sits on the heading row, so it stays revealed.
+    assert_eq!(applied_block_count(&mut cx), 0);
+
+    // Moving the cursor off the heading re-renders it, row 0 included.
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&Default::default(), window, cx);
+        editor.move_down(&Default::default(), window, cx);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        applied_block_count(&mut cx),
+        1,
+        "row-0 heading should re-render after the cursor leaves"
+    );
+
+    // Forward-delete from the empty first line, heading still rendered:
+    // this deleted the newline plus the heading's whole replaced range
+    // before deletions bordering a block were taken over by the addon.
+    cx.set_state(indoc::indoc! {"
+        ˇ
+        # Suzuri
+
+        body
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    cx.dispatch_action(editor::actions::Delete);
+    cx.executor().run_until_parked();
+    assert_eq!(cx.buffer_text(), "# Suzuri\n\nbody\n");
+}
+
+#[gpui::test]
+async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {"
+        # Suzuri
+
+        bodyˇ
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    // What `on_source_click` runs when the click lands on the rendered
+    // heading's own text (the wrapper's mouse-down never fires there —
+    // `MarkdownElement` claims the click and prevents default): the source
+    // reveals with the cursor at the clicked character.
+    let range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Markdown => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("heading block")
+    });
+    let weak = cx.editor.downgrade();
+    let handled =
+        cx.update(|window, cx| reveal_at_source_index(&weak, &range, "# Su".len(), window, cx));
+    assert!(handled);
+    cx.executor().run_until_parked();
+
+    assert_eq!(applied_block_count(&mut cx), 0, "source should reveal");
+    let head = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot)
+            .0
+    });
+    assert_eq!(head, "# Su".len(), "cursor lands on the clicked character");
+
+    // An index past the block (the widget's mini-document carries appended
+    // reference definitions) clamps to the block's end.
+    let handled = cx.update(|window, cx| reveal_at_source_index(&weak, &range, 10_000, window, cx));
+    assert!(handled);
+    cx.executor().run_until_parked();
+    let head = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot)
+            .0
+    });
+    assert_eq!(head, "# Suzuri".len());
+}
