@@ -1,0 +1,9 @@
+The Suzuri theme family is ported from Visual Studio Code's built-in
+"Light 2026" and "Dark 2026" default themes.
+
+Source: https://github.com/microsoft/vscode
+        extensions/theme-defaults/themes/2026-light.json
+        extensions/theme-defaults/themes/2026-dark.json
+
+Visual Studio Code is licensed under the MIT License.
+Copyright (c) Microsoft Corporation.
