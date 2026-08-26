@@ -1,5 +1,5 @@
 use editor::{Editor, MultiBuffer};
-use gpui::{AnyElement, Entity, Modifiers};
+use gpui::{AnyElement, Entity, Focusable as _, Modifiers};
 use markdown_preview::markdown_preview_view::MarkdownPreviewView;
 use svg_preview::svg_preview_view::SvgPreviewView;
 use tabular_data_preview::TabularDataPreviewPane;
@@ -71,6 +71,41 @@ impl QuickActionBar {
             key: "click".into(),
             modifiers: Modifiers::alt(),
             ..Default::default()
+        };
+
+        // Obsidian-style source-mode toggle for markdown buffers: flips the
+        // per-editor live preview off so the raw markdown shows.
+        let source_mode_button = match &preview_target {
+            PreviewTarget::Markdown(editor) => {
+                let source_mode =
+                    !markdown_live_preview::is_live_preview_enabled(editor.read(cx), cx);
+                let editor = editor.clone();
+                Some(
+                    IconButton::new("toggle-markdown-source-mode", IconName::Code)
+                        .icon_size(IconSize::Small)
+                        .style(ButtonStyle::Subtle)
+                        .toggle_state(source_mode)
+                        .tooltip(move |_window, cx| {
+                            Tooltip::for_action(
+                                if source_mode {
+                                    "Live Preview"
+                                } else {
+                                    "Source Mode"
+                                },
+                                &markdown_live_preview::ToggleLivePreview,
+                                cx,
+                            )
+                        })
+                        .on_click(move |_, window, cx| {
+                            editor.read(cx).focus_handle(cx).dispatch_action(
+                                &markdown_live_preview::ToggleLivePreview,
+                                window,
+                                cx,
+                            );
+                        }),
+                )
+            }
+            _ => None,
         };
 
         let button = IconButton::new(button_id, IconName::Eye)
@@ -149,6 +184,11 @@ impl QuickActionBar {
                 }
             });
 
-        Some(button.into_any_element())
+        Some(
+            h_flex()
+                .children(source_mode_button)
+                .child(button)
+                .into_any_element(),
+        )
     }
 }
