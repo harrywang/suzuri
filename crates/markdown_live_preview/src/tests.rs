@@ -334,7 +334,10 @@ async fn test_frontmatter_renders_as_block(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
     assert_eq!(applied_block_count(&mut cx), 1);
 
-    // Cursor inside the frontmatter reveals the raw YAML.
+    // Cursor inside the frontmatter does NOT reveal the raw YAML: the
+    // Properties card is edited through its widget (like tables and images),
+    // so the cursor landing at the top of a freshly opened file keeps the
+    // card rendered.
     cx.set_state(indoc::indoc! {"
         ---
         title: Some Noteˇ
@@ -344,7 +347,161 @@ async fn test_frontmatter_renders_as_block(cx: &mut TestAppContext) {
         body text
     "});
     cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    // Marking the block explicitly revealed (what the card's `</>` button
+    // does) removes the widget while the cursor stays inside.
+    cx.update_editor(|editor, _, cx| {
+        let range = extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Frontmatter => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("frontmatter");
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.source_revealed = Some(range);
+        }
+        apply_decorations(editor, cx);
+    });
+    cx.executor().run_until_parked();
     assert_eq!(applied_block_count(&mut cx), 0);
+}
+
+#[test]
+fn test_parse_frontmatter_properties() {
+    let source = indoc::indoc! {r#"
+        ---
+        title: "Some Note"
+        date: 2026-05-31T00:00:00.000Z
+        rating: 4.5
+        published: false
+        empty:
+        tags:
+          - alpha
+          - "beta"
+        aliases: [one, two]
+        ---"#};
+
+    let properties = parse_frontmatter_properties(source);
+    let by_key: Vec<(&str, &FrontmatterValue)> = properties
+        .iter()
+        .map(|property| (property.key.as_str(), &property.value))
+        .collect();
+    assert_eq!(properties.len(), 7);
+
+    let scalar = |value: &FrontmatterValue| match value {
+        FrontmatterValue::Scalar(text) => text.clone(),
+        FrontmatterValue::List(_) => panic!("expected scalar"),
+    };
+    let list = |value: &FrontmatterValue| match value {
+        FrontmatterValue::List(items) => items.clone(),
+        FrontmatterValue::Scalar(_) => panic!("expected list"),
+    };
+
+    assert_eq!(by_key[0].0, "title");
+    assert_eq!(scalar(by_key[0].1), "Some Note");
+    assert_eq!(scalar(by_key[1].1), "2026-05-31T00:00:00.000Z");
+    assert_eq!(scalar(by_key[2].1), "4.5");
+    assert_eq!(scalar(by_key[3].1), "false");
+    assert_eq!(scalar(by_key[4].1), "");
+    assert_eq!(list(by_key[5].1), vec!["alpha", "beta"]);
+    assert_eq!(list(by_key[6].1), vec!["one", "two"]);
+
+    // The value span starts right after the separator and covers the raw
+    // (quoted) text, so an in-place rewrite replaces exactly the value.
+    let title = &properties[0];
+    assert_eq!(&source[title.value_span.clone()], " \"Some Note\"");
+}
+
+#[test]
+fn test_parse_frontmatter_properties_toml() {
+    let source = indoc::indoc! {r#"
+        +++
+        title = "TOML Note"
+        draft = true
+        +++"#};
+
+    let properties = parse_frontmatter_properties(source);
+    assert_eq!(properties.len(), 2);
+    assert_eq!(properties[0].key, "title");
+    assert!(matches!(&properties[0].value, FrontmatterValue::Scalar(text) if text == "TOML Note"));
+    assert!(matches!(&properties[1].value, FrontmatterValue::Scalar(text) if text == "true"));
+}
+
+#[gpui::test]
+async fn test_frontmatter_property_edit_round_trip(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ---
+        title: Old Title
+        ---
+
+        body ˇtext
+    "});
+    cx.executor().run_until_parked();
+
+    let frontmatter_range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Frontmatter => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("frontmatter")
+    });
+    let editor = cx.editor.clone();
+
+    // Clicking a value mounts a single-line editor seeded with the raw value.
+    let weak = editor.downgrade();
+    let edit_range = frontmatter_range.clone();
+    cx.update(|window, cx| start_property_edit(weak, edit_range, "title".into(), window, cx));
+    let property_editor = cx.update_editor(|editor, _, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.active_property.as_ref())
+            .map(|active| active.editor.clone())
+            .expect("active property editor")
+    });
+    cx.update(|window, cx| {
+        property_editor.update(cx, |editor, cx| {
+            assert_eq!(editor.text(cx), "Old Title");
+            editor.set_text("New Title", window, cx);
+        });
+    });
+
+    // Committing writes the new value back into the frontmatter line.
+    cx.update_editor(|editor, _, cx| {
+        assert_eq!(commit_active_property(editor, cx), None);
+    });
+    cx.executor().run_until_parked();
+    let text = cx.update_editor(|editor, _, cx| editor.text(cx));
+    assert!(text.contains("title: New Title"), "{text:?}");
+
+    // "Add property" commits a `<key>: ` line before the closing delimiter
+    // and hands back the key so Enter can chain into editing its value.
+    let weak = editor.downgrade();
+    let add_range = frontmatter_range.clone();
+    cx.update(|window, cx| start_add_property(weak, add_range, window, cx));
+    let key_editor = cx.update_editor(|editor, _, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.active_property.as_ref())
+            .map(|active| active.editor.clone())
+            .expect("active key editor")
+    });
+    cx.update(|window, cx| {
+        key_editor.update(cx, |editor, cx| editor.set_text("tags", window, cx));
+    });
+    let created = cx.update_editor(|editor, _, cx| commit_active_property(editor, cx));
+    assert_eq!(created.as_deref(), Some("tags"));
+    cx.executor().run_until_parked();
+    let text = cx.update_editor(|editor, _, cx| editor.text(cx));
+    assert!(text.contains("title: New Title\ntags: \n---"), "{text:?}");
 }
 
 fn applied_block_count(cx: &mut EditorTestContext) -> usize {

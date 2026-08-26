@@ -6,8 +6,8 @@
 //! with rendered widgets. Raw markdown is revealed for editing per token: an
 //! inline construct reveals when the selection touches it, and a block
 //! reveals when the selection reaches its lines, mirroring Obsidian's Live
-//! Preview mode. Tables and images are the exception: they are edited
-//! through their widgets and only reveal source via their `</>` button.
+//! Preview mode. Tables, images, and frontmatter are the exception: they are
+//! edited through their widgets and only reveal source via their `</>` button.
 
 use std::{any::TypeId, borrow::Cow, ops::Range, path::PathBuf, sync::Arc};
 
@@ -213,6 +213,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         applied_blocks: Vec::new(),
         selected_image: None,
         active_cell: None,
+        active_property: None,
         selected_table_unit: None,
         drag_source: None,
         drop_boundary: None,
@@ -245,6 +246,9 @@ struct LivePreviewAddon {
     selected_image: Option<Range<Anchor>>,
     /// The table cell currently being edited in place.
     active_cell: Option<ActiveTableCell>,
+    /// The frontmatter property currently being edited in place through the
+    /// Properties card.
+    active_property: Option<ActivePropertyEdit>,
     selected_table_unit: Option<TableUnitSelection>,
     /// Unit being dragged (outlined in place, Obsidian-style) and the unit
     /// the pointer is currently over (gets the insertion line). Rendered
@@ -452,6 +456,39 @@ struct ActiveTableCell {
     _subscriptions: Vec<Subscription>,
 }
 
+struct ActivePropertyEdit {
+    frontmatter_range: Range<Anchor>,
+    target: PropertyEditTarget,
+    editor: Entity<Editor>,
+    _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, PartialEq)]
+enum PropertyEditTarget {
+    /// Rewrites the value of the existing property line whose key this is.
+    Value { key: String },
+    /// The "Add property" key editor; committing inserts a `<key>: ` line
+    /// before the closing delimiter.
+    NewKey,
+}
+
+/// One `key: value` entry parsed from frontmatter for the Properties card.
+struct FrontmatterProperty {
+    key: String,
+    /// Byte range of the raw value within the frontmatter source, starting
+    /// right after the `:`/`=` separator so a rewrite replaces the padding
+    /// too (mirroring how table cells rewrite between their pipes).
+    value_span: Range<usize>,
+    value: FrontmatterValue,
+}
+
+enum FrontmatterValue {
+    /// Display text with surrounding quotes stripped.
+    Scalar(String),
+    /// A YAML block list or inline `[a, b]` array, rendered as pills.
+    List(Vec<String>),
+}
+
 struct AppliedBlock {
     range: Range<Anchor>,
     source: String,
@@ -459,6 +496,15 @@ struct AppliedBlock {
     /// replacing them — display math while its source is revealed.
     below: bool,
     block_id: CustomBlockId,
+}
+
+/// Whether live preview is currently rendering in this editor, considering
+/// both the setting and the per-editor `ToggleLivePreview` override. The
+/// quick action bar's source-mode button reflects and flips this.
+pub fn is_live_preview_enabled(editor: &Editor, cx: &App) -> bool {
+    editor
+        .addon::<LivePreviewAddon>()
+        .is_some_and(|addon| is_enabled(addon, cx))
 }
 
 fn is_enabled(addon: &LivePreviewAddon, cx: &App) -> bool {
@@ -687,11 +733,15 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         let mut below = false;
         if rows_intersect(&selection_rows, start.row, end.row) {
             // Casual clicks land the cursor on widget rows constantly, which
-            // made tables and images explode into source; those two reveal
-            // only via their explicit `</>` button.
+            // made tables and images explode into source; those reveal only
+            // via their explicit `</>` button. Frontmatter joins them so the
+            // cursor sitting at the top of a freshly opened file doesn't
+            // dissolve the properties card into raw YAML.
             let needs_explicit_reveal = matches!(
                 marker.kind,
-                BlockRenderKind::Table(_) | BlockRenderKind::Image { .. }
+                BlockRenderKind::Table(_)
+                    | BlockRenderKind::Image { .. }
+                    | BlockRenderKind::Frontmatter
             );
             let explicitly_revealed = source_revealed.as_ref().is_some_and(|revealed| {
                 let revealed_start = revealed.start.to_point(&snapshot).row;
@@ -3194,62 +3244,648 @@ fn render_math_block(
     })
 }
 
+/// Parses frontmatter (YAML `---` or TOML `+++`) into Properties-card rows.
+/// Deliberately shallow: top-level `key: value` lines, inline `[a, b]`
+/// arrays, and block lists. Nested mappings and multi-line scalars stay
+/// unparsed and are edited through the card's `</>` source view.
+fn parse_frontmatter_properties(source: &str) -> Vec<FrontmatterProperty> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in source.split('\n') {
+        lines.push((offset, line));
+        offset += line.len() + 1;
+    }
+
+    let mut properties = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let (line_start, line) = lines[index];
+        index += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed == "---"
+            || trimmed == "+++"
+            || trimmed.starts_with('#')
+            || line.starts_with(char::is_whitespace)
+        {
+            continue;
+        }
+        let Some(separator) = line.find(':').or_else(|| line.find('=')) else {
+            continue;
+        };
+        let key = line[..separator].trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value_start = separator + 1;
+        let raw_value = line[value_start..].trim();
+        let value_span = line_start + value_start..line_start + line.len();
+        let value = if raw_value.is_empty() {
+            let mut items = Vec::new();
+            while let Some((_, next)) = lines.get(index).copied() {
+                let next_trimmed = next.trim();
+                let continues = !next_trimmed.is_empty()
+                    && (next.starts_with(char::is_whitespace) || next_trimmed.starts_with("- "));
+                if !continues {
+                    break;
+                }
+                if let Some(item) = next_trimmed.strip_prefix('-') {
+                    let item = unquote(item.trim());
+                    if !item.is_empty() {
+                        items.push(item.to_string());
+                    }
+                }
+                index += 1;
+            }
+            if items.is_empty() {
+                FrontmatterValue::Scalar(String::new())
+            } else {
+                FrontmatterValue::List(items)
+            }
+        } else if let Some(inner) = raw_value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            FrontmatterValue::List(
+                inner
+                    .split(',')
+                    .map(|item| unquote(item.trim()).to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect(),
+            )
+        } else {
+            FrontmatterValue::Scalar(unquote(raw_value).to_string())
+        };
+        properties.push(FrontmatterProperty {
+            key: key.to_string(),
+            value_span,
+            value,
+        });
+    }
+    properties
+}
+
+fn unquote(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
+}
+
+/// Re-resolves a scalar property's value span from live text (spans captured
+/// at render time go stale whenever an edit lands before the widget
+/// refreshes). Returns the absolute byte range starting right after the
+/// separator, and its current text.
+fn resolve_property_value_span(
+    snapshot: &MultiBufferSnapshot,
+    frontmatter_range: &Range<Anchor>,
+    key: &str,
+) -> Option<(Range<usize>, String)> {
+    let start = frontmatter_range.start.to_offset(snapshot).0;
+    let end = frontmatter_range.end.to_offset(snapshot).0;
+    if start > end || end > snapshot.len().0 {
+        return None;
+    }
+    let source: String = snapshot
+        .text_for_range(MultiBufferOffset(start)..MultiBufferOffset(end))
+        .collect();
+    let property = parse_frontmatter_properties(&source)
+        .into_iter()
+        .find(|property| property.key == key)?;
+    if !matches!(property.value, FrontmatterValue::Scalar(_)) {
+        return None;
+    }
+    let text = source.get(property.value_span.clone())?.to_string();
+    let span = start + property.value_span.start..start + property.value_span.end;
+    Some((span, text))
+}
+
+/// Rewrites `key`'s value in place; used by the bool checkbox toggle.
+fn set_property_value(
+    editor: &WeakEntity<Editor>,
+    frontmatter_range: &Range<Anchor>,
+    key: &str,
+    new_value: &str,
+    cx: &mut App,
+) {
+    editor
+        .update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let Some((span, _)) = resolve_property_value_span(&snapshot, frontmatter_range, key)
+            else {
+                return;
+            };
+            editor.buffer().update(cx, |multibuffer, cx| {
+                multibuffer.edit(
+                    [(
+                        MultiBufferOffset(span.start)..MultiBufferOffset(span.end),
+                        format!(" {new_value}"),
+                    )],
+                    None,
+                    cx,
+                );
+            });
+        })
+        .log_err();
+}
+
+/// Starts editing `key`'s value in place: mounts a focused single-line editor
+/// in the property's row, committing on enter/tab/blur and cancelling on
+/// escape.
+fn start_property_edit(
+    weak_editor: WeakEntity<Editor>,
+    frontmatter_range: Range<Anchor>,
+    key: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(main_editor) = weak_editor.upgrade() else {
+        return;
+    };
+    main_editor.update(cx, |editor, cx| {
+        commit_active_property(editor, cx);
+    });
+
+    let snapshot = main_editor.read(cx).buffer().read(cx).snapshot(cx);
+    let Some((_, raw_value)) = resolve_property_value_span(&snapshot, &frontmatter_range, &key)
+    else {
+        return;
+    };
+
+    let property_editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_text(raw_value.trim(), window, cx);
+        editor
+    });
+    install_property_editor(
+        weak_editor,
+        main_editor,
+        frontmatter_range,
+        PropertyEditTarget::Value { key },
+        property_editor,
+        window,
+        cx,
+    );
+}
+
+/// Starts the Obsidian-style "Add property" flow: an inline key editor whose
+/// commit inserts a `<key>: ` line, chaining into editing its value.
+fn start_add_property(
+    weak_editor: WeakEntity<Editor>,
+    frontmatter_range: Range<Anchor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(main_editor) = weak_editor.upgrade() else {
+        return;
+    };
+    main_editor.update(cx, |editor, cx| {
+        commit_active_property(editor, cx);
+    });
+
+    let property_editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text("Property name", window, cx);
+        editor
+    });
+    install_property_editor(
+        weak_editor,
+        main_editor,
+        frontmatter_range,
+        PropertyEditTarget::NewKey,
+        property_editor,
+        window,
+        cx,
+    );
+}
+
+fn install_property_editor(
+    weak_editor: WeakEntity<Editor>,
+    main_editor: Entity<Editor>,
+    frontmatter_range: Range<Anchor>,
+    target: PropertyEditTarget,
+    property_editor: Entity<Editor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut subscriptions = Vec::new();
+    main_editor.update(cx, |_, cx| {
+        subscriptions.push(cx.subscribe(
+            &property_editor,
+            |editor, blurred, event: &EditorEvent, cx| {
+                // Only commit if this editor is still the active property:
+                // when Enter chains the key editor into the value editor, the
+                // old editor's blur must not commit (and clear) the new one.
+                if matches!(event, EditorEvent::Blurred)
+                    && editor
+                        .addon::<LivePreviewAddon>()
+                        .and_then(|addon| addon.active_property.as_ref())
+                        .is_some_and(|active| active.editor == blurred)
+                {
+                    commit_active_property(editor, cx);
+                }
+            },
+        ));
+    });
+
+    property_editor.update(cx, |editor, _| {
+        let weak = weak_editor.clone();
+        let chain_range = frontmatter_range.clone();
+        subscriptions.push(editor.register_action::<editor::actions::Newline>(
+            move |_, window, cx| {
+                let created_key = weak
+                    .update(cx, |editor, cx| commit_active_property(editor, cx))
+                    .ok()
+                    .flatten();
+                match created_key {
+                    // Enter in the key editor chains straight into editing
+                    // the new property's value, like Obsidian.
+                    Some(key) => {
+                        start_property_edit(weak.clone(), chain_range.clone(), key, window, cx)
+                    }
+                    None => {
+                        weak.update(cx, |editor, cx| refocus_main_editor(editor, window, cx))
+                            .log_err();
+                    }
+                }
+            },
+        ));
+        let weak = weak_editor.clone();
+        subscriptions.push(
+            editor.register_action::<editor::actions::Tab>(move |_, window, cx| {
+                weak.update(cx, |editor, cx| {
+                    commit_active_property(editor, cx);
+                    refocus_main_editor(editor, window, cx);
+                })
+                .log_err();
+            }),
+        );
+        let weak = weak_editor.clone();
+        subscriptions.push(editor.register_action::<editor::actions::Cancel>(
+            move |_, window, cx| {
+                weak.update(cx, |editor, cx| {
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.active_property = None;
+                    }
+                    refocus_main_editor(editor, window, cx);
+                    cx.notify();
+                })
+                .log_err();
+            },
+        ));
+    });
+
+    let focus_handle = property_editor.read(cx).focus_handle(cx);
+    window.focus(&focus_handle, cx);
+
+    main_editor.update(cx, |editor, cx| {
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.active_property = Some(ActivePropertyEdit {
+                frontmatter_range,
+                target,
+                editor: property_editor,
+                _subscriptions: subscriptions,
+            });
+        }
+        cx.notify();
+    });
+}
+
+/// Writes the active property editor's text back into the frontmatter.
+/// Returns the key of a property line the commit just created, so Enter in
+/// the "Add property" key editor can chain into editing its value.
+fn commit_active_property(editor: &mut Editor, cx: &mut Context<Editor>) -> Option<String> {
+    let active = editor
+        .addon_mut::<LivePreviewAddon>()
+        .and_then(|addon| addon.active_property.take())?;
+    let text = active
+        .editor
+        .read(cx)
+        .text(cx)
+        .replace('\n', " ")
+        .trim()
+        .to_string();
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    match active.target {
+        PropertyEditTarget::Value { key } => {
+            let Some((span, current)) =
+                resolve_property_value_span(&snapshot, &active.frontmatter_range, &key)
+            else {
+                cx.notify();
+                return None;
+            };
+            if current.trim() == text {
+                cx.notify();
+                return None;
+            }
+            let replacement = if text.is_empty() {
+                String::new()
+            } else {
+                format!(" {text}")
+            };
+            editor.buffer().update(cx, |multibuffer, cx| {
+                multibuffer.edit(
+                    [(
+                        MultiBufferOffset(span.start)..MultiBufferOffset(span.end),
+                        replacement,
+                    )],
+                    None,
+                    cx,
+                );
+            });
+            cx.notify();
+            None
+        }
+        PropertyEditTarget::NewKey => {
+            let key = text.trim_end_matches(':').trim().to_string();
+            if key.is_empty() || key.contains(':') {
+                cx.notify();
+                return None;
+            }
+            // Insert before the closing delimiter, which is the last line of
+            // the frontmatter block's range.
+            let end_row = active.frontmatter_range.end.to_point(&snapshot).row;
+            let insert_at = Point::new(end_row, 0).to_offset(&snapshot);
+            editor.buffer().update(cx, |multibuffer, cx| {
+                multibuffer.edit([(insert_at..insert_at, format!("{key}: \n"))], None, cx);
+            });
+            cx.notify();
+            Some(key)
+        }
+    }
+}
+
 fn render_frontmatter_block(
     editor: WeakEntity<Editor>,
     range: Range<Anchor>,
     source: String,
 ) -> RenderBlock {
-    let properties: Vec<(String, String)> = source
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed == "---" || trimmed == "+++" {
-                return None;
-            }
-            let (key, value) = trimmed
-                .split_once(':')
-                .or_else(|| trimmed.split_once('='))
-                .unwrap_or(("", trimmed));
-            Some((key.trim().to_string(), value.trim().to_string()))
-        })
-        .collect();
+    let properties = Arc::new(parse_frontmatter_properties(&source));
 
     Arc::new(move |block_cx| {
-        let editor = editor.clone();
-        let start = range.start;
         let colors = block_cx.app.theme().colors().clone();
         let gutter_width = block_cx.margins.gutter.full_width();
+        let max_width = block_cx.max_width;
+
+        // The single-line editor mounted in the row being edited, if any.
+        let active = editor.upgrade().and_then(|entity| {
+            let editor_ref = entity.read(block_cx.app);
+            let snapshot = editor_ref
+                .buffer()
+                .read(block_cx.app)
+                .snapshot(block_cx.app);
+            editor_ref
+                .addon::<LivePreviewAddon>()
+                .and_then(|addon| addon.active_property.as_ref())
+                .filter(|active| {
+                    active.frontmatter_range.start.to_offset(&snapshot)
+                        == range.start.to_offset(&snapshot)
+                })
+                .map(|active| (active.target.clone(), active.editor.clone()))
+        });
+
+        let reveal_source = {
+            let weak = editor.clone();
+            let reveal_range = range.clone();
+            move |window: &mut Window, cx: &mut App| {
+                weak.update(cx, |editor, cx| {
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.source_revealed = Some(reveal_range.clone());
+                    }
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let offset = reveal_range.start.to_offset(&snapshot);
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.select_ranges([offset..offset]);
+                    });
+                })
+                .log_err();
+            }
+        };
+
+        // Reveal the frontmatter's raw source, mirroring the table widget's
+        // `</>` button in its right-hand rail.
+        let source_button = div()
+            .id("mdlp-frontmatter-source")
+            .h(gpui::px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_color(colors.text_muted)
+            .opacity(0.)
+            .group_hover("mdlp-frontmatter", |this| this.opacity(0.7))
+            .hover(|this| this.opacity(1.))
+            .child(
+                Icon::new(IconName::Code)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .tooltip(ui::Tooltip::text("Edit frontmatter source"))
+            .on_mouse_down(MouseButton::Left, {
+                let reveal_source = reveal_source.clone();
+                move |_, window, cx| {
+                    cx.stop_propagation();
+                    reveal_source(window, cx);
+                }
+            });
+
+        // Styled after Zed's own markdown preview, which renders frontmatter
+        // as a bordered two-column table with a muted key column.
+        let mut table = v_flex();
+
+        for (index, property) in properties.iter().enumerate() {
+            let key = property.key.clone();
+            let active_value_editor = match &active {
+                Some((PropertyEditTarget::Value { key: active_key }, active_editor))
+                    if *active_key == key =>
+                {
+                    Some(active_editor.clone())
+                }
+                _ => None,
+            };
+
+            let value_element: AnyElement = if let Some(active_editor) = active_value_editor {
+                div().w_full().child(active_editor).into_any_element()
+            } else {
+                match &property.value {
+                    FrontmatterValue::List(items) => h_flex()
+                        .id(("mdlp-property-list", index))
+                        .flex_wrap()
+                        .gap_1()
+                        .cursor_pointer()
+                        .children(items.iter().map(|item| {
+                            div()
+                                .px_1p5()
+                                .rounded_md()
+                                .bg(colors.element_background)
+                                .child(SharedString::from(item.clone()))
+                        }))
+                        .tooltip(ui::Tooltip::text("Edit list in source"))
+                        .on_mouse_down(MouseButton::Left, {
+                            let reveal_source = reveal_source.clone();
+                            move |_, window, cx| {
+                                cx.stop_propagation();
+                                reveal_source(window, cx);
+                            }
+                        })
+                        .into_any_element(),
+                    FrontmatterValue::Scalar(text) if text == "true" || text == "false" => {
+                        let checked = text == "true";
+                        let weak = editor.clone();
+                        let toggle_range = range.clone();
+                        Checkbox::new(
+                            ("mdlp-property-bool", index),
+                            if checked {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .on_click(move |_, _, cx| {
+                            set_property_value(
+                                &weak,
+                                &toggle_range,
+                                &key,
+                                if checked { "false" } else { "true" },
+                                cx,
+                            );
+                        })
+                        .into_any_element()
+                    }
+                    FrontmatterValue::Scalar(text) => {
+                        let weak = editor.clone();
+                        let edit_range = range.clone();
+                        div()
+                            .id(("mdlp-property-value", index))
+                            .w_full()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_text()
+                            .hover(|this| this.bg(colors.element_hover))
+                            .map(|this| {
+                                if text.is_empty() {
+                                    this.text_color(colors.text_muted).child("Empty")
+                                } else {
+                                    this.child(SharedString::from(text.clone()))
+                                }
+                            })
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                cx.stop_propagation();
+                                start_property_edit(
+                                    weak.clone(),
+                                    edit_range.clone(),
+                                    key.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .into_any_element()
+                    }
+                }
+            };
+
+            table = table.child(
+                h_flex()
+                    .items_stretch()
+                    .child(
+                        div()
+                            .w(rems(9.))
+                            .px_2()
+                            .py_1()
+                            .border_l_1()
+                            .border_r_1()
+                            .border_b_1()
+                            .when(index == 0, |this| this.border_t_1())
+                            .border_color(colors.border_variant)
+                            .bg(colors.elevated_surface_background)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(SharedString::from(property.key.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .border_r_1()
+                            .border_b_1()
+                            .when(index == 0, |this| this.border_t_1())
+                            .border_color(colors.border_variant)
+                            .flex()
+                            .items_center()
+                            .child(value_element),
+                    ),
+            );
+        }
+
+        let add_property: AnyElement =
+            if let Some((PropertyEditTarget::NewKey, active_editor)) = &active {
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(div().w_full().child(active_editor.clone()))
+                    .into_any_element()
+            } else {
+                let weak = editor.clone();
+                let add_range = range.clone();
+                h_flex()
+                    .id("mdlp-add-property")
+                    .gap_1p5()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_color(colors.text_muted)
+                    .opacity(0.6)
+                    .hover(|this| this.opacity(1.))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child("Add property")
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        cx.stop_propagation();
+                        start_add_property(weak.clone(), add_range.clone(), window, cx);
+                    })
+                    .into_any_element()
+            };
         div()
             .pl(gutter_width)
-            .w(block_cx.max_width)
-            .py(gpui::px(2.))
-            .cursor_pointer()
-            .on_mouse_down(
-                MouseButton::Left,
-                reveal_source_on_mouse_down(editor, start),
-            )
+            .w(max_width)
+            .pb(gpui::px(4.))
+            .group("mdlp-frontmatter")
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
             .child(
                 v_flex()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(colors.border_variant)
-                    .bg(colors.elevated_surface_background)
-                    .px_3()
-                    .py_1p5()
-                    .gap_0p5()
+                    // Zed's markdown preview leaves generous air above the
+                    // frontmatter table; without it the card hugs the tab
+                    // bar. The padding lives on this opaquely-painted wrapper
+                    // rather than the block's outer div: the editor still
+                    // paints the replaced first line's cursor at the block's
+                    // origin, and the background is what keeps that bar from
+                    // showing through the breathing room.
+                    .pt(gpui::px(14.))
+                    .bg(colors.editor_background)
+                    .gap_1()
                     .text_size(rems(0.85))
-                    .children(properties.iter().map(|(key, value)| {
+                    .child(
                         h_flex()
-                            .gap_3()
                             .items_start()
-                            .child(
-                                div()
-                                    .min_w(rems(7.))
-                                    .text_color(colors.text_muted)
-                                    .child(SharedString::from(key.clone())),
-                            )
-                            .child(div().flex_1().child(SharedString::from(value.clone())))
-                    })),
+                            .child(table.flex_grow(1.))
+                            .child(v_flex().w(gpui::px(22.)).child(source_button)),
+                    )
+                    .child(add_property),
             )
             .into_any_element()
     })
@@ -3655,10 +4291,12 @@ impl Extraction<'_> {
                 }
                 "minus_metadata" | "plus_metadata" => {
                     let (start_row, end_row) = self.node_rows(node);
+                    // The card adds a "Properties" header and an "Add
+                    // property" row beyond the property lines themselves.
                     self.push_block_rows(
                         start_row,
                         end_row,
-                        end_row - start_row,
+                        end_row - start_row + 2,
                         BlockRenderKind::Frontmatter,
                     );
                 }
