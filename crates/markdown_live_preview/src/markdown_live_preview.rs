@@ -102,6 +102,19 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         }),
     );
 
+    // The editor does not re-emit hunk expansion as an `EditorEvent`, so the
+    // recompute that hides the preview while a diff is expanded (see
+    // `extract_markers`) needs the multibuffer's own event.
+    let multibuffer = editor.buffer().clone();
+    subscriptions.push(cx.subscribe(
+        &multibuffer,
+        |editor, _, event: &multi_buffer::Event, cx| {
+            if matches!(event, multi_buffer::Event::DiffHunksToggled) {
+                recompute(editor, cx);
+            }
+        },
+    ));
+
     subscriptions.push(cx.observe_global::<theme::GlobalTheme>(|editor, cx| {
         let markers = editor
             .addon::<LivePreviewAddon>()
@@ -4975,7 +4988,20 @@ fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
 // --- Marker extraction ---
 
 fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
-    let buffer = editor.buffer().read(cx).as_singleton()?;
+    let multibuffer = editor.buffer().read(cx);
+    let buffer = multibuffer.as_singleton()?;
+    // Extraction reads tree-sitter's byte offsets, which are buffer-relative,
+    // and anchors them as multibuffer offsets. An expanded diff hunk splices
+    // the deleted rows into the multibuffer's coordinate space, so the two
+    // stop agreeing and every decoration below the hunk lands shifted by the
+    // deleted text's length — replacing the wrong rows and concealing the
+    // wrong spans, which reads as missing text. Reviewing a diff wants
+    // unconcealed source anyway; the preview returns when the hunks collapse
+    // (`DiffHunksToggled` drives that recompute, since collapsing edits no
+    // buffer text and so reparses nothing).
+    if multibuffer.has_expanded_diff_hunks_in_ranges(&[Anchor::Min..Anchor::Max], cx) {
+        return None;
+    }
     let buffer = buffer.read(cx);
     let language = buffer.language()?;
     if language.name() != LanguageName::new(MARKDOWN) {

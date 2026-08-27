@@ -3185,3 +3185,134 @@ async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppCon
     });
     assert_eq!(head, "# Suzuri".len());
 }
+
+/// `register_editor` attaches to every full editor, and the git panel and
+/// project diff open non-singleton multibuffers — the shape built here. There
+/// the addon must be completely inert (no concealments, blocks, or highlights)
+/// so a diff of markdown files reads as plain source, and its editing actions
+/// must pass through to the editor's own untouched.
+///
+/// `extract_markers` bails at `as_singleton()`, which is what makes this hold;
+/// this pins that, since a future change reaching for the first excerpt's
+/// buffer instead would decorate multibuffer rows using excerpt-relative
+/// offsets.
+#[gpui::test]
+async fn test_multibuffer_excerpts_stay_plain_source(cx: &mut TestAppContext) {
+    init_test(cx);
+    let mut cx = EditorTestContext::new_multibuffer(
+        cx,
+        [
+            "«# One\n\nsome **bold** and *italic* text\n»",
+            "«# Two\n\n- [ ] task item\n»",
+        ],
+    );
+    let markdown = language::markdown_lang();
+    cx.update_multibuffer(|multibuffer, cx| {
+        for buffer in multibuffer.all_buffers() {
+            buffer.update(cx, |buffer, cx| {
+                buffer.set_language(Some(markdown.clone()), cx)
+            });
+        }
+    });
+    cx.executor().run_until_parked();
+
+    // The addon is attached (`applied_block_count` would panic otherwise),
+    // but with markdown excerpts on both sides it decorates nothing.
+    assert_eq!(
+        applied_block_count(&mut cx),
+        0,
+        "a diff multibuffer must not render preview blocks"
+    );
+    let display = cx.display_text();
+    assert!(
+        display.contains("# One") && display.contains("**bold**"),
+        "syntax markers must stay visible in a diff multibuffer: {display:?}"
+    );
+    for key in [BOLD, ITALIC] {
+        let highlights = cx.update_editor(|editor, _, cx| {
+            editor
+                .text_highlights(HighlightKey::MarkdownLivePreview(key), cx)
+                .map_or(0, |(_, ranges)| ranges.len())
+        });
+        assert_eq!(highlights, 0, "no emphasis styling in a diff multibuffer");
+    }
+
+    // The addon's Backspace handler must propagate to the editor's own.
+    let before = cx.buffer_text();
+    cx.update_editor(|editor, window, cx| {
+        editor.move_to_end(&Default::default(), window, cx);
+    });
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.executor().run_until_parked();
+    assert_eq!(
+        cx.buffer_text().len(),
+        before.len() - 1,
+        "backspace must edit normally in a diff multibuffer"
+    );
+}
+
+/// An expanded diff hunk splices the deleted rows into the multibuffer's
+/// coordinate space, so the buffer byte offsets extraction anchors with stop
+/// addressing multibuffer positions: every decoration below the hunk lands
+/// shifted by the deleted text's length. The damage is not cosmetic — without
+/// the guard this fixture rendered as
+///
+/// ```text
+/// # tle
+/// ome **bold** text
+/// ```
+///
+/// with both title rows gone and a character eaten off the body, because the
+/// heading block replaced the wrong rows and concealments hid the wrong spans.
+/// The preview therefore retreats to plain source while any hunk is expanded,
+/// and returns when they collapse.
+#[gpui::test]
+async fn test_expanded_diff_hunks_reveal_plain_source(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {"
+        # Title
+
+        some **bold** textˇ
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(
+        applied_block_count(&mut cx),
+        1,
+        "heading renders as a block"
+    );
+    assert!(cx.display_text().contains("some bold text"));
+
+    cx.set_head_text(indoc::indoc! {"
+        # Old Title
+
+        some **bold** text
+    "});
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::ExpandAllDiffHunks);
+    cx.executor().run_until_parked();
+
+    assert_eq!(
+        applied_block_count(&mut cx),
+        0,
+        "an expanded hunk must drop the preview to plain source"
+    );
+    let display = cx.display_text();
+    assert!(
+        display.contains("# Old Title"),
+        "the deleted rows show: {display:?}"
+    );
+    assert!(
+        display.contains("# Title") && display.contains("**bold**"),
+        "current source shows unconcealed: {display:?}"
+    );
+
+    cx.dispatch_action(editor::actions::CollapseAllDiffHunks);
+    cx.executor().run_until_parked();
+    assert_eq!(
+        applied_block_count(&mut cx),
+        1,
+        "collapsing the hunks brings the preview back"
+    );
+    assert!(cx.display_text().contains("some bold text"));
+}
