@@ -224,6 +224,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         handle_press: None,
         source_revealed: None,
         last_resize_at: None,
+        callout_collapse: Vec::new(),
         _subscriptions: subscriptions,
     });
 
@@ -273,6 +274,10 @@ struct LivePreviewAddon {
     /// When a resize drag last wrote a width, so selection isn't cleared by
     /// the selection refresh that buffer edits trigger mid-drag.
     last_resize_at: Option<std::time::Instant>,
+    /// Callouts the reader has expanded or collapsed by clicking their title,
+    /// overriding the `+`/`-` their syntax asks for. Anchored, so the state
+    /// follows the callout as text above it changes.
+    callout_collapse: Vec<(Range<Anchor>, bool)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -391,6 +396,14 @@ enum BlockRenderKind {
         destination: Option<String>,
         alt: String,
     },
+    /// An Obsidian callout (`> [!note] Title`), rendered as a tinted card
+    /// with its type's icon and color. `collapse` carries what the `+`/`-`
+    /// suffix asked for: `None` when the callout is not collapsible at all.
+    Callout {
+        kind: CalloutKind,
+        title: String,
+        collapse: Option<bool>,
+    },
     /// Display math (`$$...$$` alone on its lines), rendered as a centered
     /// typeset formula. Unlike other blocks, revealing its source does not
     /// remove the widget: the rendering stays below the source lines and
@@ -399,6 +412,94 @@ enum BlockRenderKind {
         /// The LaTeX between the delimiters.
         source: String,
     },
+}
+
+/// Obsidian's callout types, collapsed onto the handful of visual treatments
+/// they actually have. Its full alias list maps many names onto one look —
+/// `tip`, `hint`, and `important` are the same callout — so this models the
+/// looks and resolves aliases into them.
+///
+/// An unrecognized type deliberately renders as `Note` rather than falling
+/// back to a plain quote: a vault full of `[!recipe]` callouts should still
+/// read as callouts.
+#[derive(Clone, Copy, PartialEq)]
+enum CalloutKind {
+    Note,
+    Abstract,
+    Todo,
+    Tip,
+    Success,
+    Question,
+    Warning,
+    Failure,
+    Danger,
+    Example,
+    Quote,
+}
+
+impl CalloutKind {
+    fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "abstract" | "summary" | "tldr" => Self::Abstract,
+            "todo" => Self::Todo,
+            "tip" | "hint" | "important" => Self::Tip,
+            "success" | "check" | "done" => Self::Success,
+            "question" | "help" | "faq" => Self::Question,
+            "warning" | "caution" | "attention" => Self::Warning,
+            "failure" | "fail" | "missing" | "bug" => Self::Failure,
+            "danger" | "error" => Self::Danger,
+            "example" => Self::Example,
+            "quote" | "cite" => Self::Quote,
+            _ => Self::Note,
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Note => IconName::Info,
+            Self::Abstract => IconName::Notepad,
+            Self::Todo => IconName::ListTodo,
+            Self::Tip => IconName::Flame,
+            Self::Success => IconName::Check,
+            Self::Question => IconName::CircleHelp,
+            Self::Warning => IconName::Warning,
+            Self::Failure => IconName::XCircle,
+            Self::Danger => IconName::BoltFilled,
+            Self::Example => IconName::Book,
+            Self::Quote => IconName::Quote,
+        }
+    }
+
+    /// The callout's accent, taken from the theme's status palette so both
+    /// Suzuri Light and Dark stay legible without pinning hex values.
+    fn accent(self, cx: &App) -> Hsla {
+        let status = cx.theme().status();
+        match self {
+            Self::Note | Self::Abstract | Self::Todo => status.info,
+            Self::Tip | Self::Success => status.success,
+            Self::Question | Self::Warning => status.warning,
+            Self::Failure | Self::Danger => status.error,
+            Self::Example => status.hint,
+            Self::Quote => cx.theme().colors().text_muted,
+        }
+    }
+
+    /// What Obsidian titles an untitled callout: the type's own name.
+    fn default_title(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Abstract => "Abstract",
+            Self::Todo => "Todo",
+            Self::Tip => "Tip",
+            Self::Success => "Success",
+            Self::Question => "Question",
+            Self::Warning => "Warning",
+            Self::Failure => "Failure",
+            Self::Danger => "Danger",
+            Self::Example => "Example",
+            Self::Quote => "Quote",
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
@@ -509,6 +610,10 @@ struct AppliedBlock {
     /// True when the widget is placed below its source lines instead of
     /// replacing them — display math while its source is revealed.
     below: bool,
+    /// A collapsed callout draws different content over identical source, so
+    /// this has to take part in the reuse check or toggling one redraws
+    /// nothing. Always false for every other block kind.
+    collapsed: bool,
     block_id: CustomBlockId,
 }
 
@@ -678,12 +783,23 @@ fn apply_emphasis_highlights(
     }
 }
 
+/// A block widget `apply_decorations` wants on screen this pass, paired with
+/// everything the reuse check compares against the block already applied
+/// there.
+struct DesiredBlock<'a> {
+    marker: &'a BlockMarker,
+    source: String,
+    below: bool,
+    collapsed: bool,
+}
+
 fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
         return;
     };
     let markers = addon.markers.clone();
     let image_cache = addon.image_cache.clone();
+    let callout_collapse = addon.callout_collapse.clone();
     let applied_blocks = std::mem::take(&mut addon.applied_blocks);
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -765,8 +881,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
 
     // --- Block widgets ---
 
-    let mut desired_blocks: HashMap<(usize, usize), (&BlockMarker, String, bool)> =
-        HashMap::default();
+    let mut desired_blocks: HashMap<(usize, usize), DesiredBlock<'_>> = HashMap::default();
     for marker in &markers.blocks {
         let start = marker.range.start.to_point(&snapshot);
         let end = marker.range.end.to_point(&snapshot);
@@ -810,13 +925,32 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         // document's definitions, which live outside the widget's slice.
         if matches!(
             marker.kind,
-            BlockRenderKind::Markdown | BlockRenderKind::Image { .. }
+            BlockRenderKind::Markdown
+                | BlockRenderKind::Image { .. }
+                | BlockRenderKind::Callout { .. }
         ) && !markers.definitions.is_empty()
         {
             source.push_str("\n\n");
             source.push_str(&markers.definitions);
         }
-        desired_blocks.insert((start_offset.0, end_offset.0), (marker, source, below));
+        // What the reader last asked for wins over what the `+`/`-` in the
+        // syntax asked for.
+        let collapsed = match &marker.kind {
+            BlockRenderKind::Callout { collapse, .. } => callout_collapse
+                .iter()
+                .find(|(range, _)| range.start.to_offset(&snapshot) == start_offset)
+                .map_or(collapse.unwrap_or(false), |(_, collapsed)| *collapsed),
+            _ => false,
+        };
+        desired_blocks.insert(
+            (start_offset.0, end_offset.0),
+            DesiredBlock {
+                marker,
+                source,
+                below,
+                collapsed,
+            },
+        );
     }
 
     let mut new_applied_blocks = Vec::new();
@@ -824,9 +958,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     for applied in applied_blocks {
         let start = applied.range.start.to_offset(&snapshot).0;
         let end = applied.range.end.to_offset(&snapshot).0;
-        let keep = desired_blocks
-            .get(&(start, end))
-            .is_some_and(|(_, source, below)| *source == applied.source && *below == applied.below);
+        let keep = desired_blocks.get(&(start, end)).is_some_and(|desired| {
+            desired.source == applied.source
+                && desired.below == applied.below
+                && desired.collapsed == applied.collapsed
+        });
         if keep {
             desired_blocks.remove(&(start, end));
             new_applied_blocks.push(applied);
@@ -845,7 +981,13 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         .read(cx)
         .as_singleton()
         .and_then(|buffer| buffer.read(cx).language_registry());
-    for (marker, source, below) in desired_blocks.into_values() {
+    for DesiredBlock {
+        marker,
+        source,
+        below,
+        collapsed,
+    } in desired_blocks.into_values()
+    {
         let render = match &marker.kind {
             BlockRenderKind::Markdown => {
                 let markdown = cx.new(|cx| {
@@ -951,6 +1093,40 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             BlockRenderKind::Frontmatter => {
                 render_frontmatter_block(weak_editor.clone(), marker.range.clone(), source.clone())
             }
+            BlockRenderKind::Callout {
+                kind,
+                title,
+                collapse,
+            } => {
+                let body_source = callout_body(&source);
+                let body = (!collapsed && !body_source.trim().is_empty()).then(|| {
+                    cx.new(|cx| {
+                        Markdown::new_with_options(
+                            SharedString::from(body_source),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })
+                });
+                render_callout_block(
+                    *kind,
+                    SharedString::from(title.clone()),
+                    body,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    base_directory.clone(),
+                    marker.indent_columns,
+                    image_cache.clone(),
+                    collapse.is_some(),
+                    collapsed,
+                )
+            }
             BlockRenderKind::Math { source } => {
                 let text_color = cx.theme().colors().editor_foreground;
                 request_math_render(
@@ -982,7 +1158,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             render,
             priority: 0,
         });
-        pending_applied.push((marker.range.clone(), source, below));
+        pending_applied.push((marker.range.clone(), source, below, collapsed));
     }
 
     if !block_ids_to_remove.is_empty() {
@@ -990,11 +1166,14 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     }
     if !blocks_to_insert.is_empty() {
         let block_ids = editor.insert_blocks(blocks_to_insert, None, cx);
-        for ((range, source, below), block_id) in pending_applied.into_iter().zip(block_ids) {
+        for ((range, source, below, collapsed), block_id) in
+            pending_applied.into_iter().zip(block_ids)
+        {
             new_applied_blocks.push(AppliedBlock {
                 range,
                 source,
                 below,
+                collapsed,
                 block_id,
             });
         }
@@ -1324,11 +1503,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                             .w(width)
                             .pt(pad_top)
                             .pb(pad_bottom)
-                            .child(
-                                img(ImageSource::Render(image.clone()))
-                                    .h(height)
-                                    .w(width),
-                            )
+                            .child(img(ImageSource::Render(image.clone())).h(height).w(width))
                             .into_any_element()
                     }
                     // While a render is in flight — and permanently for a
@@ -3379,6 +3554,132 @@ fn render_rule_block(
     })
 }
 
+/// Renders an Obsidian callout as a tinted card: the type's icon and color, a
+/// title row, and the quote's body with its `>` prefixes stripped.
+///
+/// A collapsible callout's title row claims its own click so it toggles
+/// instead of revealing source, the way a rendered code block's copy button
+/// does. Everything else in the card falls through to the wrapper and reveals
+/// the markdown for editing, like any other block widget.
+#[allow(clippy::too_many_arguments)]
+fn render_callout_block(
+    kind: CalloutKind,
+    title: SharedString,
+    body: Option<Entity<Markdown>>,
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    base_directory: Option<PathBuf>,
+    indent_columns: u32,
+    image_cache: Entity<RetainAllImageCache>,
+    collapsible: bool,
+    collapsed: bool,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let accent = kind.accent(block_cx.app);
+        let style = block_markdown_style(block_cx.window, block_cx.app);
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        // The title row is the only stateful element in the card, so the
+        // block's own id is enough to keep it distinct from every other
+        // callout on screen.
+        let title_id = block_cx.block_id;
+        let start = range.start;
+        let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
+        let body = body.clone();
+        let toggle_editor = editor.clone();
+        let toggle_range = range.clone();
+        let source_click_editor = editor.clone();
+        let source_range = range.clone();
+
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor.clone(), start),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .border_l_2()
+                    .border_color(accent)
+                    .rounded_r_md()
+                    .bg(accent.opacity(0.1))
+                    .child(
+                        h_flex()
+                            .id(title_id)
+                            .gap_1p5()
+                            .items_center()
+                            .when(collapsible, |this| {
+                                this.on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.prevent_default()
+                                })
+                                .on_click(move |_, _, cx| {
+                                    toggle_callout(&toggle_editor, &toggle_range, collapsed, cx);
+                                })
+                            })
+                            .child(
+                                Icon::new(kind.icon())
+                                    .size(IconSize::Small)
+                                    .color(Color::Custom(accent)),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(accent)
+                                    .child(title.clone()),
+                            )
+                            .when(collapsible, |this| {
+                                this.child(
+                                    Icon::new(if collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Custom(accent)),
+                                )
+                            }),
+                    )
+                    .when_some(body, |this, body| {
+                        this.child(
+                            MarkdownElement::new(body, style)
+                                .image_resolver(move |destination, _cx| {
+                                    resolve_image_source(
+                                        destination,
+                                        base_directory.as_deref(),
+                                        &image_cache,
+                                    )
+                                })
+                                .on_source_click(move |_source_index, _click_count, window, cx| {
+                                    if window.default_prevented() {
+                                        return false;
+                                    }
+                                    // The body's indices point into the
+                                    // stripped markdown, which has had a
+                                    // header line and a `>` per line removed,
+                                    // so they do not map back onto buffer
+                                    // characters; reveal at the callout's
+                                    // start instead of at the wrong one.
+                                    reveal_at_source_index(
+                                        &source_click_editor,
+                                        &source_range,
+                                        0,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        )
+                    }),
+            )
+            .into_any_element()
+    })
+}
+
 /// Renders display math as a centered formula.
 ///
 /// In replace mode (`below == false`) the widget stands in for the source
@@ -4525,12 +4826,25 @@ impl Extraction<'_> {
                 }
                 "block_quote" => {
                     let (start_row, end_row) = self.node_rows(node);
-                    self.push_block_rows(
-                        start_row,
-                        end_row,
-                        end_row - start_row + 1,
-                        BlockRenderKind::Markdown,
-                    );
+                    let header = self
+                        .text
+                        .get(node.byte_range())
+                        .and_then(|text| text.lines().next())
+                        .and_then(parse_callout_header);
+                    let (kind, height) = match header {
+                        Some((kind, title, collapse)) => (
+                            BlockRenderKind::Callout {
+                                kind,
+                                title,
+                                collapse,
+                            },
+                            // A title row plus the body; a collapsed callout
+                            // is resized down when the editor measures it.
+                            end_row - start_row + 2,
+                        ),
+                        None => (BlockRenderKind::Markdown, end_row - start_row + 1),
+                    };
+                    self.push_block_rows(start_row, end_row, height, kind);
                     push_children(node, &mut stack);
                 }
                 "link_reference_definition" => {
@@ -5195,6 +5509,81 @@ fn citation_keys(inner: &str) -> Vec<Range<usize>> {
         keys.push(at..at + 1 + key.len());
     }
     keys
+}
+
+/// Parses a callout's header line — `> [!type]`, `> [!type] Title`, with an
+/// optional `+`/`-` collapse suffix on the type — into its kind, title, and
+/// initial collapsed state. Returns `None` for an ordinary block quote, which
+/// keeps rendering as one.
+fn parse_callout_header(line: &str) -> Option<(CalloutKind, String, Option<bool>)> {
+    let rest = line.trim_start().strip_prefix('>')?.trim_start();
+    let (name, after) = rest.strip_prefix("[!")?.split_once(']')?;
+    // The fold character sits immediately after the `]`, so a title that
+    // merely opens with a dash (`> [!note] - like this`) is left alone.
+    let (collapse, title) = match after.strip_prefix('+') {
+        Some(title) => (Some(false), title),
+        None => match after.strip_prefix('-') {
+            Some(title) => (Some(true), title),
+            None => (None, after),
+        },
+    };
+    let name = name.trim();
+    // A type is one word. Without this, an ordinary quote that happens to
+    // open with a bracketed aside would be claimed as a callout.
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let kind = CalloutKind::from_name(name);
+    let title = title.trim();
+    let title = if title.is_empty() {
+        kind.default_title().to_string()
+    } else {
+        title.to_string()
+    };
+    Some((kind, title, collapse))
+}
+
+/// A callout's body: the block quote's `>` prefixes stripped, and its header
+/// line dropped, leaving markdown a widget can render. Lines with no `>` pass
+/// through unchanged, which is what carries the reference definitions
+/// `apply_decorations` appends past the quote's own text.
+fn callout_body(source: &str) -> String {
+    source
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match trimmed.strip_prefix('>') {
+                Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+                None => line,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Flips a callout between expanded and collapsed, recording the choice on
+/// the addon so it survives the redraw and overrides the `+`/`-` the syntax
+/// asked for.
+fn toggle_callout(
+    editor: &WeakEntity<Editor>,
+    range: &Range<Anchor>,
+    collapsed: bool,
+    cx: &mut App,
+) {
+    editor
+        .update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = range.start.to_offset(&snapshot);
+            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                addon
+                    .callout_collapse
+                    .retain(|(existing, _)| existing.start.to_offset(&snapshot) != start);
+                addon.callout_collapse.push((range.clone(), !collapsed));
+            }
+            recompute(editor, cx);
+        })
+        .log_err();
 }
 
 fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::Node<'a>>) {
