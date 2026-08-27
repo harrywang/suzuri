@@ -510,11 +510,15 @@ impl CalloutKind {
     fn accent(self, cx: &App) -> Hsla {
         let status = cx.theme().status();
         match self {
-            Self::Note | Self::Abstract | Self::Todo => status.info,
+            // Obsidian gives `example` a purple of its own, but the status
+            // palette has no purple: `hint` is blue in Zed's base theme and
+            // grey in Suzuri's, which would make this family collide with
+            // `note` under one theme and with `quote` under the other. It
+            // takes `info` and leans on its book icon to stay distinct.
+            Self::Note | Self::Abstract | Self::Todo | Self::Example => status.info,
             Self::Tip | Self::Success => status.success,
             Self::Question | Self::Warning => status.warning,
             Self::Failure | Self::Danger => status.error,
-            Self::Example => status.hint,
             Self::Quote => cx.theme().colors().text_muted,
         }
     }
@@ -1156,7 +1160,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 let body = match &state {
                     EmbedState::Ready { body, .. } => Some(cx.new(|cx| {
                         Markdown::new_with_options(
-                            body.clone(),
+                            SharedString::from(wikilink_display_text(body).into_owned()),
                             language_registry.clone(),
                             None,
                             markdown::MarkdownOptions {
@@ -1189,7 +1193,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 title,
                 collapse,
             } => {
+                // Like a table cell, the body renders through the markdown
+                // crate, which has no wikilink syntax — so `[[Note]]` would
+                // otherwise reach the screen with its brackets on.
                 let body_source = callout_body(&source);
+                let body_source = wikilink_display_text(&body_source).into_owned();
                 let body = (!collapsed && !body_source.trim().is_empty()).then(|| {
                     cx.new(|cx| {
                         Markdown::new_with_options(
@@ -5334,9 +5342,15 @@ impl Extraction<'_> {
                                 title,
                                 collapse,
                             },
-                            // A title row plus the body; a collapsed callout
-                            // is resized down when the editor measures it.
-                            end_row - start_row + 2,
+                            // The same row count a plain block quote uses.
+                            // A card looks taller than its source — padding,
+                            // a title row — but its body is markdown, where
+                            // consecutive quoted lines collapse into one
+                            // wrapped paragraph, so it usually is not.
+                            // Guessing high made every callout on screen
+                            // need a resize round, and enough of them at
+                            // once exhausted the editor's prepaint depth.
+                            end_row - start_row + 1,
                         ),
                         None => (BlockRenderKind::Markdown, end_row - start_row + 1),
                     };
