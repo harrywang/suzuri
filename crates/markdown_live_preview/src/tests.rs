@@ -2029,7 +2029,10 @@ async fn test_highlight_marks_conceal(cx: &mut TestAppContext) {
     let display = cx.display_text();
     assert!(display.contains("a marked phrase here"), "{display}");
     assert!(display.contains("code stays raw: ==nope=="), "{display}");
-    assert!(display.contains("loose delimiters: a == b == c"), "{display}");
+    assert!(
+        display.contains("loose delimiters: a == b == c"),
+        "{display}"
+    );
     assert!(display.contains("empty stays raw: ===="), "{display}");
 
     // Only the one real mark carries the highlight.
@@ -2145,6 +2148,141 @@ async fn test_footnotes_conceal_references_and_mute_definitions(cx: &mut TestApp
         "{}",
         cx.display_text()
     );
+}
+
+#[gpui::test]
+async fn test_callouts_render_as_callout_blocks(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        > [!warning] Careful
+        > This is the body.
+
+        > an ordinary quote
+        > stays an ordinary quote
+    "});
+    cx.executor().run_until_parked();
+
+    let kinds = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .expect("markdown buffer should produce markers")
+            .blocks
+            .iter()
+            .map(|block| block.kind.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(kinds.len(), 2, "one callout and one plain quote");
+    assert!(
+        matches!(
+            &kinds[0],
+            BlockRenderKind::Callout {
+                kind: CalloutKind::Warning,
+                title,
+                collapse: None,
+            } if title == "Careful"
+        ),
+        "expected a warning callout"
+    );
+    assert!(
+        matches!(kinds[1], BlockRenderKind::Markdown),
+        "a plain block quote must keep rendering as one"
+    );
+}
+
+#[gpui::test]
+async fn test_collapsed_callout_hides_its_body(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        > [!note]- Folded
+        > Hidden body.
+
+        > [!note]+ Open
+        > Shown body.
+    "});
+    cx.executor().run_until_parked();
+
+    let collapsed = cx.update_editor(|editor, _, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .unwrap()
+            .applied_blocks
+            .iter()
+            .map(|block| block.collapsed)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        collapsed,
+        vec![true, false],
+        "`-` starts collapsed, `+` starts expanded"
+    );
+}
+
+#[test]
+fn test_parse_callout_header() {
+    let parse = parse_callout_header;
+
+    // An untitled callout takes its type's name as the title, like Obsidian.
+    assert!(matches!(
+        parse("> [!note]"),
+        Some((CalloutKind::Note, ref title, None)) if title == "Note"
+    ));
+    assert!(matches!(
+        parse("> [!TIP] Try this"),
+        Some((CalloutKind::Tip, ref title, None)) if title == "Try this"
+    ));
+
+    // Aliases collapse onto one look.
+    assert!(matches!(
+        parse("> [!tldr]"),
+        Some((CalloutKind::Abstract, ..))
+    ));
+    assert!(matches!(
+        parse("> [!faq]"),
+        Some((CalloutKind::Question, ..))
+    ));
+    assert!(matches!(
+        parse("> [!caution]"),
+        Some((CalloutKind::Warning, ..))
+    ));
+
+    // Collapse suffixes.
+    assert!(matches!(parse("> [!note]- x"), Some((_, _, Some(true)))));
+    assert!(matches!(parse("> [!note]+ x"), Some((_, _, Some(false)))));
+    // The fold character binds to the `]`; a title may still open with a dash.
+    assert!(matches!(
+        parse("> [!note] - a dash"),
+        Some((_, ref title, None)) if title == "- a dash"
+    ));
+
+    // An unknown type is still a callout, styled as a note.
+    assert!(matches!(
+        parse("> [!recipe] Pasta"),
+        Some((CalloutKind::Note, ..))
+    ));
+
+    // Not callouts.
+    assert!(parse("> just a quote").is_none());
+    assert!(parse("> [!two words] x").is_none());
+    assert!(parse("> [!unclosed").is_none());
+    assert!(parse("[!note] no quote marker").is_none());
+}
+
+#[test]
+fn test_callout_body_strips_quote_prefixes() {
+    assert_eq!(
+        callout_body("> [!note] Title\n> first\n> - item\n>\n> last"),
+        "first\n- item\n\nlast"
+    );
+    // Reference definitions are appended past the quote's own text and carry
+    // no `>`; they must survive the strip.
+    assert_eq!(
+        callout_body("> [!note]\n> see [ref]\n\n[ref]: https://example.com"),
+        "see [ref]\n\n[ref]: https://example.com"
+    );
+    assert_eq!(callout_body("> [!note] Title"), "");
 }
 
 // --- Contract tests ---
