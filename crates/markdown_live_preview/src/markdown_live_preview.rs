@@ -312,6 +312,13 @@ struct MarkerSet {
     /// Pandoc-style citation keys (`@key` including the `@`), styled as
     /// reference chips once the surrounding brackets are concealed.
     citations: Vec<Range<Anchor>>,
+    /// Bodies of Obsidian `==highlight==` marks, painted with a highlighter
+    /// background once the `==` delimiters are concealed.
+    highlights: Vec<Range<Anchor>>,
+    /// Obsidian tags (`#tag`, `#area/topic`), styled as chips. Unlike the
+    /// other inline constructs a tag has no syntax to hide: the `#` is part
+    /// of the tag's name, so it is styled in place rather than concealed.
+    tags: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -338,6 +345,9 @@ enum InlineKind {
         /// The range of the `[ ]`/`[x]` marker itself, edited on toggle.
         marker_range: Range<Anchor>,
     },
+    /// A footnote reference (`[^label]`), rendered as a raised chip carrying
+    /// the label, the way a preview renders a superscript marker.
+    Footnote { label: SharedString },
     /// A LaTeX formula (`$x$` or `$$x$$`), rendered as a typeset image.
     ///
     /// Rendering is asynchronous, so the placeholder reads whatever the shared
@@ -546,6 +556,8 @@ const LINK: usize = 3;
 const DEFINITION: usize = 4;
 const ORDERED_MARKER: usize = 5;
 const CITATION: usize = 6;
+const HIGHLIGHT: usize = 7;
+const TAG: usize = 8;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
 /// bold/italic styling, overriding the theme's source-mode markup colors
@@ -563,6 +575,13 @@ fn apply_emphasis_highlights(
         .theme()
         .colors()
         .editor_document_highlight_read_background;
+    // A highlighter mark reads as a wash of color behind the text rather than
+    // a chip, so it is the one decoration that wants a warm, saturated
+    // background; deriving it from the theme's warning hue keeps it legible
+    // in both Suzuri Light and Dark instead of pinning a yellow that only
+    // works in one.
+    let highlight_background = cx.theme().status().warning.opacity(0.28);
+    let tag_background = cx.theme().status().info_background;
     let sets = [
         (
             STRIKE,
@@ -629,6 +648,25 @@ fn apply_emphasis_highlights(
                 ..Default::default()
             },
         ),
+        (
+            HIGHLIGHT,
+            markers.map(|markers| markers.highlights.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                background_color: Some(highlight_background),
+                ..Default::default()
+            },
+        ),
+        (
+            TAG,
+            markers.map(|markers| markers.tags.clone()),
+            HighlightStyle {
+                color: Some(accent_color),
+                background_color: Some(tag_background),
+                font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
     ];
     for (key, ranges, style) in sets {
         match ranges {
@@ -690,9 +728,10 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             InlineKind::Hide { reveal_span } => reveal_span,
             // Math reveals when the selection touches the formula, so putting
             // the cursor in it hands back the LaTeX to edit.
-            InlineKind::Bullet | InlineKind::Checkbox { .. } | InlineKind::Math { .. } => {
-                &marker.range
-            }
+            InlineKind::Bullet
+            | InlineKind::Checkbox { .. }
+            | InlineKind::Footnote { .. }
+            | InlineKind::Math { .. } => &marker.range,
         };
         let span = reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
         let revealed = selection_offsets
@@ -1172,7 +1211,10 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
     // element at its measured width.
     let collapsed_text = match &marker.kind {
         InlineKind::Hide { .. } => Some(SharedString::new_static("")),
-        InlineKind::Bullet | InlineKind::Checkbox { .. } | InlineKind::Math { .. } => None,
+        InlineKind::Bullet
+        | InlineKind::Checkbox { .. }
+        | InlineKind::Footnote { .. }
+        | InlineKind::Math { .. } => None,
     };
     let render: Arc<dyn Send + Sync + Fn(_, _, &mut App) -> gpui::AnyElement> = match &marker.kind {
         InlineKind::Hide { .. } => Arc::new(|_, _, _| Empty.into_any_element()),
@@ -1206,6 +1248,24 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                     toggle_task_marker(&editor, &marker_range, checked, cx);
                 })
                 .into_any_element()
+            })
+        }
+        InlineKind::Footnote { label } => {
+            let label = label.clone();
+            Arc::new(move |_, _, cx: &mut App| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                let font_size = theme_settings.buffer_font_size(cx);
+                // The editor centers an inline element in the line, so the
+                // only way to raise a marker above the baseline is to pad it
+                // asymmetrically: bottom padding of 2d shifts it up by d.
+                let raise = font_size * 0.3;
+                div()
+                    .pb(raise * 2.0)
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(font_size * 0.75)
+                    .text_color(cx.theme().colors().text_accent)
+                    .child(label.clone())
+                    .into_any_element()
             })
         }
         InlineKind::Math { source, style } => {
@@ -1299,6 +1359,14 @@ fn marker_content_key(kind: &InlineKind) -> u64 {
         InlineKind::Hide { .. } => 0,
         InlineKind::Bullet => 1,
         InlineKind::Checkbox { checked, .. } => 2 + u64::from(*checked),
+        // The label is what the placeholder draws, so a `[^1]` edited into
+        // `[^2]` over an unchanged range must not reuse the old concealment.
+        InlineKind::Footnote { label } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            label.hash(&mut hasher);
+            4 + hasher.finish()
+        }
         // Editing a formula changes what its placeholder must draw even though
         // its range is unchanged, so the source has to take part in the key or
         // the concealment is reused with a stale image.
@@ -1307,7 +1375,9 @@ fn marker_content_key(kind: &InlineKind) -> u64 {
             let mut hasher = collections::FxHasher::default();
             source.hash(&mut hasher);
             style.hash(&mut hasher);
-            // Keep clear of the discriminants above.
+            // Keep clear of the discriminants above. Footnotes hash into the
+            // same space; the differing seed text makes a collision no more
+            // likely than between two formulas.
             4 + hasher.finish()
         }
     }
@@ -4126,6 +4196,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges: Vec::new(),
         ordered_markers: Vec::new(),
         citations: Vec::new(),
+        highlights: Vec::new(),
+        tags: Vec::new(),
     };
 
     for layer in buffer_snapshot.syntax_layers() {
@@ -4139,6 +4211,9 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
 
     extraction.scan_wikilinks();
     extraction.scan_citations();
+    extraction.scan_footnotes();
+    extraction.scan_highlights();
+    extraction.scan_tags();
 
     let Extraction {
         inline,
@@ -4151,6 +4226,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        highlights,
+        tags,
         ..
     } = extraction;
 
@@ -4189,6 +4266,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        highlights,
+        tags,
     })
 }
 
@@ -4212,6 +4291,8 @@ struct Extraction<'a> {
     definition_ranges: Vec<Range<Anchor>>,
     ordered_markers: Vec<Range<Anchor>>,
     citations: Vec<Range<Anchor>>,
+    highlights: Vec<Range<Anchor>>,
+    tags: Vec<Range<Anchor>>,
 }
 
 impl Extraction<'_> {
@@ -4839,6 +4920,169 @@ impl Extraction<'_> {
                     self.citations.push(range);
                 }
                 search_from = close + 1;
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Conceal footnote references (`[^label]`), rendering each as a raised
+    /// chip carrying the label. The markdown grammar has no footnote nodes, so
+    /// like wikilinks this scans the prose regions directly, skipping code
+    /// spans.
+    ///
+    /// A definition (`[^label]: text` at the start of a line) is not a
+    /// reference: concealing its marker would leave a bare paragraph with no
+    /// sign of which footnote it defines, so it recedes like a link reference
+    /// definition instead of disappearing.
+    fn scan_footnotes(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            while let Some(open_offset) = region_text[search_from..].find("[^") {
+                let open = search_from + open_offset;
+                search_from = open + 2;
+                let Some(close_offset) = region_text[open + 2..].find(']') else {
+                    break;
+                };
+                let close = open + 2 + close_offset;
+                let label = &region_text[open + 2..close];
+                if label.is_empty() || label.contains(char::is_whitespace) || label.contains('[') {
+                    continue;
+                }
+                let start = region.start + open;
+                let end = region.start + close + 1;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                search_from = close + 1;
+
+                let line_start = self.text[..start].rfind('\n').map_or(0, |index| index + 1);
+                let is_definition = self.text[line_start..start]
+                    .chars()
+                    .all(char::is_whitespace)
+                    && self.text[end..].starts_with(':');
+                if is_definition {
+                    let range = self.anchor_range(start..end + 1);
+                    self.definition_ranges.push(range);
+                    continue;
+                }
+
+                let range = self.anchor_range(start..end);
+                self.inline.push(InlineMarker {
+                    range,
+                    kind: InlineKind::Footnote {
+                        label: SharedString::from(label.to_string()),
+                    },
+                });
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Conceal Obsidian's `==highlight==` marks, leaving the body painted with
+    /// a highlighter background. The markdown grammar has no highlight node,
+    /// so like wikilinks this scans the prose regions directly, skipping code
+    /// spans.
+    fn scan_highlights(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            while let Some(open_offset) = region_text[search_from..].find("==") {
+                let open = search_from + open_offset;
+                search_from = open + 2;
+                let Some(close_offset) = region_text[open + 2..].find("==") else {
+                    break;
+                };
+                let close = open + 2 + close_offset;
+                let inner = &region_text[open + 2..close];
+                // Delimiters bind tightly, as emphasis does: without this,
+                // prose comparing two values ("a == b == c") reads as a mark.
+                if inner.is_empty()
+                    || inner.contains('\n')
+                    || inner.starts_with(char::is_whitespace)
+                    || inner.ends_with(char::is_whitespace)
+                {
+                    continue;
+                }
+                let start = region.start + open;
+                let end = region.start + close + 2;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                search_from = close + 2;
+
+                let reveal = start..end;
+                self.hide(start..start + 2, reveal.clone());
+                self.hide(end - 2..end, reveal);
+                let range = self.anchor_range(start + 2..end - 2);
+                self.highlights.push(range);
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Style Obsidian tags (`#tag`, `#area/topic`) as chips. A tag is the one
+    /// inline construct with no syntax to hide — the `#` is part of its name —
+    /// so it is only highlighted.
+    ///
+    /// A heading can never be mistaken for a tag: `walk_block_layer` claims
+    /// `atx_heading` without descending into it, so a heading's text never
+    /// becomes a prose region in the first place.
+    fn scan_tags(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            for (hash, _) in region_text.match_indices('#') {
+                // A tag has to open a word. This is what keeps a URL fragment
+                // (`example.com/#top`) and a wikilink's heading target
+                // (`[[Note#section]]`) from reading as tags.
+                let opens_word = match region_text[..hash].chars().last() {
+                    None => true,
+                    Some(character) => character.is_whitespace(),
+                };
+                if !opens_word {
+                    continue;
+                }
+                let body: String = region_text[hash + 1..]
+                    .chars()
+                    .take_while(|character| {
+                        character.is_alphanumeric() || matches!(character, '_' | '-' | '/')
+                    })
+                    .collect();
+                // Trailing separators belong to the prose, not the tag.
+                let body = body.trim_end_matches(['-', '/']);
+                // `#1` is an issue reference or a heading level; Obsidian
+                // likewise requires at least one non-numeric character.
+                if body.is_empty() || body.chars().all(|character| character.is_numeric()) {
+                    continue;
+                }
+                let start = region.start + hash;
+                let end = start + 1 + body.len();
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                let range = self.anchor_range(start..end);
+                self.tags.push(range);
             }
         }
         self.prose_regions = regions;
