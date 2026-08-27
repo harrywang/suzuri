@@ -937,15 +937,27 @@ async fn test_obsidian_image_embed_renders_as_block(cx: &mut TestAppContext) {
     "});
     cx.executor().run_until_parked();
 
-    // The two standalone image embeds render as image blocks; the inline
-    // embed and the non-image note embed stay raw.
-    assert_eq!(applied_block_count(&mut cx), 2);
+    // The two standalone image embeds render as image blocks, and the note
+    // embed as a transclusion card; only the inline embed stays raw.
+    assert_eq!(applied_block_count(&mut cx), 3);
     let display = cx.display_text();
     assert!(
         display.contains("inline stays raw: ![[photo.png]]"),
         "{display}"
     );
-    assert!(display.contains("![[Some Note]]"), "{display}");
+
+    let image_blocks = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .expect("markdown buffer should produce markers")
+            .blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockRenderKind::Image { .. }))
+            .count()
+    });
+    assert_eq!(
+        image_blocks, 2,
+        "an image target must not become a note embed"
+    );
 }
 
 #[gpui::test]
@@ -2283,6 +2295,152 @@ fn test_callout_body_strips_quote_prefixes() {
         "see [ref]\n\n[ref]: https://example.com"
     );
     assert_eq!(callout_body("> [!note] Title"), "");
+}
+
+#[gpui::test]
+async fn test_note_embeds_extract_as_embed_blocks(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        ![[Some Note]]
+
+        ![[Some Note#Method]]
+
+        ![[photo.png]]
+
+        inline ![[Some Note]] stays raw
+    "});
+    cx.executor().run_until_parked();
+
+    let kinds = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .expect("markdown buffer should produce markers")
+            .blocks
+            .iter()
+            .map(|block| block.kind.clone())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(kinds.len(), 3, "an inline embed must not become a block");
+    assert!(
+        matches!(&kinds[0], BlockRenderKind::Embed { target, section: None } if target == "Some Note"),
+        "a bare note embed"
+    );
+    assert!(
+        matches!(
+            &kinds[1],
+            BlockRenderKind::Embed { target, section: Some(section) }
+                if target == "Some Note" && section == "Method"
+        ),
+        "a section embed"
+    );
+    assert!(
+        matches!(kinds[2], BlockRenderKind::Image { .. }),
+        "an image target must still render as an image"
+    );
+
+    // The inline embed keeps its source on screen rather than disappearing.
+    assert!(
+        cx.display_text()
+            .contains("inline ![[Some Note]] stays raw"),
+        "{}",
+        cx.display_text()
+    );
+}
+
+#[test]
+fn test_embed_section_extraction() {
+    let note = indoc::indoc! {"
+        # Title
+
+        Intro text.
+
+        ## Method
+
+        The method body.
+
+        ### Detail
+
+        Nested detail.
+
+        ## Results
+
+        Results body.
+    "};
+
+    let method = embed_section(note, "Method").expect("the heading exists");
+    assert!(method.contains("The method body."), "{method}");
+    // A deeper heading belongs to the section; a sibling ends it.
+    assert!(method.contains("Nested detail."), "{method}");
+    assert!(!method.contains("Results body."), "{method}");
+
+    // The last section runs to the end of the note.
+    let results = embed_section(note, "Results").expect("the heading exists");
+    assert!(results.contains("Results body."), "{results}");
+
+    // Matching ignores case, and a missing heading is reported rather than
+    // silently embedding the whole note.
+    assert!(embed_section(note, "method").is_some());
+    assert!(embed_section(note, "Nowhere").is_none());
+}
+
+#[gpui::test]
+async fn test_resolve_embed_target(cx: &mut TestAppContext) {
+    init_test(cx);
+    use project::Fs as _;
+
+    let fs = project::FakeFs::new(cx.executor());
+    for directory in [
+        "/vault",
+        "/vault/notes",
+        "/vault/notes/deep",
+        "/vault/archive",
+    ] {
+        fs.create_dir(directory.as_ref())
+            .await
+            .expect("failed to create the test directory");
+    }
+    for path in [
+        "/vault/Index.md",
+        "/vault/notes/Method.md",
+        "/vault/notes/deep/Method.md",
+        "/vault/archive/Index.md",
+    ] {
+        fs.insert_file(path, Vec::new()).await;
+    }
+    let project = project::Project::test(fs, ["/vault".as_ref()], cx).await;
+
+    let resolve =
+        |directory: Option<&'static str>, target: &'static str, cx: &mut TestAppContext| {
+            let project = project.clone();
+            cx.update(|cx| {
+                resolve_embed_target(&project, directory.map(Path::new), target, cx)
+                    .map(|(_, absolute)| absolute)
+            })
+        };
+
+    // A bare name prefers the note beside the embedding one over a deeper match.
+    assert_eq!(
+        resolve(Some("/vault/notes"), "Method", cx),
+        Some(PathBuf::from("/vault/notes/Method.md"))
+    );
+    // With no directory to prefer, the shallowest match wins.
+    assert_eq!(
+        resolve(None, "Index", cx),
+        Some(PathBuf::from("/vault/Index.md"))
+    );
+    // A target that spells out a path matches that path exactly, beating the
+    // shallower note of the same name.
+    assert_eq!(
+        resolve(None, "archive/Index", cx),
+        Some(PathBuf::from("/vault/archive/Index.md"))
+    );
+    // The `.md` extension is implied but may be written out.
+    assert_eq!(
+        resolve(None, "notes/Method.md", cx),
+        Some(PathBuf::from("/vault/notes/Method.md"))
+    );
+    assert_eq!(resolve(None, "Nowhere", cx), None);
 }
 
 // --- Contract tests ---

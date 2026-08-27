@@ -9,7 +9,13 @@
 //! Preview mode. Tables, images, and frontmatter are the exception: they are
 //! edited through their widgets and only reveal source via their `</>` button.
 
-use std::{any::TypeId, borrow::Cow, ops::Range, path::PathBuf, sync::Arc};
+use std::{
+    any::TypeId,
+    borrow::Cow,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use collections::{HashMap, HashSet};
 use editor::{
@@ -30,7 +36,7 @@ use math_render::{MathStyle, MathTheme};
 use multi_buffer::{
     Anchor, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset as _, ToPoint as _,
 };
-use project::PathChange;
+use project::{PathChange, Project, ProjectPath};
 use settings::{RegisterSetting, Settings};
 use text::Point;
 use ui::{Checkbox, ToggleState, prelude::*};
@@ -169,43 +175,65 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     if let Some(project) = editor.project().cloned() {
         subscriptions.push(cx.subscribe_in(&project, window, {
             let image_cache = image_cache.clone();
-            move |_editor, project, event, window, cx| {
+            move |editor, project, event, window, cx| {
                 let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
                     return;
                 };
                 let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
                     return;
                 };
-                let changed_images: Vec<PathBuf> = {
+                let (changed_images, changed_notes, note_created) = {
                     let worktree = worktree.read(cx);
-                    changes
-                        .iter()
+                    let mut images = Vec::new();
+                    let mut notes = Vec::new();
+                    let mut created = false;
+                    for (path, _, change) in changes.iter() {
                         // `Loaded` is the initial scan reporting what was
                         // already there, not a change; acting on it would
                         // re-decode every image in the project on open.
-                        .filter(|(_, _, change)| *change != PathChange::Loaded)
-                        .filter(|(path, _, _)| path.extension().is_some_and(is_image_extension))
-                        .map(|(path, _, _)| {
-                            let absolute = worktree.absolutize(path);
+                        if *change == PathChange::Loaded {
+                            continue;
+                        }
+                        let Some(extension) = path.extension() else {
+                            continue;
+                        };
+                        let absolute = worktree.absolutize(path);
+                        if is_image_extension(extension) {
                             // Matches how `resolve_image_source` keys the
                             // cache. A just-deleted file cannot be
                             // canonicalized; fall back to the literal path so
                             // an exactly-spelled reference still evicts.
-                            std::fs::canonicalize(&absolute).unwrap_or(absolute)
-                        })
-                        .collect()
-                };
-                if changed_images.is_empty() {
-                    return;
-                }
-                image_cache.update(cx, |image_cache, cx| {
-                    for path in changed_images {
-                        image_cache.remove(&Resource::Path(Arc::from(path.as_path())), window, cx);
+                            images.push(std::fs::canonicalize(&absolute).unwrap_or(absolute));
+                        } else if extension == "md" {
+                            created |=
+                                matches!(change, PathChange::Added | PathChange::AddedOrUpdated);
+                            notes.push(absolute);
+                        }
                     }
-                });
-                // The widgets keep their blocks; they just need to redraw so
-                // the evicted images are fetched again.
-                cx.notify();
+                    (images, notes, created)
+                };
+
+                if !changed_images.is_empty() {
+                    image_cache.update(cx, |image_cache, cx| {
+                        for path in changed_images {
+                            image_cache.remove(
+                                &Resource::Path(Arc::from(path.as_path())),
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                    // The widgets keep their blocks; they just need to redraw
+                    // so the evicted images are fetched again.
+                    cx.notify();
+                }
+
+                // A transclusion's content is baked into its block when the
+                // block is inserted, so unlike an image it needs a recompute
+                // rather than a repaint to pick a changed note up.
+                if !changed_notes.is_empty() && evict_embeds(&changed_notes, note_created, cx) {
+                    recompute(editor, cx);
+                }
             }
         }));
     }
@@ -395,6 +423,13 @@ enum BlockRenderKind {
         display_width: Option<f32>,
         destination: Option<String>,
         alt: String,
+    },
+    /// An Obsidian note transclusion (`![[Note]]`, `![[Note#Heading]]`),
+    /// rendered as a card holding the target note's markdown. The body is
+    /// loaded asynchronously and reaches the widget through [`EmbedCache`].
+    Embed {
+        target: String,
+        section: Option<String>,
     },
     /// An Obsidian callout (`> [!note] Title`), rendered as a tinted card
     /// with its type's icon and color. `collapse` carries what the `+`/`-`
@@ -791,6 +826,9 @@ struct DesiredBlock<'a> {
     source: String,
     below: bool,
     collapsed: bool,
+    /// What the cache held for an embed this pass. Not on `AppliedBlock`,
+    /// because `source` already stands in for it in the reuse check.
+    embed: Option<EmbedState>,
 }
 
 fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
@@ -826,6 +864,8 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         addon.source_revealed = source_revealed.clone();
     }
     let selection_offsets = selection_offset_ranges(editor, &snapshot);
+    let base_directory = buffer_base_directory(editor, cx);
+    let project = editor.project().cloned();
 
     // --- Inline concealments ---
 
@@ -933,6 +973,23 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             source.push_str("\n\n");
             source.push_str(&markers.definitions);
         }
+        let embed = match &marker.kind {
+            BlockRenderKind::Embed { target, section } => {
+                let state = embed_state(
+                    EmbedKey {
+                        source_directory: base_directory.clone(),
+                        target: target.clone(),
+                        section: section.clone(),
+                    },
+                    project.clone(),
+                    weak_editor.clone(),
+                    cx,
+                );
+                source = state.reuse_key();
+                Some(state)
+            }
+            _ => None,
+        };
         // What the reader last asked for wins over what the `+`/`-` in the
         // syntax asked for.
         let collapsed = match &marker.kind {
@@ -949,6 +1006,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 source,
                 below,
                 collapsed,
+                embed,
             },
         );
     }
@@ -973,7 +1031,6 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
 
     let mut blocks_to_insert = Vec::new();
     let mut pending_applied = Vec::new();
-    let base_directory = buffer_base_directory(editor, cx);
     // The language registry lets rendered code blocks (and code spans in
     // tables/quotes) get syntax highlighting.
     let language_registry = editor
@@ -986,6 +1043,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         source,
         below,
         collapsed,
+        embed,
     } in desired_blocks.into_values()
     {
         let render = match &marker.kind {
@@ -1092,6 +1150,39 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             ),
             BlockRenderKind::Frontmatter => {
                 render_frontmatter_block(weak_editor.clone(), marker.range.clone(), source.clone())
+            }
+            BlockRenderKind::Embed { target, section } => {
+                let state = embed.clone().unwrap_or(EmbedState::Missing);
+                let body = match &state {
+                    EmbedState::Ready { body, .. } => Some(cx.new(|cx| {
+                        Markdown::new_with_options(
+                            body.clone(),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })),
+                    EmbedState::Loading | EmbedState::Missing => None,
+                };
+                let label = match section {
+                    Some(section) => format!("{target} › {section}"),
+                    None => target.clone(),
+                };
+                render_embed_block(
+                    state,
+                    SharedString::from(label),
+                    body,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    base_directory.clone(),
+                    marker.indent_columns,
+                    image_cache.clone(),
+                )
             }
             BlockRenderKind::Callout {
                 kind,
@@ -1275,6 +1366,245 @@ fn rows_intersect(selection_rows: &[Range<u32>], start_row: u32, end_row: u32) -
 /// Identity of a rendered formula. Two formulas that agree on every field
 /// rasterize identically, so the cache is shared across editors: the same
 /// equation in two panes is typeset once.
+/// Drops the cached transclusions a set of changed notes invalidates, and
+/// reports whether anything was dropped. Creating a note also drops every
+/// `Missing` entry: that creation may be exactly what an unresolved target
+/// was waiting for.
+fn evict_embeds(changed: &[PathBuf], note_created: bool, cx: &mut App) -> bool {
+    let cache = cx.default_global::<EmbedCache>();
+    let before = cache.entries.len();
+    cache.entries.retain(|_, entry| match entry {
+        EmbedEntry::Ready { absolute, .. } => !changed.contains(absolute),
+        EmbedEntry::Missing => !note_created,
+        EmbedEntry::Pending => true,
+    });
+    cache.entries.len() != before
+}
+
+/// Identifies one note transclusion's content. The embedding note's folder
+/// takes part in the key so that two vaults open at once, each with their own
+/// `Index.md`, do not share an entry.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct EmbedKey {
+    source_directory: Option<PathBuf>,
+    target: String,
+    section: Option<String>,
+}
+
+enum EmbedEntry {
+    Pending,
+    /// The target resolved and loaded. `absolute` is kept so a change on disk
+    /// can evict exactly this entry, and `path` so the card's header can open
+    /// the note it is showing.
+    Ready {
+        body: SharedString,
+        path: ProjectPath,
+        absolute: PathBuf,
+    },
+    /// No note in the project answers to this target.
+    Missing,
+}
+
+/// Loaded transclusions, shared across editors: the same note embedded from
+/// two places is read once. Entries are evicted when their file changes on
+/// disk, and every `Missing` entry is dropped whenever a markdown file is
+/// created, since that creation may be what the target was waiting for.
+#[derive(Default)]
+struct EmbedCache {
+    entries: HashMap<EmbedKey, EmbedEntry>,
+}
+
+impl gpui::Global for EmbedCache {}
+
+/// What `apply_decorations` found in the cache for one embed, carried to the
+/// render closure. Distinct from [`EmbedEntry`] because the widget needs an
+/// owned snapshot, not a borrow of the global.
+#[derive(Clone, PartialEq)]
+enum EmbedState {
+    Loading,
+    Missing,
+    Ready {
+        body: SharedString,
+        path: ProjectPath,
+    },
+}
+
+impl EmbedState {
+    /// A string standing in for the block's source in the reuse check. An
+    /// embed draws the note it points at, not the `![[..]]` that points
+    /// there, so a load finishing after the block was inserted has to change
+    /// this or the new content never reaches the screen.
+    fn reuse_key(&self) -> String {
+        match self {
+            Self::Loading => "\u{0}loading".to_string(),
+            Self::Missing => "\u{0}missing".to_string(),
+            Self::Ready { body, .. } => format!("\u{0}ready\n{body}"),
+        }
+    }
+}
+
+/// Reads an embed's state, starting the load if this is the first time it has
+/// been asked for. The editor is recomputed when the load lands, which is what
+/// gets the loaded body onto the screen.
+fn embed_state(
+    key: EmbedKey,
+    project: Option<Entity<Project>>,
+    editor: WeakEntity<Editor>,
+    cx: &mut App,
+) -> EmbedState {
+    if let Some(entry) = cx.default_global::<EmbedCache>().entries.get(&key) {
+        return match entry {
+            EmbedEntry::Pending => EmbedState::Loading,
+            EmbedEntry::Missing => EmbedState::Missing,
+            EmbedEntry::Ready { body, path, .. } => EmbedState::Ready {
+                body: body.clone(),
+                path: path.clone(),
+            },
+        };
+    }
+    // Without a project there is no vault to resolve a note name against.
+    let Some(project) = project else {
+        return EmbedState::Missing;
+    };
+
+    let resolved = resolve_embed_target(&project, key.source_directory.as_deref(), &key.target, cx);
+    let Some((path, absolute)) = resolved else {
+        cx.default_global::<EmbedCache>()
+            .entries
+            .insert(key, EmbedEntry::Missing);
+        return EmbedState::Missing;
+    };
+
+    cx.global_mut::<EmbedCache>()
+        .entries
+        .insert(key.clone(), EmbedEntry::Pending);
+    let fs = project.read(cx).fs().clone();
+    cx.spawn(async move |cx| {
+        let loaded = cx
+            .background_spawn({
+                let absolute = absolute.clone();
+                async move { fs.load(&absolute).await }
+            })
+            .await;
+        cx.update(|cx| {
+            let entry = match loaded {
+                Ok(text) => {
+                    let body = match &key.section {
+                        Some(section) => embed_section(&text, section),
+                        None => Some(text),
+                    };
+                    match body {
+                        Some(body) => EmbedEntry::Ready {
+                            body: SharedString::from(body),
+                            path,
+                            absolute,
+                        },
+                        // The note exists but has no such heading.
+                        None => EmbedEntry::Missing,
+                    }
+                }
+                Err(_) => EmbedEntry::Missing,
+            };
+            cx.global_mut::<EmbedCache>().entries.insert(key, entry);
+        });
+        editor
+            .update(cx, |editor, cx| recompute(editor, cx))
+            .log_err();
+    })
+    .detach();
+
+    EmbedState::Loading
+}
+
+/// Resolves a wikilink target to a note, the way Obsidian does: a target that
+/// spells out a path is matched against the whole relative path first, and a
+/// bare name is matched by file stem, preferring a note beside the embedding
+/// one and then the shallowest match. The `.md` extension is implied.
+fn resolve_embed_target(
+    project: &Entity<Project>,
+    source_directory: Option<&Path>,
+    target: &str,
+    cx: &App,
+) -> Option<(ProjectPath, PathBuf)> {
+    let target = target.trim().trim_end_matches(".md");
+    if target.is_empty() {
+        return None;
+    }
+    let wanted_path = target.to_lowercase();
+    let wanted_stem = Path::new(target).file_stem()?.to_str()?.to_lowercase();
+
+    let mut best: Option<(u32, usize, ProjectPath, PathBuf)> = None;
+    for worktree in project.read(cx).worktrees(cx) {
+        let worktree_id = worktree.read(cx).id();
+        let worktree = worktree.read(cx);
+        for entry in worktree.entries(false, 0) {
+            if !entry.is_file() || entry.path.extension() != Some("md") {
+                continue;
+            }
+            let relative = entry.path.as_unix_str().to_lowercase();
+            let stem = entry.path.file_stem().map(str::to_lowercase);
+            let rank = if relative.trim_end_matches(".md") == wanted_path {
+                0
+            } else if stem.as_deref() == Some(wanted_stem.as_str()) {
+                let beside = source_directory.is_some_and(|directory| {
+                    worktree.absolutize(&entry.path).parent() == Some(directory)
+                });
+                if beside { 1 } else { 2 }
+            } else {
+                continue;
+            };
+            let depth = entry.path.components().count();
+            let better = best.as_ref().is_none_or(|(best_rank, best_depth, ..)| {
+                (rank, depth) < (*best_rank, *best_depth)
+            });
+            if better {
+                let absolute = worktree.absolutize(&entry.path);
+                let path = ProjectPath {
+                    worktree_id,
+                    path: entry.path.clone(),
+                };
+                best = Some((rank, depth, path, absolute));
+            }
+        }
+    }
+    best.map(|(_, _, path, absolute)| (path, absolute))
+}
+
+/// The slice of a note under one heading: from that heading to the next one at
+/// the same or a higher level. Returns `None` when the note has no such
+/// heading, which the card reports rather than silently embedding everything.
+fn embed_section(text: &str, section: &str) -> Option<String> {
+    let wanted = section.trim().to_lowercase();
+    let heading_level = |line: &str| {
+        let hashes = line
+            .chars()
+            .take_while(|character| *character == '#')
+            .count();
+        (1..=6).contains(&hashes).then_some(hashes)
+    };
+
+    let mut lines = text.lines().enumerate();
+    let (start, level) = lines.find_map(|(index, line)| {
+        let level = heading_level(line)?;
+        let title = line[level..].trim().to_lowercase();
+        (title == wanted).then_some((index, level))
+    })?;
+
+    let end = text
+        .lines()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| heading_level(line).is_some_and(|found| found <= level))
+        .map_or(text.lines().count(), |(index, _)| index);
+    Some(
+        text.lines()
+            .take(end)
+            .skip(start)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct MathKey {
     source: SharedString,
@@ -3554,6 +3884,164 @@ fn render_rule_block(
     })
 }
 
+/// Opens the note a transclusion is showing, in the workspace the embedding
+/// editor belongs to.
+fn open_embedded_note(
+    editor: &WeakEntity<Editor>,
+    path: ProjectPath,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = editor
+        .read_with(cx, |editor, _| editor.workspace())
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace
+            .open_path(path, None, true, window, cx)
+            .detach_and_log_err(cx);
+    });
+}
+
+/// Renders a note transclusion as a card: a header naming the note, which
+/// opens it, over the note's own markdown.
+///
+/// The body is loaded asynchronously, so the card also has to draw the two
+/// states that are not content — still loading, and no such note — rather
+/// than collapsing to nothing and leaving the reader with a blank line where
+/// they wrote an embed.
+#[allow(clippy::too_many_arguments)]
+fn render_embed_block(
+    state: EmbedState,
+    label: SharedString,
+    body: Option<Entity<Markdown>>,
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    base_directory: Option<PathBuf>,
+    indent_columns: u32,
+    image_cache: Entity<RetainAllImageCache>,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let colors = block_cx.app.theme().colors();
+        let border_color = colors.border;
+        let muted_color = colors.text_muted;
+        let accent_color = colors.text_accent;
+        let style = block_markdown_style(block_cx.window, block_cx.app);
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let header_id = block_cx.block_id;
+        let start = range.start;
+        let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
+        let body = body.clone();
+        let open_editor = editor.clone();
+        let open_path = match &state {
+            EmbedState::Ready { path, .. } => Some(path.clone()),
+            EmbedState::Loading | EmbedState::Missing => None,
+        };
+        // Accent color promises a click. A target that has not resolved has
+        // nothing to open, so its header recedes instead of lying.
+        let label_color = if open_path.is_some() {
+            accent_color
+        } else {
+            muted_color
+        };
+        let source_click_editor = editor.clone();
+        let source_range = range.clone();
+
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor.clone(), start),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .border_1()
+                    .border_color(border_color)
+                    .rounded_md()
+                    .child(
+                        h_flex()
+                            .id(header_id)
+                            .gap_1p5()
+                            .items_center()
+                            .when_some(open_path, |this, path| {
+                                // Opening the note is the header's job, so it
+                                // claims the click instead of letting the
+                                // wrapper reveal the embed's source.
+                                this.on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.prevent_default()
+                                })
+                                .on_click(move |_, window, cx| {
+                                    open_embedded_note(&open_editor, path.clone(), window, cx);
+                                })
+                            })
+                            .child(
+                                Icon::new(IconName::Link)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Custom(muted_color)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(
+                                        block_cx
+                                            .window
+                                            .text_style()
+                                            .font_size
+                                            .to_pixels(block_cx.window.rem_size())
+                                            * 0.9,
+                                    )
+                                    .text_color(label_color)
+                                    .child(label.clone()),
+                            ),
+                    )
+                    .map(|this| match (&state, body) {
+                        (EmbedState::Ready { .. }, Some(body)) => this.child(
+                            MarkdownElement::new(body, style)
+                                .image_resolver(move |destination, _cx| {
+                                    resolve_image_source(
+                                        destination,
+                                        base_directory.as_deref(),
+                                        &image_cache,
+                                    )
+                                })
+                                .on_source_click(move |_source_index, _click_count, window, cx| {
+                                    if window.default_prevented() {
+                                        return false;
+                                    }
+                                    // The indices point into the embedded
+                                    // note, not this buffer, so they cannot
+                                    // be mapped to a character here; reveal
+                                    // at the embed's own start instead.
+                                    reveal_at_source_index(
+                                        &source_click_editor,
+                                        &source_range,
+                                        0,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        ),
+                        (EmbedState::Missing, _) => this.child(
+                            div()
+                                .text_color(muted_color)
+                                .child("No note in this project answers to that name."),
+                        ),
+                        _ => this.child(div().text_color(muted_color).child("Loading\u{2026}")),
+                    }),
+            )
+            .into_any_element()
+    })
+}
+
 /// Renders an Obsidian callout as a tinted card: the type's icon and color, a
 /// title row, and the quote's body with its `>` prefixes stripped.
 ///
@@ -5099,7 +5587,7 @@ impl Extraction<'_> {
                     continue;
                 }
                 if is_embed {
-                    self.embed_image_block(start - 1, end, inner);
+                    self.embed_block(start - 1, end, inner);
                     continue;
                 }
 
@@ -5122,23 +5610,16 @@ impl Extraction<'_> {
         self.prose_regions = regions;
     }
 
-    /// Renders an Obsidian image embed (`![[photo.png]]`, with Obsidian's
-    /// `![[photo.png|640]]` width syntax) as an image block when it is the
-    /// only content on its line. The target resolves like a regular markdown
-    /// image destination — relative to the buffer's directory. Non-image
-    /// embeds (`![[Some Note]]`) and inline embeds stay raw.
-    fn embed_image_block(&mut self, embed_start: usize, embed_end: usize, inner: &str) {
-        let (target, size) = match inner.split_once('|') {
-            Some((target, size)) => (target.trim(), Some(size)),
-            None => (inner.trim(), None),
-        };
-        let is_image = std::path::Path::new(target)
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(is_image_extension);
-        if !is_image {
-            return;
-        }
+    /// Renders an Obsidian embed as a block widget when it is the only
+    /// content on its line; inline embeds stay raw.
+    ///
+    /// A target that names an image (`![[photo.png]]`, with Obsidian's
+    /// `![[photo.png|640]]` width syntax) becomes an image block, resolved
+    /// like a regular markdown image destination — relative to the buffer's
+    /// directory. Anything else is a note transclusion (`![[Some Note]]`,
+    /// `![[Some Note#Part]]`), whose target is a note name resolved against
+    /// the whole project rather than a path.
+    fn embed_block(&mut self, embed_start: usize, embed_end: usize, inner: &str) {
         let row = self
             .snapshot
             .offset_to_point(MultiBufferOffset(embed_start))
@@ -5152,22 +5633,53 @@ impl Extraction<'_> {
         if line_text.trim() != embed_text.trim() {
             return;
         }
-        let display_width = size
-            .map(|size| {
-                size.chars()
-                    .take_while(|character| character.is_ascii_digit())
-                    .collect::<String>()
-            })
-            .and_then(|width| width.parse::<f32>().ok())
-            .filter(|width| *width > 0.);
+
+        let (target, size) = match inner.split_once('|') {
+            Some((target, size)) => (target.trim(), Some(size)),
+            None => (inner.trim(), None),
+        };
+        let is_image = Path::new(target)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(is_image_extension);
+        if is_image {
+            let display_width = size
+                .map(|size| {
+                    size.chars()
+                        .take_while(|character| character.is_ascii_digit())
+                        .collect::<String>()
+                })
+                .and_then(|width| width.parse::<f32>().ok())
+                .filter(|width| *width > 0.);
+            self.push_block_rows(
+                row,
+                row,
+                8,
+                BlockRenderKind::Image {
+                    display_width,
+                    destination: Some(target.to_string()),
+                    alt: String::new(),
+                },
+            );
+            return;
+        }
+
+        let (target, section) = match target.split_once('#') {
+            Some((target, section)) => (target.trim(), Some(section.trim().to_string())),
+            None => (target, None),
+        };
+        // `![[#Heading]]`, an embed of the current note's own section, needs
+        // no resolution and is not handled here.
+        if target.is_empty() {
+            return;
+        }
         self.push_block_rows(
             row,
             row,
-            8,
-            BlockRenderKind::Image {
-                display_width,
-                destination: Some(target.to_string()),
-                alt: String::new(),
+            6,
+            BlockRenderKind::Embed {
+                target: target.to_string(),
+                section,
             },
         );
     }
