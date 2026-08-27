@@ -3971,6 +3971,10 @@ fn render_embed_block(
                     .child(
                         h_flex()
                             .id(header_id)
+                            .debug_selector({
+                                let label = label.clone();
+                                move || format!("mdlp-embed-header-{label}")
+                            })
                             .gap_1p5()
                             .items_center()
                             .when_some(open_path, |this, path| {
@@ -4100,6 +4104,10 @@ fn render_callout_block(
                     .child(
                         h_flex()
                             .id(title_id)
+                            .debug_selector({
+                                let title = title.clone();
+                                move || format!("mdlp-callout-title-{title}")
+                            })
                             .gap_1p5()
                             .items_center()
                             .when(collapsible, |this| {
