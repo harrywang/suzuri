@@ -2015,6 +2015,138 @@ fn test_wikilink_display_text_in_cells() {
     );
 }
 
+#[gpui::test]
+async fn test_highlight_marks_conceal(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        a ==marked phrase== here
+        code stays raw: `==nope==`
+        loose delimiters: a == b == c
+        empty stays raw: ====
+    "});
+    cx.executor().run_until_parked();
+    let display = cx.display_text();
+    assert!(display.contains("a marked phrase here"), "{display}");
+    assert!(display.contains("code stays raw: ==nope=="), "{display}");
+    assert!(display.contains("loose delimiters: a == b == c"), "{display}");
+    assert!(display.contains("empty stays raw: ===="), "{display}");
+
+    // Only the one real mark carries the highlight.
+    let highlighted = cx.update_editor(|editor, _, cx| {
+        editor
+            .text_highlights(HighlightKey::MarkdownLivePreview(HIGHLIGHT), cx)
+            .map_or(0, |(_, ranges)| ranges.len())
+    });
+    assert_eq!(highlighted, 1);
+
+    // Touching the mark hands back its source, like every inline construct.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        a ==markeˇd phrase== here
+    "});
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text().contains("a ==marked phrase== here"),
+        "{}",
+        cx.display_text()
+    );
+}
+
+#[gpui::test]
+async fn test_tags_are_styled_without_concealment(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        filed under #research and #area/methods today
+        not a tag: example.com/#top or [[Note#section]] or #1
+        code stays raw: `#nope`
+    "});
+    cx.executor().run_until_parked();
+
+    // A tag keeps its `#`: it is styled in place, never concealed.
+    let display = cx.display_text();
+    assert!(
+        display.contains("filed under #research and #area/methods today"),
+        "{display}"
+    );
+
+    let tags = cx.update_editor(|editor, _, cx| {
+        editor
+            .text_highlights(HighlightKey::MarkdownLivePreview(TAG), cx)
+            .map_or(0, |(_, ranges)| ranges.len())
+    });
+    assert_eq!(tags, 2, "only the two real tags should be styled");
+}
+
+#[gpui::test]
+async fn test_headings_are_never_read_as_tags(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        # Heading One
+
+        ### Heading Three
+    "});
+    cx.executor().run_until_parked();
+
+    let tags = cx.update_editor(|editor, _, cx| {
+        editor
+            .text_highlights(HighlightKey::MarkdownLivePreview(TAG), cx)
+            .map_or(0, |(_, ranges)| ranges.len())
+    });
+    assert_eq!(tags, 0);
+}
+
+#[gpui::test]
+async fn test_footnotes_conceal_references_and_mute_definitions(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        a claim[^1] and another[^note] here
+        code stays raw: `[^2]`
+        not a footnote: [^ spaced]
+
+        [^1]: The first note.
+        [^note]: The second note.
+    "});
+    cx.executor().run_until_parked();
+
+    let display = cx.display_text();
+    assert!(display.contains("a claim⋯ and another⋯ here"), "{display}");
+    assert!(display.contains("code stays raw: [^2]"), "{display}");
+    assert!(display.contains("not a footnote: [^ spaced]"), "{display}");
+
+    // Definitions keep their marker on screen, muted rather than concealed:
+    // a bare paragraph would not say which footnote it defines.
+    assert!(display.contains("[^1]: The first note."), "{display}");
+
+    let markers = cx.update_editor(|editor, _, cx| {
+        let markers = extract_markers(editor, cx).expect("markdown buffer should produce markers");
+        let references = markers
+            .inline
+            .iter()
+            .filter(|marker| matches!(marker.kind, InlineKind::Footnote { .. }))
+            .count();
+        (references, markers.definition_ranges.len())
+    });
+    assert_eq!(markers.0, 2, "two references");
+    assert_eq!(markers.1, 2, "two definition markers muted");
+
+    // Touching a reference reveals its source.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        a claim[^ˇ1] and another[^note] here
+    "});
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text().contains("a claim[^1] and another⋯ here"),
+        "{}",
+        cx.display_text()
+    );
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than
