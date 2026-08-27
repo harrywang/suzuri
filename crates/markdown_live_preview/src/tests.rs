@@ -2443,6 +2443,206 @@ async fn test_resolve_embed_target(cx: &mut TestAppContext) {
     assert_eq!(resolve(None, "Nowhere", cx), None);
 }
 
+/// Clicks the center of a rendered element located by its debug selector.
+fn click_debug_element(cx: &mut EditorTestContext, selector: &'static str) {
+    let bounds = cx
+        .cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} was not rendered"));
+    cx.cx.simulate_mouse_down(
+        bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.cx.simulate_mouse_up(
+        bounds.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+}
+
+fn callout_collapse_states(cx: &mut EditorTestContext) -> Vec<bool> {
+    cx.update_editor(|editor, _, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .unwrap()
+            .applied_blocks
+            .iter()
+            .map(|block| block.collapsed)
+            .collect()
+    })
+}
+
+#[gpui::test]
+async fn test_clicking_a_callout_title_toggles_it(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        > [!danger]- Folded
+        > Hidden body.
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(callout_collapse_states(&mut cx), vec![true]);
+
+    // Expanding must not also reveal the source: the title claims the click,
+    // so the widget stays on screen instead of dissolving into markdown.
+    click_debug_element(&mut cx, "mdlp-callout-title-Folded");
+    assert_eq!(callout_collapse_states(&mut cx), vec![false]);
+    assert!(
+        !cx.display_text().contains("[!danger]"),
+        "{}",
+        cx.display_text()
+    );
+
+    click_debug_element(&mut cx, "mdlp-callout-title-Folded");
+    assert_eq!(callout_collapse_states(&mut cx), vec![true]);
+}
+
+#[gpui::test]
+async fn test_clicking_a_plain_callout_title_reveals_its_source(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        > [!note] Plain
+        > Body text.
+    "});
+    cx.executor().run_until_parked();
+    assert!(!cx.display_text().contains("[!note]"), "starts rendered");
+
+    // A callout with no `+`/`-` is not collapsible, so its title falls
+    // through to the wrapper and reveals the markdown for editing.
+    click_debug_element(&mut cx, "mdlp-callout-title-Plain");
+    assert!(
+        cx.display_text().contains("> [!note] Plain"),
+        "{}",
+        cx.display_text()
+    );
+}
+
+/// An editor over a real project, which transclusion needs: a target is a
+/// note name resolved against the project's worktrees, not a path resolved
+/// against the buffer's directory, so an editor with no project can only ever
+/// report the target missing.
+async fn markdown_vault_test_context<'a>(
+    cx: &'a mut TestAppContext,
+    files: &[(&'static str, &'static str)],
+    open: &str,
+) -> (
+    Entity<Editor>,
+    Arc<project::FakeFs>,
+    &'a mut gpui::VisualTestContext,
+) {
+    use project::Fs as _;
+
+    init_test(cx);
+    let fs = project::FakeFs::new(cx.executor());
+    fs.create_dir("/vault".as_ref())
+        .await
+        .expect("failed to create the vault");
+    for (path, content) in files {
+        fs.insert_file(format!("/vault/{path}"), content.as_bytes().to_vec())
+            .await;
+    }
+    let project = project::Project::test(fs.clone(), ["/vault".as_ref()], cx).await;
+
+    let registry = project.read_with(cx, |project, _| project.languages().clone());
+    registry.add(language::markdown_lang());
+    registry.add(markdown_inline_lang());
+
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(format!("/vault/{open}"), cx)
+        })
+        .await
+        .expect("failed to open the note");
+    cx.executor().run_until_parked();
+
+    let (editor, cx) = cx.add_window_view({
+        let project = project.clone();
+        |window, cx| Editor::for_buffer(buffer, Some(project), window, cx)
+    });
+    cx.run_until_parked();
+    (editor, fs, cx)
+}
+
+/// The markdown a transclusion widget is currently drawing, or the state it is
+/// reporting instead. Read from the applied block's source, which is where
+/// `EmbedState::reuse_key` records what reached the screen.
+fn embed_block_sources(editor: &Entity<Editor>, cx: &mut gpui::VisualTestContext) -> Vec<String> {
+    editor.update(cx, |editor, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .unwrap()
+            .applied_blocks
+            .iter()
+            .filter(|block| block.source.starts_with('\u{0}'))
+            .map(|block| block.source.clone())
+            .collect()
+    })
+}
+
+#[gpui::test]
+async fn test_an_embed_loads_its_target_and_redraws(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "Opening line.\n\n![[Method]]\n"),
+            ("Method.md", "# Method\n\nWe sampled 40 participants.\n"),
+        ],
+        "Note.md",
+    )
+    .await;
+
+    let sources = embed_block_sources(&editor, cx);
+    assert_eq!(sources.len(), 1, "one transclusion block");
+    assert!(
+        sources[0].contains("We sampled 40 participants."),
+        "the load never reached the screen: {:?}",
+        sources[0]
+    );
+
+    // Changing the target on disk evicts its cache entry and redraws, so an
+    // embed does not keep showing a note that has since been edited.
+    fs.save(
+        "/vault/Method.md".as_ref(),
+        &"# Method\n\nWe sampled 80 participants.\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to rewrite the target");
+    cx.run_until_parked();
+
+    let sources = embed_block_sources(&editor, cx);
+    assert!(
+        sources[0].contains("We sampled 80 participants."),
+        "a target edited on disk kept showing its old text: {:?}",
+        sources[0]
+    );
+}
+
+#[gpui::test]
+async fn test_an_unresolved_embed_reports_itself(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[("Note.md", "Opening line.\n\n![[Nowhere]]\n")],
+        "Note.md",
+    )
+    .await;
+
+    let sources = embed_block_sources(&editor, cx);
+    assert_eq!(sources.len(), 1, "a missing target still draws a block");
+    assert!(
+        sources[0].contains("missing"),
+        "expected the missing state, got {:?}",
+        sources[0]
+    );
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than
