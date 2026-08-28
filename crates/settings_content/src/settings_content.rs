@@ -242,6 +242,9 @@ pub struct SettingsContent {
     /// The settings for markdown live preview in the editor.
     pub markdown_live_preview: Option<MarkdownLivePreviewSettingsContent>,
 
+    /// The settings for live Typst and LaTeX preview.
+    pub typeset_preview: Option<TypesetPreviewSettingsContent>,
+
     pub repl: Option<ReplSettingsContent>,
 
     /// Whether or not to enable Helix mode.
@@ -1259,6 +1262,48 @@ pub struct MarkdownLivePreviewSettingsContent {
     ///
     /// Default: "attachments"
     pub attachments_folder: Option<String>,
+}
+
+/// The settings for live Typst and LaTeX preview.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct TypesetPreviewSettingsContent {
+    /// Which engine compiles `.tex` files.
+    ///
+    /// Default: "auto"
+    pub latex_engine: Option<LatexEngine>,
+}
+
+/// Which engine compiles `.tex` files for live preview.
+///
+/// Conference templates routinely pin an engine — AAAI and many IEEE styles
+/// call `\RequirePDFTeX` and refuse to build under anything else — so this is
+/// a per-user choice rather than something the editor can decide once.
+#[derive(Clone, Default, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom)]
+#[serde(rename_all = "snake_case")]
+pub enum LatexEngine {
+    /// Use `latexmk` from the PATH, falling back to a managed TeX Live
+    /// installation that Suzuri downloads on first use.
+    #[default]
+    Auto,
+    /// Drive `latexmk`, which picks the engine a document asks for and runs
+    /// the bibtex/rerun loop itself.
+    Latexmk,
+    /// Compile with pdfTeX. Required by AAAI and many IEEE templates.
+    Pdflatex,
+    /// Compile with LuaTeX, the engine the LaTeX Project recommends for new
+    /// documents.
+    Lualatex,
+    /// Compile with XeTeX.
+    Xelatex,
+    /// Compile with an external command. The file name is appended to
+    /// `arguments`, and the command runs in the document's directory.
+    External {
+        /// The external program to run.
+        command: String,
+        /// The arguments to pass to the program, before the file name.
+        arguments: Option<Vec<String>>,
+    },
 }
 
 /// The settings for the image viewer.

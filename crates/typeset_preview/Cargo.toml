@@ -21,6 +21,7 @@ language.workspace = true
 log.workspace = true
 paths.workspace = true
 project.workspace = true
+settings.workspace = true
 sha2.workspace = true
 util.workspace = true
 which.workspace = true
