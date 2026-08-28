@@ -5159,7 +5159,7 @@ impl Extraction<'_> {
     /// neighbors and display-style layout cannot fit within a line.
     fn latex(&mut self, node: tree_sitter::Node) {
         let mut delimiters = Vec::new();
-        for index in 0..node.child_count() as u32 {
+        for index in 0..node.child_count() {
             let Some(child) = node.child(index) else {
                 continue;
             };
@@ -5410,7 +5410,7 @@ impl Extraction<'_> {
     fn list_item_markers(&mut self, node: tree_sitter::Node) {
         let mut list_marker = None;
         let mut task_marker = None;
-        for index in 0..node.child_count() as u32 {
+        for index in 0..node.child_count() {
             let Some(child) = node.child(index) else {
                 continue;
             };
@@ -5476,7 +5476,7 @@ impl Extraction<'_> {
                         "emphasis" => self.italic.push(range),
                         _ => self.bold.push(range),
                     }
-                    for index in 0..node.child_count() as u32 {
+                    for index in 0..node.child_count() {
                         let Some(child) = node.child(index) else {
                             continue;
                         };
@@ -5491,7 +5491,7 @@ impl Extraction<'_> {
                 }
                 "code_span" => {
                     self.code_spans.push(node.byte_range());
-                    for index in 0..node.child_count() as u32 {
+                    for index in 0..node.child_count() {
                         let Some(child) = node.child(index) else {
                             continue;
                         };
@@ -5503,7 +5503,7 @@ impl Extraction<'_> {
                 "inline_link" | "full_reference_link" | "collapsed_reference_link" => {
                     let mut open_bracket = None;
                     let mut close_bracket = None;
-                    for index in 0..node.child_count() as u32 {
+                    for index in 0..node.child_count() {
                         let Some(child) = node.child(index) else {
                             continue;
                         };
@@ -5531,13 +5531,13 @@ impl Extraction<'_> {
                     // literal text (the preview pane has the same limit). The
                     // image sits under a `link_text` node, not directly under
                     // the link.
-                    let wrapped_image = (0..node.child_count() as u32)
+                    let wrapped_image = (0..node.child_count())
                         .filter_map(|index| node.child(index))
                         .find_map(|child| {
                             if child.kind() == "image" {
                                 Some(child)
                             } else if child.kind() == "link_text" {
-                                (0..child.child_count() as u32)
+                                (0..child.child_count())
                                     .filter_map(|index| child.child(index))
                                     .find(|grandchild| grandchild.kind() == "image")
                             } else {
@@ -5583,7 +5583,7 @@ impl Extraction<'_> {
                     }
                     if self.is_alone_on_line(node) {
                         self.image_block(node);
-                    } else if let Some(description) = (0..node.child_count() as u32)
+                    } else if let Some(description) = (0..node.child_count())
                         .filter_map(|index| node.child(index))
                         .find(|child| child.kind() == "image_description")
                     {
@@ -5986,14 +5986,14 @@ impl Extraction<'_> {
     }
 
     fn image_alt(&self, image_node: tree_sitter::Node) -> Option<&str> {
-        let description = (0..image_node.child_count() as u32)
+        let description = (0..image_node.child_count())
             .filter_map(|index| image_node.child(index))
             .find(|child| child.kind() == "image_description")?;
         self.text.get(description.byte_range())
     }
 
     fn image_destination(&self, image_node: tree_sitter::Node) -> Option<String> {
-        let destination = (0..image_node.child_count() as u32)
+        let destination = (0..image_node.child_count())
             .filter_map(|index| image_node.child(index))
             .find(|child| child.kind() == "link_destination")?;
         self.text
@@ -6147,7 +6147,7 @@ fn toggle_callout(
 }
 
 fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::Node<'a>>) {
-    for index in (0..node.child_count() as u32).rev() {
+    for index in (0..node.child_count()).rev() {
         if let Some(child) = node.child(index) {
             stack.push(child);
         }
@@ -6155,7 +6155,7 @@ fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::N
 }
 
 fn heading_level(node: tree_sitter::Node) -> u32 {
-    for index in 0..node.child_count() as u32 {
+    for index in 0..node.child_count() {
         if let Some(child) = node.child(index) {
             match child.kind() {
                 "atx_h1_marker" => return 1,

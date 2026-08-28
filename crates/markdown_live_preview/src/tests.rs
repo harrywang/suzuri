@@ -485,7 +485,7 @@ async fn test_frontmatter_property_edit_round_trip(cx: &mut TestAppContext) {
     // "Add property" commits a `<key>: ` line before the closing delimiter
     // and hands back the key so Enter can chain into editing its value.
     let weak = editor.downgrade();
-    let add_range = frontmatter_range.clone();
+    let add_range = frontmatter_range;
     cx.update(|window, cx| start_add_property(weak, add_range, window, cx));
     let key_editor = cx.update_editor(|editor, _, _| {
         editor
@@ -703,7 +703,7 @@ async fn test_linked_image_renders_as_block(cx: &mut TestAppContext) {
                     let mut stack = vec![layer.node()];
                     while let Some(node) = stack.pop() {
                         nodes.push(format!("{} {:?}", node.kind(), node.byte_range()));
-                        for index in (0..node.child_count() as u32).rev() {
+                        for index in (0..node.child_count()).rev() {
                             if let Some(child) = node.child(index) {
                                 stack.push(child);
                             }
