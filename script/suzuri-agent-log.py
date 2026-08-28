@@ -72,6 +72,9 @@ GENESIS = "0" * 64
 # archiving them into a project folder must be a decision, never a default.
 HOOK_EVENTS = ("SessionStart", "SessionEnd")
 HOOK_MARKER = "suzuri-agent-log"
+# Read by the authoring_ledger crate; its presence is what turns editor-side
+# recording on. Kept in step with project.json's "enabled" by set_enabled().
+ENABLED_MARKER = "enabled"
 
 
 # --------------------------------------------------------------------------
@@ -348,12 +351,26 @@ def is_enabled(project_root):
 
 
 def set_enabled(project_root, enabled):
+    """Flip the switch for both halves of the record.
+
+    The agent half is this script; the editor half is the `authoring_ledger`
+    crate, which records only while <project>/.suzuri/editor-log/enabled exists.
+    One switch drives both so a project cannot end up with half a trail.
+    """
     ensure_archive(project_root)
     path = os.path.join(archive_root(project_root), "project.json")
     config = project_config(project_root)
     config["enabled"] = bool(enabled)
     config["enabled_changed_at"] = utc_iso()
     write_json(path, config)
+
+    marker = os.path.join(norm(project_root), ".suzuri", "editor-log", ENABLED_MARKER)
+    if enabled:
+        os.makedirs(os.path.dirname(marker), exist_ok=True)
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write("")
+    elif os.path.exists(marker):
+        os.remove(marker)
 
 
 # --------------------------------------------------------------------------

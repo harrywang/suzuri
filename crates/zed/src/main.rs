@@ -785,6 +785,9 @@ fn main() {
         feedback::init(cx);
         markdown_preview::init(cx);
         markdown_live_preview::init(cx);
+        // SUZURI: records how documents were written; off unless a project has
+        // .suzuri/editor-log/enabled
+        authoring_ledger::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);

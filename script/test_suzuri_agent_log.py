@@ -179,6 +179,17 @@ class TestOptIn(Harness):
         sal.set_enabled(root, False)
         self.assertFalse(sal.is_enabled(root))
 
+    def test_switch_drives_the_editor_ledger_too(self):
+        """One switch must turn on both halves, or a project ends up with half a
+        trail: agent turns recorded but no human edits, or the reverse."""
+        root = self.make_project("proj")
+        marker = os.path.join(root, ".suzuri", "editor-log", "enabled")
+        self.assertFalse(os.path.exists(marker))
+        sal.set_enabled(root, True)
+        self.assertTrue(os.path.exists(marker))
+        sal.set_enabled(root, False)
+        self.assertFalse(os.path.exists(marker))
+
     def test_archive_is_gitignored_on_creation(self):
         root = self.make_project("proj")
         sal.ensure_archive(root)

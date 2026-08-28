@@ -1386,6 +1386,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "authoring_ledger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "editor",
+ "gpui",
+ "language",
+ "log",
+ "parking_lot",
+ "project",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "text",
+ "util",
+ "uuid",
+]
+
+[[package]]
 name = "auto_update"
 version = "0.1.0"
 dependencies = [
@@ -23226,6 +23247,7 @@ dependencies = [
  "askpass",
  "assets",
  "audio",
+ "authoring_ledger",
  "auto_update",
  "auto_update_ui",
  "breadcrumbs",
