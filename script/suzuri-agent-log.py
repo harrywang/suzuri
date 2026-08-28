@@ -25,6 +25,28 @@ between worktrees mid-run), and resolves each cwd to a project identity:
 Resolution is frozen into the manifest at sync time, because a cwd that has since
 been deleted can no longer be resolved by git and would otherwise become
 permanently unattributable.
+
+Usage
+-----
+
+Recording is off for every project until it is turned on:
+
+    script/suzuri-agent-log.py enable    # opt in, install hooks, backfill
+    script/suzuri-agent-log.py status    # archived vs pending
+    script/suzuri-agent-log.py verify    # check the manifest hash chain
+    script/suzuri-agent-log.py disable   # opt out, remove hooks, keep archive
+
+`enable` installs SessionStart and SessionEnd hooks into the project's
+.claude/settings.json, preserving any hooks already there. Both events are
+needed: SessionEnd covers a normal exit, SessionStart sweeps sessions that were
+killed before SessionEnd could fire.
+
+What this does not capture: human keystrokes, paste versus typing, and files an
+agent writes by any means other than the Write/Edit tools. A `cat > file <<EOF`
+heredoc leaves no checkpoint and fires no tool hook, so tool-call capture alone
+under-reports; only editor-side observation closes that gap.
+
+Tests: python3 script/test_suzuri_agent_log.py
 """
 
 import argparse
@@ -44,6 +66,12 @@ import uuid
 SCHEMA_VERSION = 1
 ARCHIVE_REL = os.path.join(".suzuri", "agent-logs")
 GENESIS = "0" * 64
+
+# Recording is opt-in per project. Nothing is copied until `enable` is run: the
+# transcripts hold unredacted prompts, file contents, and shell output, so
+# archiving them into a project folder must be a decision, never a default.
+HOOK_EVENTS = ("SessionStart", "SessionEnd")
+HOOK_MARKER = "suzuri-agent-log"
 
 
 # --------------------------------------------------------------------------
@@ -300,8 +328,100 @@ def ensure_archive(project_root):
         identity["project_uuid"] = str(uuid.uuid4())
         identity["created_at"] = utc_iso()
         identity["schema"] = SCHEMA_VERSION
+        identity["enabled"] = False
         write_json(identity_path, identity)
     return root
+
+
+def project_config(project_root):
+    path = os.path.join(archive_root(project_root), "project.json")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            config = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return config if isinstance(config, dict) else {}
+
+
+def is_enabled(project_root):
+    return bool(project_config(project_root).get("enabled"))
+
+
+def set_enabled(project_root, enabled):
+    ensure_archive(project_root)
+    path = os.path.join(archive_root(project_root), "project.json")
+    config = project_config(project_root)
+    config["enabled"] = bool(enabled)
+    config["enabled_changed_at"] = utc_iso()
+    write_json(path, config)
+
+
+# --------------------------------------------------------------------------
+# hook installation
+
+
+def settings_path(project_root):
+    return os.path.join(norm(project_root), ".claude", "settings.json")
+
+
+def load_settings(project_root):
+    path = settings_path(project_root)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            settings = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return settings if isinstance(settings, dict) else {}
+
+
+def hook_command():
+    return "%s hook" % os.path.abspath(__file__)
+
+
+def install_hooks(project_root):
+    """Add our SessionStart/SessionEnd hooks, preserving anything already there.
+
+    Both events are needed: SessionEnd covers the normal exit, SessionStart
+    sweeps sessions that were killed or crashed before SessionEnd could fire.
+    """
+    settings = load_settings(project_root)
+    hooks = settings.setdefault("hooks", {})
+    added = []
+    for event in HOOK_EVENTS:
+        matchers = hooks.setdefault(event, [])
+        if any(HOOK_MARKER in json.dumps(entry) for entry in matchers):
+            continue
+        matchers.append({"hooks": [{"type": "command", "command": hook_command()}]})
+        added.append(event)
+    path = settings_path(project_root)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    write_json(path, settings)
+    return added
+
+
+def remove_hooks(project_root):
+    """Remove only our entries; leave every other hook untouched."""
+    settings = load_settings(project_root)
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return []
+    removed = []
+    for event in HOOK_EVENTS:
+        matchers = hooks.get(event)
+        if not isinstance(matchers, list):
+            continue
+        kept = [entry for entry in matchers if HOOK_MARKER not in json.dumps(entry)]
+        if len(kept) != len(matchers):
+            removed.append(event)
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+    if not hooks:
+        settings.pop("hooks", None)
+    if os.path.exists(settings_path(project_root)):
+        write_json(settings_path(project_root), settings)
+    return removed
 
 
 def gzip_copy(src, dst):
@@ -497,8 +617,18 @@ def archive_session(project_root, transcript_path, info, identity, primary):
     )
 
 
-def sync_project(project_root, quiet=False):
+def sync_project(project_root, quiet=False, force=False):
     project_root = norm(project_root)
+    if not force and not is_enabled(project_root):
+        if not quiet:
+            print(
+                "recording is off for %s\n"
+                "nothing was copied. turn it on with:\n"
+                "  %s enable --project %s"
+                % (project_root, os.path.abspath(__file__), project_root)
+            )
+        return 0
+
     identity = project_identity(project_root)
     ensure_archive(project_root)
 
@@ -657,11 +787,43 @@ def cmd_sync(args):
     return 0
 
 
+def cmd_enable(args):
+    project_root = norm(args.project or os.getcwd())
+    set_enabled(project_root, True)
+    added = install_hooks(project_root)
+    print("recording ON for %s" % project_root)
+    print("  archive : %s  (gitignored)" % archive_root(project_root))
+    print("  hooks   : %s" % (", ".join(added) if added else "already installed"))
+    # The hook stores this script's absolute path. A worktree is temporary, so a
+    # path inside one leaves a dangling hook the moment the worktree is removed.
+    if os.path.join(".claude", "worktrees") in os.path.abspath(__file__):
+        print(
+            "\n  warning: hooks now point at a copy of this script inside a git\n"
+            "  worktree, which will break when that worktree is removed. Re-run\n"
+            "  `enable` from your main checkout to repoint them."
+        )
+    print("\nbackfilling sessions already on disk...")
+    sync_project(project_root)
+    return 0
+
+
+def cmd_disable(args):
+    project_root = norm(args.project or os.getcwd())
+    set_enabled(project_root, False)
+    removed = remove_hooks(project_root)
+    print("recording OFF for %s" % project_root)
+    print("  hooks removed: %s" % (", ".join(removed) if removed else "none were installed"))
+    print("  the existing archive was left in place; delete %s to discard it."
+          % archive_root(project_root))
+    return 0
+
+
 def cmd_status(args):
     project_root = norm(args.project or os.getcwd())
     identity = project_identity(project_root)
     print("project : %s" % project_root)
     print("identity: %s (%s)" % (identity["common_dir"] or identity["root"], identity["kind"]))
+    print("recording: %s" % ("ON" if is_enabled(project_root) else "OFF (default)"))
 
     known = {r.get("session_id") for r in manifest_records(project_root)}
     available, foreign = [], 0
@@ -714,6 +876,8 @@ def cmd_hook(args):
         payload = {}
 
     project_root = payload.get("cwd") or args.project or os.getcwd()
+    if not is_enabled(project_root):
+        return 0  # opt-in: a project that never enabled recording is left alone
     try:
         sync_project(project_root, quiet=True)
     except Exception as err:  # a hook must never break the user's session
@@ -728,6 +892,8 @@ def main():
     )
     sub = parser.add_subparsers(dest="command")
     for name, handler, help_text in (
+        ("enable", cmd_enable, "turn recording on for this project and backfill"),
+        ("disable", cmd_disable, "turn recording off and remove the hooks"),
         ("sync", cmd_sync, "copy this project's sessions into .suzuri/agent-logs/"),
         ("status", cmd_status, "show archived vs pending sessions"),
         ("render", cmd_render, "regenerate AUTHORING.md from the manifest"),
