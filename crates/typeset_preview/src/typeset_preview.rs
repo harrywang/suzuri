@@ -177,13 +177,10 @@ pub fn open_live_preview_for_editor(
         );
     }
     let http = cx.http_client();
-    let task = {
-        let path = path.clone();
-        cx.background_spawn(async move {
-            let command = compile_command(&path, http).await?;
-            run_compile(command).await
-        })
-    };
+    let task = cx.background_spawn(async move {
+        let command = compile_command(&path, http).await?;
+        run_compile(command).await
+    });
     cx.spawn_in(window, async move |workspace, cx| {
         let result = task.await;
         match result {
@@ -459,13 +456,12 @@ async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Resu
         let archive_path = destination.join(&asset_name);
         std::fs::write(&archive_path, &bytes)
             .with_context(|| format!("writing {archive_path:?}"))?;
-        let status = util::command::new_std_command("tar")
-            .args(["-xf"])
+        let mut tar = util::command::new_command("tar");
+        tar.args(["-xf"])
             .arg(&archive_path)
             .arg("-C")
-            .arg(&destination)
-            .status()
-            .context("running tar")?;
+            .arg(&destination);
+        let status = tar.status().await.context("running tar")?;
         std::fs::remove_file(&archive_path).ok();
         anyhow::ensure!(status.success(), "extracting {asset_name} failed");
     }
@@ -594,10 +590,13 @@ async fn run_compile(command: CompileCommand) -> Result<()> {
     if let Some(artifact) = command.artifact.clone() {
         return run_until_artifact(command, artifact);
     }
-    let output = util::command::new_std_command(&command.program)
+    let mut compiler = util::command::new_command(&command.program);
+    compiler
         .args(&command.arguments)
-        .current_dir(&command.working_directory)
+        .current_dir(&command.working_directory);
+    let output = compiler
         .output()
+        .await
         .with_context(|| format!("running {}", command.program.display()))?;
     if output.status.success() {
         Ok(())
@@ -614,6 +613,10 @@ async fn run_compile(command: CompileCommand) -> Result<()> {
 /// Runs a program that writes `artifact` and may never exit, giving up after
 /// a minute. The artifact counts as finished once it is newer than the run
 /// and its size has stopped changing.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the loop below polls the child synchronously; converting it needs an async timer"
+)]
 fn run_until_artifact(command: CompileCommand, artifact: PathBuf) -> Result<()> {
     use std::time::{Duration, Instant};
 
