@@ -8,19 +8,44 @@
 //! PDF item notices the changed bytes on disk and re-renders in place, so
 //! the loop is: type → pause → page updates.
 //!
-//! Compilers are discovered on PATH: `typst` for .typ; `tectonic`, then
-//! `latexmk`, for .tex. Compile errors surface as a workspace toast holding
-//! the compiler's message.
+//! Compilers are discovered on PATH: `typst` for .typ, and for .tex whichever
+//! engine `latex_engine` selects — by default `latexmk`. When nothing is
+//! installed, the first preview offers to download a managed compiler rather
+//! than fetching one unannounced; for LaTeX that is a TeX Live installation
+//! (TinyTeX), whose missing packages are then installed on demand.
+//!
+//! The engine is a setting because conference templates pin one: AAAI and
+//! many IEEE styles call `\RequirePDFTeX` and refuse to build under XeTeX,
+//! so no single default can serve every document.
+//!
+//! Compile errors surface as a workspace toast holding the compiler's message.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
 
 use anyhow::{Context as _, Result, bail};
 use editor::{Editor, EditorEvent};
 use gpui::{App, AppContext as _, Context, Entity, Global, TaskExt as _, Window, actions};
+use settings::{LatexEngine, RegisterSetting, Settings as _};
 use util::ResultExt as _;
 use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
+
+/// Settings for live typeset preview.
+#[derive(Clone, Debug, Default, PartialEq, RegisterSetting)]
+pub struct TypesetPreviewSettings {
+    pub latex_engine: LatexEngine,
+}
+
+impl settings::Settings for TypesetPreviewSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let content = content.typeset_preview.clone().unwrap_or_default();
+        Self {
+            latex_engine: content.latex_engine.unwrap_or_default(),
+        }
+    }
+}
 
 actions!(
     typeset_preview,
@@ -164,23 +189,57 @@ pub fn open_live_preview_for_editor(
         Some(_) => {}
     }
 
+    let engine = TypesetPreviewSettings::get_global(cx).latex_engine.clone();
+    // Offer the download rather than starting it. Until the user accepts,
+    // the file stays unregistered, so saving it does not quietly pull tens of
+    // megabytes either.
+    if let Some(what) = pending_download(&path, &engine) {
+        let handle = cx.entity().downgrade();
+        let message = format!("Live preview needs {what}. Install it now?");
+        workspace.show_toast(
+            Toast::new(NotificationId::unique::<LiveCompileToast>(), message).on_click(
+                "Install",
+                move |window, cx| {
+                    let path = path.clone();
+                    handle
+                        .update(cx, |workspace, cx| {
+                            begin_preview(workspace, path, window, cx);
+                        })
+                        .ok();
+                },
+            ),
+            cx,
+        );
+        return;
+    }
+    begin_preview(workspace, path, window, cx);
+}
+
+/// Registers `path` for live preview, compiles it, and opens the PDF.
+fn begin_preview(
+    workspace: &mut Workspace,
+    path: PathBuf,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     cx.global_mut::<LiveCompileRegistry>()
         .enabled
         .insert(path.clone());
 
     let output = path.with_extension("pdf");
-    if let Some(compiler_name) = pending_download_name(&path) {
-        show_toast(
+    let engine = TypesetPreviewSettings::get_global(cx).latex_engine.clone();
+    // Downloading a toolchain takes far longer than a compile, so saying
+    // "Compiling…" through it reads as a hang.
+    match pending_download(&path, &engine) {
+        Some(what) => show_toast(
             workspace,
-            &format!("Downloading {compiler_name} (first use)…"),
+            &format!("Installing {what}. This runs once and may take a minute…"),
             cx,
-        );
+        ),
+        None => show_toast(workspace, "Compiling…", cx),
     }
     let http = cx.http_client();
-    let task = cx.background_spawn(async move {
-        let command = compile_command(&path, http).await?;
-        run_compile(command).await
-    });
+    let task = cx.background_spawn(async move { compile_document(&path, http, engine).await });
     cx.spawn_in(window, async move |workspace, cx| {
         let result = task.await;
         match result {
@@ -257,14 +316,12 @@ fn compile(path: PathBuf, workspace: Option<Entity<Workspace>>, cx: &mut Context
     }
 
     let http = cx.http_client();
+    let engine = TypesetPreviewSettings::get_global(cx).latex_engine.clone();
     cx.spawn(async move |_, cx| {
         let result = cx
             .background_spawn({
                 let path = path.clone();
-                async move {
-                    let command = compile_command(&path, http).await?;
-                    run_compile(command).await
-                }
+                async move { compile_document(&path, http, engine).await }
             })
             .await;
         cx.update(|cx| {
@@ -291,6 +348,14 @@ struct CompileCommand {
     /// headless Chrome finishes `--print-to-pdf` and then keeps running. Wait
     /// for the artifact instead of the exit status, then stop the process.
     artifact: Option<PathBuf>,
+    /// Prepended to `PATH`. `latexmk` is a Perl script that shells out to
+    /// `pdflatex` by name, so a managed TeX Live only works if its own binary
+    /// directory is findable.
+    path_prepend: Option<PathBuf>,
+    /// The managed TeX Live's binary directory, when this compile is using
+    /// one. Missing packages are installed only into an installation Suzuri
+    /// owns — a system TeX belongs to the user (and usually needs root).
+    managed_texlive: Option<PathBuf>,
 }
 
 /// Pinned compiler releases for auto-provisioning. PATH installs always take
@@ -298,8 +363,11 @@ struct CompileCommand {
 /// digest-verified, so "double-click install" is the whole setup.
 const TYPST_TAG: &str = "v0.15.1";
 const TYPST_REPOSITORY: &str = "typst/typst";
-const TECTONIC_TAG: &str = "tectonic@0.17.0";
-const TECTONIC_REPOSITORY: &str = "tectonic-typesetting/tectonic";
+/// TinyTeX is a prebuilt, relocatable TeX Live: the same engines Overleaf
+/// runs, packaged as a versioned tarball. Releases are retained indefinitely,
+/// so pinning a tag keeps provisioning reproducible.
+const TINYTEX_TAG: &str = "v2026.08";
+const TINYTEX_REPOSITORY: &str = "rstudio/tinytex-releases";
 
 fn compilers_dir() -> PathBuf {
     paths::data_dir().join("typeset_compilers")
@@ -309,21 +377,36 @@ fn exe(name: &str) -> String {
     format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
-/// Where a provisioned compiler's binary lives once downloaded.
-fn provisioned_binary(name: &str) -> Result<PathBuf> {
-    let dir = compilers_dir().join(format!(
-        "{name}-{}",
-        match name {
-            "typst" => TYPST_TAG,
-            _ => TECTONIC_TAG.rsplit('@').next().unwrap_or(TECTONIC_TAG),
-        }
-    ));
-    Ok(match name {
-        // Typst archives contain a `typst-<triple>/` directory.
-        "typst" => dir.join(typst_asset_stem()?).join(exe("typst")),
-        // Tectonic archives contain the bare binary.
-        _ => dir.join(exe("tectonic")),
-    })
+/// Where the provisioned typst binary lives once downloaded. Typst archives
+/// contain a `typst-<triple>/` directory.
+fn provisioned_typst() -> Result<PathBuf> {
+    Ok(compilers_dir()
+        .join(format!("typst-{TYPST_TAG}"))
+        .join(typst_asset_stem()?)
+        .join(exe("typst")))
+}
+
+fn tinytex_dir() -> PathBuf {
+    compilers_dir().join(format!("tinytex-{TINYTEX_TAG}"))
+}
+
+/// TeX Live names its binary directory after its own platform convention
+/// (`universal-darwin`, `x86_64-linux`, `windows`), so discover it rather
+/// than trying to predict it.
+fn tinytex_bin_dir() -> Result<PathBuf> {
+    let root = tinytex_dir().join("TinyTeX").join("bin");
+    let entry = std::fs::read_dir(&root)
+        .with_context(|| format!("reading {root:?}"))?
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.path().is_dir())
+        .with_context(|| format!("no platform directory under {root:?}"))?;
+    Ok(entry.path())
+}
+
+/// A managed TeX Live counts as installed once it can actually typeset.
+fn tinytex_installed() -> Option<PathBuf> {
+    let bin = tinytex_bin_dir().ok()?;
+    bin.join(exe("pdftex")).exists().then_some(bin)
 }
 
 fn target_triple() -> Result<(&'static str, &'static str)> {
@@ -344,25 +427,56 @@ fn typst_asset_stem() -> Result<String> {
     Ok(format!("typst-{arch}-{os}"))
 }
 
-/// The name a first-run download would fetch, if any — used to toast
-/// "Downloading …" before the user waits on it.
-fn pending_download_name(path: &Path) -> Option<&'static str> {
+/// What a first preview would have to download, if anything. Downloads are
+/// offered rather than performed: they are large, and for LaTeX the choice of
+/// toolchain decides whether a document compiles at all, so silently picking
+/// one and failing later leaves the user with an error they cannot act on.
+fn pending_download(path: &Path, engine: &LatexEngine) -> Option<&'static str> {
     match typesetter_for(path)? {
         Typesetter::Typst => (which::which("typst").is_err()
-            && !provisioned_binary("typst").ok()?.exists())
-        .then_some("the Typst compiler"),
-        Typesetter::Latex => (which::which("tectonic").is_err()
-            && which::which("latexmk").is_err()
-            && !provisioned_binary("tectonic").ok()?.exists())
-        .then_some("the Tectonic LaTeX compiler"),
+            && !provisioned_typst().ok()?.exists())
+        .then_some("the Typst compiler (~30 MB)"),
+        Typesetter::Latex => {
+            // An external command is the user's own; never provision for it.
+            let program = match engine {
+                LatexEngine::External { .. } => return None,
+                LatexEngine::Auto | LatexEngine::Latexmk => "latexmk",
+                LatexEngine::Pdflatex => "pdflatex",
+                LatexEngine::Lualatex => "lualatex",
+                LatexEngine::Xelatex => "xelatex",
+            };
+            (which::which(program).is_err() && tinytex_installed().is_none())
+                .then_some("a LaTeX toolchain (TeX Live, ~67 MB)")
+        }
         // Browsers are never downloaded on the user's behalf.
         Typesetter::Html => None,
+    }
+}
+
+/// The engine a `.tex` document should be compiled with, and the arguments it
+/// takes. `file` is appended by the caller.
+fn latex_invocation(engine: &LatexEngine) -> (&str, Vec<String>) {
+    // `-interaction=nonstopmode` without `-halt-on-error`: a run that keeps
+    // going reports every missing file at once, so the package resolver
+    // converges in far fewer rounds.
+    match engine {
+        LatexEngine::Auto | LatexEngine::Latexmk => (
+            "latexmk",
+            vec!["-pdf".into(), "-interaction=nonstopmode".into()],
+        ),
+        LatexEngine::Pdflatex => ("pdflatex", vec!["-interaction=nonstopmode".into()]),
+        LatexEngine::Lualatex => ("lualatex", vec!["-interaction=nonstopmode".into()]),
+        LatexEngine::Xelatex => ("xelatex", vec!["-interaction=nonstopmode".into()]),
+        LatexEngine::External { command, arguments } => {
+            (command.as_str(), arguments.clone().unwrap_or_default())
+        }
     }
 }
 
 async fn compile_command(
     path: &Path,
     http: std::sync::Arc<dyn http_client::HttpClient>,
+    engine: LatexEngine,
 ) -> Result<CompileCommand> {
     let working_directory = path
         .parent()
@@ -384,37 +498,48 @@ async fn compile_command(
                 arguments: vec!["compile".into(), file],
                 working_directory,
                 artifact: None,
+                path_prepend: None,
+                managed_texlive: None,
             })
         }
         Typesetter::Latex => {
-            if let Ok(program) = which::which("tectonic") {
-                Ok(CompileCommand {
+            let (name, mut arguments) = latex_invocation(&engine);
+            arguments.push(file);
+            // An external command is the user's own toolchain: run it as
+            // given, and never provision or mutate anything on its behalf.
+            if let LatexEngine::External { .. } = engine {
+                let program =
+                    which::which(name).with_context(|| format!("{name} not found on PATH"))?;
+                return Ok(CompileCommand {
                     program,
-                    arguments: vec![file],
+                    arguments,
                     working_directory,
                     artifact: None,
-                })
-            } else if let Ok(program) = which::which("latexmk") {
-                Ok(CompileCommand {
-                    program,
-                    arguments: vec![
-                        "-pdf".into(),
-                        "-interaction=nonstopmode".into(),
-                        "-halt-on-error".into(),
-                        file,
-                    ],
-                    working_directory,
-                    artifact: None,
-                })
-            } else {
-                let program = ensure_tectonic(http).await?;
-                Ok(CompileCommand {
-                    program,
-                    arguments: vec![file],
-                    working_directory,
-                    artifact: None,
-                })
+                    path_prepend: None,
+                    managed_texlive: None,
+                });
             }
+            // A TeX already on PATH is the user's, and takes precedence over
+            // anything Suzuri would install.
+            if let Ok(program) = which::which(name) {
+                return Ok(CompileCommand {
+                    program,
+                    arguments,
+                    working_directory,
+                    artifact: None,
+                    path_prepend: None,
+                    managed_texlive: None,
+                });
+            }
+            let bin = ensure_tinytex(http).await?;
+            Ok(CompileCommand {
+                program: bin.join(exe(name)),
+                arguments,
+                working_directory,
+                artifact: None,
+                path_prepend: Some(bin.clone()),
+                managed_texlive: Some(bin),
+            })
         }
         // HTML never reaches here: `open_live_preview_for_editor` hands it
         // to the browser instead of a compiler.
@@ -423,7 +548,7 @@ async fn compile_command(
 }
 
 async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Result<PathBuf> {
-    let binary = provisioned_binary("typst")?;
+    let binary = provisioned_typst()?;
     if binary.exists() {
         return Ok(binary);
     }
@@ -450,20 +575,25 @@ async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Resu
         // decompresses xz natively on macOS and Linux.
         let asset_name = format!("typst-{arch}-{os}.tar.xz");
         let (url, digest) = release_asset(&http, TYPST_REPOSITORY, TYPST_TAG, &asset_name).await?;
-        let bytes = fetch_verified(&http, &url, digest.as_deref()).await?;
         std::fs::create_dir_all(&destination)
             .with_context(|| format!("creating {destination:?}"))?;
-        let archive_path = destination.join(&asset_name);
-        std::fs::write(&archive_path, &bytes)
-            .with_context(|| format!("writing {archive_path:?}"))?;
+        let archive_directory = destination.join("archive");
+        let archive_path = fetch_to_file(
+            &http,
+            &url,
+            digest.as_deref(),
+            &archive_directory,
+            &asset_name,
+        )
+        .await?;
         let mut tar = util::command::new_command("tar");
         tar.args(["-xf"])
             .arg(&archive_path)
             .arg("-C")
             .arg(&destination);
-        let status = tar.status().await.context("running tar")?;
-        std::fs::remove_file(&archive_path).ok();
-        anyhow::ensure!(status.success(), "extracting {asset_name} failed");
+        let extracted = run_extraction(&mut tar, &asset_name).await;
+        std::fs::remove_dir_all(&archive_directory).ok();
+        extracted?;
     }
     anyhow::ensure!(
         binary.exists(),
@@ -472,39 +602,119 @@ async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Resu
     Ok(binary)
 }
 
-async fn ensure_tectonic(http: std::sync::Arc<dyn http_client::HttpClient>) -> Result<PathBuf> {
-    let binary = provisioned_binary("tectonic")?;
-    if binary.exists() {
-        return Ok(binary);
-    }
-    let destination = binary.parent().context("no parent")?.to_path_buf();
-    let version = TECTONIC_TAG.rsplit('@').next().unwrap_or(TECTONIC_TAG);
-    let (arch, os) = target_triple()?;
-    let (asset_name, kind) = if os.contains("windows") {
-        (
-            format!("tectonic-{version}-{arch}-{os}.zip"),
-            http_client::github::AssetKind::Zip,
-        )
-    } else {
-        (
-            format!("tectonic-{version}-{arch}-{os}.tar.gz"),
-            http_client::github::AssetKind::TarGz,
-        )
+/// Unpacks a downloaded archive, reporting the extractor's own diagnostics
+/// rather than a bare exit status.
+async fn run_extraction(command: &mut util::command::Command, asset_name: &str) -> Result<()> {
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("extracting {asset_name}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "extracting {asset_name} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+            .trim()
+            .chars()
+            .take(300)
+            .collect::<String>()
+    );
+    Ok(())
+}
+
+/// The TinyTeX asset for this platform. The bundles are per-platform, and
+/// Windows ships a 7-Zip self-extracting `.exe` rather than an archive.
+fn tinytex_asset_name() -> Result<String> {
+    use std::env::consts::{ARCH, OS};
+    let platform = match (OS, ARCH) {
+        ("macos", _) => "darwin".to_string(),
+        ("linux", "aarch64") => "linux-arm64".to_string(),
+        ("linux", "x86_64") => "linux-x86_64".to_string(),
+        ("windows", _) => {
+            return Ok(format!("TinyTeX-1-windows-{TINYTEX_TAG}.exe"));
+        }
+        (os, arch) => bail!("no prebuilt TeX Live for {os} on {arch}"),
     };
-    download_release_archive(
+    Ok(format!("TinyTeX-1-{platform}-{TINYTEX_TAG}.tar.xz"))
+}
+
+/// Downloads and prepares a managed TeX Live, returning its binary directory.
+async fn ensure_tinytex(http: std::sync::Arc<dyn http_client::HttpClient>) -> Result<PathBuf> {
+    if let Some(bin) = tinytex_installed() {
+        return Ok(bin);
+    }
+    let destination = tinytex_dir();
+    let asset_name = tinytex_asset_name()?;
+    let (url, digest) = release_asset(&http, TINYTEX_REPOSITORY, TINYTEX_TAG, &asset_name).await?;
+    std::fs::create_dir_all(&destination).with_context(|| format!("creating {destination:?}"))?;
+    let archive_directory = destination.join("archive");
+    let archive_path = fetch_to_file(
         &http,
-        TECTONIC_REPOSITORY,
-        TECTONIC_TAG,
+        &url,
+        digest.as_deref(),
+        &archive_directory,
         &asset_name,
-        &destination,
-        kind,
     )
     .await?;
+
+    let mut extractor = if asset_name.ends_with(".exe") {
+        // A 7-Zip SFX: extracting it means running it. `-y` accepts the
+        // prompts, `-o` sets the output directory.
+        let mut installer = util::command::new_command(&archive_path);
+        installer
+            .arg("-y")
+            .arg(format!("-o{}", destination.display()));
+        installer
+    } else {
+        // `.tar.xz`, which the shared downloader cannot handle; the system
+        // tar decompresses xz natively on macOS and Linux.
+        let mut tar = util::command::new_command("tar");
+        tar.arg("-xf")
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&destination);
+        tar
+    };
+    let extracted = run_extraction(&mut extractor, &asset_name).await;
+    std::fs::remove_dir_all(&archive_directory).ok();
+    extracted?;
+
+    let bin = tinytex_installed()
+        .with_context(|| format!("downloaded TeX Live archive did not populate {destination:?}"))?;
+
+    // The bundled `tlmgr` is older than the package repository it talks to,
+    // and refuses every install until it updates itself. Failing here is not
+    // fatal: the toolchain still typesets whatever it already ships.
+    run_texlive_tool(&bin, "tlmgr", &["update".into(), "--self".into()])
+        .await
+        .context("updating tlmgr")
+        .log_err();
+    Ok(bin)
+}
+
+/// Runs one of the managed TeX Live's own tools with its binary directory on
+/// `PATH`, returning combined output.
+async fn run_texlive_tool(bin: &Path, tool: &str, arguments: &[String]) -> Result<String> {
+    let mut command = util::command::new_command(bin.join(exe(tool)));
+    command.args(arguments).env("PATH", prepended_path(bin));
+    let output = command
+        .output()
+        .await
+        .with_context(|| format!("running {tool}"))?;
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
     anyhow::ensure!(
-        binary.exists(),
-        "downloaded tectonic archive did not contain {binary:?}"
+        output.status.success(),
+        "{tool} failed: {}",
+        combined.trim().chars().take(300).collect::<String>()
     );
-    Ok(binary)
+    Ok(combined)
+}
+
+fn prepended_path(bin: &Path) -> std::ffi::OsString {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut entries = vec![bin.to_path_buf()];
+    entries.extend(std::env::split_paths(&existing));
+    std::env::join_paths(entries).unwrap_or(existing)
 }
 
 /// Resolves a release asset to its download URL and normalized sha256.
@@ -554,60 +764,274 @@ async fn download_release_archive(
     .await
 }
 
-async fn fetch_verified(
+/// Downloads `url` into `directory/file_name`, returning the file's path.
+///
+/// This streams through the shared downloader rather than reading the body
+/// into memory: `read_to_end` on an `AsyncBody` stalls indefinitely on a
+/// large asset, which left the first preview sitting on "Compiling…" forever
+/// while a 67 MB archive never arrived. It also verifies the digest and
+/// stages the file, so a failed download cannot leave a partial archive
+/// behind for the extractor to choke on.
+async fn fetch_to_file(
     http: &std::sync::Arc<dyn http_client::HttpClient>,
     url: &str,
     digest: Option<&str>,
-) -> Result<Vec<u8>> {
-    use futures::AsyncReadExt as _;
-    let mut response = http
-        .get(url, Default::default(), true)
-        .await
-        .with_context(|| format!("downloading {url}"))?;
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .read_to_end(&mut bytes)
-        .await
-        .with_context(|| format!("reading {url}"))?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "download of {url} failed with {}",
-        response.status()
-    );
-    if let Some(expected) = digest {
-        use sha2::Digest as _;
-        let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
-        anyhow::ensure!(
-            actual.eq_ignore_ascii_case(expected),
-            "sha256 mismatch for {url}: expected {expected}, got {actual}"
-        );
+    directory: &Path,
+    file_name: &str,
+) -> Result<PathBuf> {
+    if let Some(parent) = directory.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
     }
-    Ok(bytes)
+    http_client::github_download::download_server_raw_binary(
+        http.as_ref(),
+        url,
+        digest,
+        directory,
+        file_name,
+    )
+    .await
+    .with_context(|| format!("downloading {url}"))?;
+    let path = directory.join(file_name);
+    anyhow::ensure!(path.exists(), "download of {url} produced no {path:?}");
+    Ok(path)
 }
 
-async fn run_compile(command: CompileCommand) -> Result<()> {
-    if let Some(artifact) = command.artifact.clone() {
-        return run_until_artifact(command, artifact);
+struct CompileRun {
+    success: bool,
+    output: String,
+}
+
+impl CompileRun {
+    /// TeX prefixes real errors with `! `, and buries them in hundreds of
+    /// lines of routine chatter; that one line is what belongs in a toast.
+    fn message(&self) -> String {
+        if let Some(error) = self.output.lines().find(|line| line.starts_with("! ")) {
+            return error.trim().to_string();
+        }
+        let trimmed = self.output.trim();
+        if trimmed.is_empty() {
+            return "compiler reported no output".to_string();
+        }
+        trimmed.chars().take(600).collect()
     }
-    let mut compiler = util::command::new_command(&command.program);
-    compiler
+}
+
+async fn run_once(command: &CompileCommand) -> Result<CompileRun> {
+    let mut process = util::command::new_command(&command.program);
+    process
         .args(&command.arguments)
         .current_dir(&command.working_directory);
-    let output = compiler
+    if let Some(bin) = &command.path_prepend {
+        process.env("PATH", prepended_path(bin));
+    }
+    // TeX appends to this, so a stale copy would keep reporting fonts that
+    // have since been installed.
+    std::fs::remove_file(command.working_directory.join(MISSFONT_LOG)).ok();
+    let output = process
         .output()
         .await
         .with_context(|| format!("running {}", command.program.display()))?;
-    if output.status.success() {
+    // TeX reports its errors on stdout, not stderr, so both are needed --
+    // both to show the user and to find missing packages in.
+    let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(CompileRun {
+        success: output.status.success(),
+        output: combined,
+    })
+}
+
+/// How many install-and-retry rounds a single compile may take. Each round
+/// resolves every file the previous run named, so this is generous.
+const MAX_RESOLVE_ROUNDS: usize = 12;
+
+async fn compile_document(
+    path: &Path,
+    http: std::sync::Arc<dyn http_client::HttpClient>,
+    engine: LatexEngine,
+) -> Result<()> {
+    let command = compile_command(path, http, engine).await?;
+    if let Some(artifact) = command.artifact.clone() {
+        return run_until_artifact(command, artifact);
+    }
+    // Only a TeX Live that Suzuri installed may be modified. A system one is
+    // the user's, and installing into it would generally need root anyway.
+    let managed = command.managed_texlive.clone();
+    let mut run = run_once(&command).await?;
+    for _ in 0..MAX_RESOLVE_ROUNDS {
+        let mut missing = missing_files(&run.output);
+        missing.extend(missing_fonts(&command.working_directory));
+        missing.sort();
+        missing.dedup();
+        // A run that succeeded but is still missing a font produced a PDF
+        // typeset in the wrong one, so success alone is not a stopping
+        // condition -- only having nothing left to resolve is.
+        if missing.is_empty() {
+            break;
+        }
+        let Some(bin) = &managed else { break };
+        if !install_missing_packages(bin, &missing).await {
+            break;
+        }
+        clear_latexmk_state(&command);
+        run = run_once(&command).await?;
+    }
+    if run.success {
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let mut message: String = stderr.trim().chars().take(600).collect();
-        if message.is_empty() {
-            message = format!("compiler exited with {}", output.status);
-        }
-        bail!("{message}")
+        bail!("{}", run.message())
     }
+}
+
+/// Fonts TeX could not find. When `mktextfm` is on the PATH, a missing metric
+/// is not an error in the log at all: TeX defers to it, records the request in
+/// `missfont.log`, and exits successfully having typeset the document in a
+/// substituted font. That silent path is the one that actually happens, so it
+/// has to be read from the file rather than the compiler's output.
+fn missing_fonts(working_directory: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(working_directory.join(MISSFONT_LOG)) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            // `mktextfm pcrr8t`, or `mktexpk --mfmode ... --dpi 600 pcrr8t`.
+            let name = line.split_whitespace().last()?;
+            (!name.is_empty() && !name.starts_with('-')).then(|| format!("{name}.tfm"))
+        })
+        .collect()
+}
+
+const MISSFONT_LOG: &str = "missfont.log";
+
+/// `latexmk` remembers a failed run and then reports "Nothing to do" on every
+/// retry, so its state has to go before recompiling.
+fn clear_latexmk_state(command: &CompileCommand) {
+    let Some(stem) = command
+        .arguments
+        .last()
+        .map(Path::new)
+        .and_then(|file| file.file_stem())
+        .map(|stem| stem.to_string_lossy().into_owned())
+    else {
+        return;
+    };
+    std::fs::remove_file(
+        command
+            .working_directory
+            .join(format!("{stem}.fdb_latexmk")),
+    )
+    .ok();
+}
+
+/// Files a failed run reported missing, as names `tlmgr` can search for.
+fn missing_files(output: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in output.lines() {
+        // `! LaTeX Error: File `newtx.sty' not found.`
+        if let Some((_, rest)) = line.split_once("File `")
+            && let Some((name, tail)) = rest.split_once('\'')
+            && tail.trim_start().starts_with("not found")
+        {
+            files.push(name.to_string());
+        }
+        // latexmk's own summary: `Missing input file 'newfloat.sty'`
+        if let Some((_, rest)) = line.split_once("Missing input file '")
+            && let Some((name, _)) = rest.split_once('\'')
+        {
+            files.push(name.to_string());
+        }
+        // `! Font TS1/ntxtlf/m/n/10=ts1-qtmr at 10.0pt not loadable: Metric
+        // (TFM) file not found.` -- the metric is named after `=`. This case
+        // matters more than a missing .sty: TeX carries on and still writes a
+        // PDF, so an unhandled font failure is silent visual corruption
+        // rather than a build error.
+        if line.contains("not loadable: Metric (TFM) file not found")
+            && let Some((_, rest)) = line.split_once('=')
+            && let Some((name, _)) = rest.split_once(" at ")
+        {
+            files.push(format!("{}.tfm", name.trim()));
+        }
+    }
+    files.sort();
+    files.dedup();
+    files
+}
+
+/// Lookups that came back empty. Without this, a document naming a package
+/// that does not exist would spend a network round trip on every save.
+static UNRESOLVABLE: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+/// `tlmgr` locks the whole installation, so concurrent previews of two
+/// documents would otherwise race and one would fail. The guard is held
+/// across awaits, so it has to be a futures-aware lock.
+static TLMGR_LOCK: LazyLock<futures::lock::Mutex<()>> =
+    LazyLock::new(futures::lock::Mutex::default);
+
+/// Installs the packages providing `files`, returning whether anything new
+/// arrived — a `false` means retrying the compile is pointless.
+async fn install_missing_packages(bin: &Path, files: &[String]) -> bool {
+    let _guard = TLMGR_LOCK.lock().await;
+    let mut installed_any = false;
+    for file in files {
+        if unresolvable_contains(file) {
+            continue;
+        }
+        let Some(package) = texlive_package_for(bin, file).await else {
+            remember_unresolvable(file);
+            continue;
+        };
+        if run_texlive_tool(bin, "tlmgr", &["install".to_string(), package])
+            .await
+            .log_err()
+            .is_some()
+        {
+            installed_any = true;
+        } else {
+            remember_unresolvable(file);
+        }
+    }
+    installed_any
+}
+
+fn unresolvable_contains(file: &str) -> bool {
+    UNRESOLVABLE
+        .lock()
+        .map(|set| set.contains(file))
+        .unwrap_or(false)
+}
+
+fn remember_unresolvable(file: &str) {
+    if let Ok(mut set) = UNRESOLVABLE.lock() {
+        set.insert(file.to_string());
+    }
+}
+
+/// Asks `tlmgr` which package ships `file`.
+async fn texlive_package_for(bin: &Path, file: &str) -> Option<String> {
+    let output = run_texlive_tool(
+        bin,
+        "tlmgr",
+        &[
+            "search".to_string(),
+            "--global".to_string(),
+            "--file".to_string(),
+            format!("/{file}"),
+        ],
+    )
+    .await
+    .log_err()?;
+    output.lines().find_map(parse_package_line)
+}
+
+/// A search result heads its block with `name:` at column zero. The
+/// `tlmgr: package repository ...` banner has the same shape, so it has to be
+/// excluded by name.
+fn parse_package_line(line: &str) -> Option<String> {
+    let name = line.strip_suffix(':')?;
+    if name.is_empty() || name == "tlmgr" || name.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Runs a program that writes `artifact` and may never exit, giving up after
@@ -677,4 +1101,309 @@ fn show_toast(workspace: &mut Workspace, message: &str, cx: &mut Context<Workspa
 
 fn dismiss_toast(workspace: &mut Workspace, cx: &mut Context<Workspace>) {
     workspace.dismiss_toast(&NotificationId::unique::<LiveCompileToast>(), cx);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Real pdflatex output: the error lands on stdout, and names the file
+    /// between a backtick and an apostrophe.
+    #[test]
+    fn missing_style_file_is_extracted() {
+        let output = "(./AnonymousSubmission2027.tex\n\
+                      LaTeX2e <2026-06-01>\n\
+                      ! LaTeX Error: File `newtxtext.sty' not found.\n\
+                      \n\
+                      Type X to quit or <RETURN> to proceed,\n";
+        assert_eq!(missing_files(output), vec!["newtxtext.sty".to_string()]);
+    }
+
+    /// latexmk restates the same failure in its own summary format.
+    #[test]
+    fn latexmk_missing_input_summary_is_extracted() {
+        let output = "Latexmk: Examining 'paper.log'\n\
+                      Latexmk: Missing input file 'algorithm.sty' message in .log file:\n";
+        assert_eq!(missing_files(output), vec!["algorithm.sty".to_string()]);
+    }
+
+    /// A missing font metric is the dangerous case: TeX carries on and still
+    /// writes a PDF, so failing to resolve one silently typesets the document
+    /// in the wrong font instead of reporting an error.
+    #[test]
+    fn missing_font_metric_is_extracted() {
+        let output = "! Font TS1/ntxtlf/m/n/10=ts1-qtmr at 10.0pt not loadable: \
+                      Metric (TFM) file not found.\n\
+                      ! Font T1/pcr/m/n/9=pcrr8t at 9.0pt not loadable: \
+                      Metric (TFM) file not found.\n";
+        assert_eq!(
+            missing_files(output),
+            vec!["pcrr8t.tfm".to_string(), "ts1-qtmr.tfm".to_string()]
+        );
+    }
+
+    /// The failure that actually happens in the field: with `mktextfm`
+    /// available, TeX does not report a missing metric as an error at all. It
+    /// writes the request here, exits 0, and hands back a PDF typeset in a
+    /// substituted font -- so this file is the only evidence.
+    #[test]
+    fn missing_fonts_are_read_from_missfont_log() {
+        let directory =
+            std::env::temp_dir().join(format!("suzuri-missfont-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        std::fs::write(
+            directory.join(MISSFONT_LOG),
+            "mktextfm pcrr8t\nmktexpk --mfmode ljfour --dpi 600 ptmr8t\n",
+        )
+        .expect("writing missfont.log");
+
+        assert_eq!(
+            missing_fonts(&directory),
+            vec!["pcrr8t.tfm".to_string(), "ptmr8t.tfm".to_string()]
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn missing_fonts_is_empty_without_a_missfont_log() {
+        let directory = std::env::temp_dir().join(format!("suzuri-nomiss-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        assert!(missing_fonts(&directory).is_empty());
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn missing_files_are_deduplicated_and_clean_output_yields_none() {
+        let repeated = "! LaTeX Error: File `caption.sty' not found.\n\
+                        ! LaTeX Error: File `caption.sty' not found.\n";
+        assert_eq!(missing_files(repeated), vec!["caption.sty".to_string()]);
+        assert!(missing_files("Output written on paper.pdf (8 pages).").is_empty());
+    }
+
+    /// `tlmgr search` heads each hit with `name:` at column zero -- and so
+    /// does its own repository banner, which is not a result.
+    #[test]
+    fn package_lookup_skips_the_tlmgr_banner() {
+        let output = "tlmgr: package repository https://tlnet.yihui.org (verified)\n\
+                      newtx:\n\
+                      \ttexmf-dist/tex/latex/newtx/newtxtext.sty\n";
+        assert_eq!(
+            output.lines().find_map(parse_package_line),
+            Some("newtx".to_string())
+        );
+        assert_eq!(parse_package_line("tlmgr:"), None);
+        assert_eq!(
+            parse_package_line("\ttexmf-dist/tex/latex/newtx/x.sty"),
+            None
+        );
+        assert_eq!(parse_package_line("some words here:"), None);
+    }
+
+    /// The engine is a setting because templates pin one; each value has to
+    /// reach a different program.
+    #[test]
+    fn each_engine_selects_its_own_program() {
+        assert_eq!(latex_invocation(&LatexEngine::Auto).0, "latexmk");
+        assert_eq!(latex_invocation(&LatexEngine::Latexmk).0, "latexmk");
+        assert_eq!(latex_invocation(&LatexEngine::Pdflatex).0, "pdflatex");
+        assert_eq!(latex_invocation(&LatexEngine::Lualatex).0, "lualatex");
+        assert_eq!(latex_invocation(&LatexEngine::Xelatex).0, "xelatex");
+
+        let external = LatexEngine::External {
+            command: "tectonic".to_string(),
+            arguments: Some(vec!["--keep-logs".to_string()]),
+        };
+        let (program, arguments) = latex_invocation(&external);
+        assert_eq!(program, "tectonic");
+        assert_eq!(arguments, vec!["--keep-logs".to_string()]);
+    }
+
+    /// Every engine must keep running past the first error, or the resolver
+    /// only learns about one missing file per compile.
+    #[test]
+    fn engines_do_not_halt_on_first_error() {
+        for engine in [
+            LatexEngine::Auto,
+            LatexEngine::Latexmk,
+            LatexEngine::Pdflatex,
+            LatexEngine::Lualatex,
+            LatexEngine::Xelatex,
+        ] {
+            let (_, arguments) = latex_invocation(&engine);
+            assert!(
+                arguments.iter().any(|a| a == "-interaction=nonstopmode"),
+                "{engine:?} should run nonstop"
+            );
+            assert!(
+                !arguments.iter().any(|a| a == "-halt-on-error"),
+                "{engine:?} should not halt on the first error"
+            );
+        }
+    }
+
+    /// An external command is the user's own toolchain and must be passed
+    /// through untouched -- no injected flags.
+    #[test]
+    fn external_engine_arguments_are_not_augmented() {
+        let (_, arguments) = latex_invocation(&LatexEngine::External {
+            command: "arara".to_string(),
+            arguments: None,
+        });
+        assert!(arguments.is_empty());
+    }
+
+    #[test]
+    fn compile_message_prefers_the_tex_error_line() {
+        let run = CompileRun {
+            success: false,
+            output: "This is pdfTeX, Version 3.141592653\n\
+                     entering extended mode\n\
+                     ! LaTeX Error: File `newtx.sty' not found.\n\
+                     Type X to quit\n"
+                .to_string(),
+        };
+        assert_eq!(run.message(), "! LaTeX Error: File `newtx.sty' not found.");
+    }
+
+    #[test]
+    fn compile_message_falls_back_when_tex_reported_nothing() {
+        let empty = CompileRun {
+            success: false,
+            output: "   \n".to_string(),
+        };
+        assert_eq!(empty.message(), "compiler reported no output");
+    }
+
+    /// Windows ships a self-extracting executable rather than an archive, so
+    /// provisioning has to branch on the asset's shape.
+    #[test]
+    fn tinytex_asset_matches_this_platform() {
+        let asset = tinytex_asset_name().expect("this platform has a TeX Live build");
+        assert!(asset.contains(TINYTEX_TAG));
+        if cfg!(windows) {
+            assert!(asset.ends_with(".exe"));
+        } else {
+            assert!(asset.ends_with(".tar.xz"));
+        }
+    }
+
+    /// An external command must never trigger provisioning: it is the user's
+    /// own toolchain, wherever it lives.
+    #[test]
+    fn external_engine_never_requests_a_download() {
+        let external = LatexEngine::External {
+            command: "tectonic".to_string(),
+            arguments: None,
+        };
+        assert_eq!(pending_download(Path::new("paper.tex"), &external), None);
+    }
+
+    /// Settings reach the store through `#[derive(RegisterSetting)]`, not an
+    /// explicit call at init, and `SettingsStore::get` *panics* on a type it
+    /// does not know. A missing derive therefore compiles cleanly and then
+    /// takes the app down the first time someone previews a document, so the
+    /// registration is pinned here rather than discovered at runtime.
+    ///
+    /// This also pins that `default.json` carries the key: `from_settings`
+    /// falls back to `Auto` silently, so a typo there would go unnoticed.
+    #[gpui::test]
+    fn settings_are_registered_and_default_to_auto(cx: &mut gpui::App) {
+        let store = settings::SettingsStore::new(cx, &settings::default_settings());
+        cx.set_global(store);
+        assert_eq!(
+            TypesetPreviewSettings::get_global(cx).latex_engine,
+            LatexEngine::Auto
+        );
+    }
+
+    /// Writes a document carrying the constraint that started all this:
+    /// AAAI's style opens with `\RequirePDFTeX`, so the document compiles
+    /// under pdfTeX and aborts under anything else. Reproducing just that
+    /// line keeps the fixture free of AAAI's own style files.
+    fn write_pdftex_only_document(directory: &Path) -> Result<String> {
+        std::fs::create_dir_all(directory)?;
+        let name = "pdftex-only.tex";
+        std::fs::write(
+            directory.join(name),
+            "\\documentclass{article}\n\
+             \\usepackage{iftex}\n\
+             \\RequirePDFTeX\n\
+             \\begin{document}\n\
+             Ink density saturates.\n\
+             \\end{document}\n",
+        )?;
+        Ok(name.to_string())
+    }
+
+    fn command_for(engine: &str, directory: &Path, file: String) -> Option<CompileCommand> {
+        let program = which::which(engine).ok()?;
+        let (_, mut arguments) = latex_invocation(&match engine {
+            "pdflatex" => LatexEngine::Pdflatex,
+            _ => LatexEngine::Xelatex,
+        });
+        arguments.push(file);
+        Some(CompileCommand {
+            program,
+            arguments,
+            working_directory: directory.to_path_buf(),
+            artifact: None,
+            path_prepend: None,
+            managed_texlive: None,
+        })
+    }
+
+    /// End-to-end against a real TeX installation, when one is present. This
+    /// is the regression that motivated making the engine configurable: the
+    /// same document must build under pdfTeX and fail under XeTeX, so an
+    /// engine chosen for the user silently decides whether their paper
+    /// previews at all.
+    #[test]
+    fn pdftex_only_document_builds_under_pdftex_and_fails_under_xetex() {
+        if which::which("pdflatex").is_err() || which::which("xelatex").is_err() {
+            // No TeX on this machine (CI); the unit tests above still pin the
+            // parsing and engine selection.
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "suzuri-typeset-{}-{}",
+            std::process::id(),
+            "pdftex-check"
+        ));
+        let file = write_pdftex_only_document(&directory).expect("writing the fixture");
+
+        let pdflatex = command_for("pdflatex", &directory, file.clone()).expect("pdflatex");
+        let run = futures::executor::block_on(run_once(&pdflatex)).expect("running pdflatex");
+        assert!(
+            run.success,
+            "pdfTeX should build a \\RequirePDFTeX document, got: {}",
+            run.message()
+        );
+
+        let xelatex = command_for("xelatex", &directory, file).expect("xelatex");
+        let run = futures::executor::block_on(run_once(&xelatex)).expect("running xelatex");
+        assert!(
+            !run.success,
+            "XeTeX must not build a \\RequirePDFTeX document"
+        );
+        assert!(
+            run.output.contains("pdfTeX is required"),
+            "the failure should name the cause, got: {}",
+            run.message()
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn only_previewable_files_can_request_a_download() {
+        assert_eq!(
+            pending_download(Path::new("notes.md"), &LatexEngine::Auto),
+            None
+        );
+        // HTML opens in a browser, which is never downloaded for the user.
+        assert_eq!(
+            pending_download(Path::new("page.html"), &LatexEngine::Auto),
+            None
+        );
+    }
 }

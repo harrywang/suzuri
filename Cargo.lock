@@ -19780,6 +19780,7 @@ dependencies = [
  "log",
  "paths",
  "project",
+ "settings",
  "sha2",
  "util",
  "which 6.0.3",

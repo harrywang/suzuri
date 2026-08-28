@@ -136,6 +136,26 @@
     // note's folder. An empty string stores attachments in the note's folder.
     "attachments_folder": "attachments",
   },
+  // Live Typst and LaTeX preview settings
+  "typeset_preview": {
+    // Which engine compiles .tex files.
+    //
+    // Conference templates routinely pin an engine -- AAAI and many IEEE
+    // styles call \RequirePDFTeX and refuse to build under anything else.
+    //
+    // 1. Use "latexmk" from the PATH, falling back to a managed TeX Live
+    //    that Suzuri downloads on first use:
+    //      "auto"
+    // 2. Drive latexmk, which picks the engine a document asks for:
+    //      "latexmk"
+    // 3. A specific engine. "lualatex" is what the LaTeX Project recommends
+    //    for new documents; "pdflatex" is what AAAI and IEEE require:
+    //      "pdflatex", "lualatex", "xelatex"
+    // 4. An external command, run in the document's directory with the file
+    //    name appended:
+    //      { "external": { "command": "tectonic", "arguments": [] } }
+    "latex_engine": "auto",
+  },
   // Determines the modifier to be used to add multiple cursors with the mouse. The open hover link mouse gestures will adapt such that it do not conflict with the multicursor modifier.
   //
   // 1. Maps to `Alt` on Linux and Windows and to `Option` on MacOS:
