@@ -228,7 +228,16 @@ fn begin_preview(
 
     let output = path.with_extension("pdf");
     let engine = TypesetPreviewSettings::get_global(cx).latex_engine.clone();
-    show_toast(workspace, "Compiling…", cx);
+    // Downloading a toolchain takes far longer than a compile, so saying
+    // "Compiling…" through it reads as a hang.
+    match pending_download(&path, &engine) {
+        Some(what) => show_toast(
+            workspace,
+            &format!("Installing {what}. This runs once and may take a minute…"),
+            cx,
+        ),
+        None => show_toast(workspace, "Compiling…", cx),
+    }
     let http = cx.http_client();
     let task = cx.background_spawn(async move { compile_document(&path, http, engine).await });
     cx.spawn_in(window, async move |workspace, cx| {
@@ -566,19 +575,24 @@ async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Resu
         // decompresses xz natively on macOS and Linux.
         let asset_name = format!("typst-{arch}-{os}.tar.xz");
         let (url, digest) = release_asset(&http, TYPST_REPOSITORY, TYPST_TAG, &asset_name).await?;
-        let bytes = fetch_verified(&http, &url, digest.as_deref()).await?;
         std::fs::create_dir_all(&destination)
             .with_context(|| format!("creating {destination:?}"))?;
-        let archive_path = destination.join(&asset_name);
-        std::fs::write(&archive_path, &bytes)
-            .with_context(|| format!("writing {archive_path:?}"))?;
+        let archive_directory = destination.join("archive");
+        let archive_path = fetch_to_file(
+            &http,
+            &url,
+            digest.as_deref(),
+            &archive_directory,
+            &asset_name,
+        )
+        .await?;
         let mut tar = util::command::new_command("tar");
         tar.args(["-xf"])
             .arg(&archive_path)
             .arg("-C")
             .arg(&destination);
         let extracted = run_extraction(&mut tar, &asset_name).await;
-        std::fs::remove_file(&archive_path).ok();
+        std::fs::remove_dir_all(&archive_directory).ok();
         extracted?;
     }
     anyhow::ensure!(
@@ -631,10 +645,16 @@ async fn ensure_tinytex(http: std::sync::Arc<dyn http_client::HttpClient>) -> Re
     let destination = tinytex_dir();
     let asset_name = tinytex_asset_name()?;
     let (url, digest) = release_asset(&http, TINYTEX_REPOSITORY, TINYTEX_TAG, &asset_name).await?;
-    let bytes = fetch_verified(&http, &url, digest.as_deref()).await?;
     std::fs::create_dir_all(&destination).with_context(|| format!("creating {destination:?}"))?;
-    let archive_path = destination.join(&asset_name);
-    std::fs::write(&archive_path, &bytes).with_context(|| format!("writing {archive_path:?}"))?;
+    let archive_directory = destination.join("archive");
+    let archive_path = fetch_to_file(
+        &http,
+        &url,
+        digest.as_deref(),
+        &archive_directory,
+        &asset_name,
+    )
+    .await?;
 
     let mut extractor = if asset_name.ends_with(".exe") {
         // A 7-Zip SFX: extracting it means running it. `-y` accepts the
@@ -655,7 +675,7 @@ async fn ensure_tinytex(http: std::sync::Arc<dyn http_client::HttpClient>) -> Re
         tar
     };
     let extracted = run_extraction(&mut extractor, &asset_name).await;
-    std::fs::remove_file(&archive_path).ok();
+    std::fs::remove_dir_all(&archive_directory).ok();
     extracted?;
 
     let bin = tinytex_installed()
@@ -744,36 +764,36 @@ async fn download_release_archive(
     .await
 }
 
-async fn fetch_verified(
+/// Downloads `url` into `directory/file_name`, returning the file's path.
+///
+/// This streams through the shared downloader rather than reading the body
+/// into memory: `read_to_end` on an `AsyncBody` stalls indefinitely on a
+/// large asset, which left the first preview sitting on "Compiling…" forever
+/// while a 67 MB archive never arrived. It also verifies the digest and
+/// stages the file, so a failed download cannot leave a partial archive
+/// behind for the extractor to choke on.
+async fn fetch_to_file(
     http: &std::sync::Arc<dyn http_client::HttpClient>,
     url: &str,
     digest: Option<&str>,
-) -> Result<Vec<u8>> {
-    use futures::AsyncReadExt as _;
-    let mut response = http
-        .get(url, Default::default(), true)
-        .await
-        .with_context(|| format!("downloading {url}"))?;
-    let mut bytes = Vec::new();
-    response
-        .body_mut()
-        .read_to_end(&mut bytes)
-        .await
-        .with_context(|| format!("reading {url}"))?;
-    anyhow::ensure!(
-        response.status().is_success(),
-        "download of {url} failed with {}",
-        response.status()
-    );
-    if let Some(expected) = digest {
-        use sha2::Digest as _;
-        let actual = format!("{:x}", sha2::Sha256::digest(&bytes));
-        anyhow::ensure!(
-            actual.eq_ignore_ascii_case(expected),
-            "sha256 mismatch for {url}: expected {expected}, got {actual}"
-        );
+    directory: &Path,
+    file_name: &str,
+) -> Result<PathBuf> {
+    if let Some(parent) = directory.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
     }
-    Ok(bytes)
+    http_client::github_download::download_server_raw_binary(
+        http.as_ref(),
+        url,
+        digest,
+        directory,
+        file_name,
+    )
+    .await
+    .with_context(|| format!("downloading {url}"))?;
+    let path = directory.join(file_name);
+    anyhow::ensure!(path.exists(), "download of {url} produced no {path:?}");
+    Ok(path)
 }
 
 struct CompileRun {
@@ -804,6 +824,9 @@ async fn run_once(command: &CompileCommand) -> Result<CompileRun> {
     if let Some(bin) = &command.path_prepend {
         process.env("PATH", prepended_path(bin));
     }
+    // TeX appends to this, so a stale copy would keep reporting fonts that
+    // have since been installed.
+    std::fs::remove_file(command.working_directory.join(MISSFONT_LOG)).ok();
     let output = process
         .output()
         .await
@@ -831,28 +854,55 @@ async fn compile_document(
     if let Some(artifact) = command.artifact.clone() {
         return run_until_artifact(command, artifact);
     }
-    let mut run = run_once(&command).await?;
-    if run.success {
-        return Ok(());
-    }
     // Only a TeX Live that Suzuri installed may be modified. A system one is
     // the user's, and installing into it would generally need root anyway.
-    let Some(bin) = command.managed_texlive.clone() else {
-        bail!("{}", run.message());
-    };
+    let managed = command.managed_texlive.clone();
+    let mut run = run_once(&command).await?;
     for _ in 0..MAX_RESOLVE_ROUNDS {
-        let missing = missing_files(&run.output);
-        if missing.is_empty() || !install_missing_packages(&bin, &missing).await {
+        let mut missing = missing_files(&run.output);
+        missing.extend(missing_fonts(&command.working_directory));
+        missing.sort();
+        missing.dedup();
+        // A run that succeeded but is still missing a font produced a PDF
+        // typeset in the wrong one, so success alone is not a stopping
+        // condition -- only having nothing left to resolve is.
+        if missing.is_empty() {
+            break;
+        }
+        let Some(bin) = &managed else { break };
+        if !install_missing_packages(bin, &missing).await {
             break;
         }
         clear_latexmk_state(&command);
         run = run_once(&command).await?;
-        if run.success {
-            return Ok(());
-        }
     }
-    bail!("{}", run.message());
+    if run.success {
+        Ok(())
+    } else {
+        bail!("{}", run.message())
+    }
 }
+
+/// Fonts TeX could not find. When `mktextfm` is on the PATH, a missing metric
+/// is not an error in the log at all: TeX defers to it, records the request in
+/// `missfont.log`, and exits successfully having typeset the document in a
+/// substituted font. That silent path is the one that actually happens, so it
+/// has to be read from the file rather than the compiler's output.
+fn missing_fonts(working_directory: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(working_directory.join(MISSFONT_LOG)) else {
+        return Vec::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| {
+            // `mktextfm pcrr8t`, or `mktexpk --mfmode ... --dpi 600 pcrr8t`.
+            let name = line.split_whitespace().last()?;
+            (!name.is_empty() && !name.starts_with('-')).then(|| format!("{name}.tfm"))
+        })
+        .collect()
+}
+
+const MISSFONT_LOG: &str = "missfont.log";
 
 /// `latexmk` remembers a failed run and then reports "Nothing to do" on every
 /// retry, so its state has to go before recompiling.
@@ -1090,6 +1140,36 @@ mod tests {
             missing_files(output),
             vec!["pcrr8t.tfm".to_string(), "ts1-qtmr.tfm".to_string()]
         );
+    }
+
+    /// The failure that actually happens in the field: with `mktextfm`
+    /// available, TeX does not report a missing metric as an error at all. It
+    /// writes the request here, exits 0, and hands back a PDF typeset in a
+    /// substituted font -- so this file is the only evidence.
+    #[test]
+    fn missing_fonts_are_read_from_missfont_log() {
+        let directory =
+            std::env::temp_dir().join(format!("suzuri-missfont-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        std::fs::write(
+            directory.join(MISSFONT_LOG),
+            "mktextfm pcrr8t\nmktexpk --mfmode ljfour --dpi 600 ptmr8t\n",
+        )
+        .expect("writing missfont.log");
+
+        assert_eq!(
+            missing_fonts(&directory),
+            vec!["pcrr8t.tfm".to_string(), "ptmr8t.tfm".to_string()]
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn missing_fonts_is_empty_without_a_missfont_log() {
+        let directory = std::env::temp_dir().join(format!("suzuri-nomiss-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("temp dir");
+        assert!(missing_fonts(&directory).is_empty());
+        std::fs::remove_dir_all(&directory).ok();
     }
 
     #[test]
