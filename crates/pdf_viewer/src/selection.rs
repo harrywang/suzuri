@@ -1,10 +1,10 @@
 use gpui::{
-    div, px, AnyElement, ClipboardItem, Context, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Styled, Window,
+    AnyElement, ClipboardItem, Context, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Styled, Window, div, px,
 };
 
 use super::pdf_renderer;
-use super::{CopyDocumentText, PdfViewer, TextPosition, PAGE_GAP_PX};
+use super::{CopyDocumentText, PAGE_GAP_PX, PdfViewer, TextPosition};
 
 impl PdfViewer {
     pub(crate) fn extract_all_text(&mut self, cx: &mut Context<Self>) {
@@ -29,7 +29,8 @@ impl PdfViewer {
 
         let pdf_bytes = self.pdf_item.read(cx).pdf_bytes().clone();
 
-        let (sender, receiver) = smol::channel::unbounded::<(usize, pdf_renderer::PageTextLayout)>();
+        let (sender, receiver) =
+            smol::channel::unbounded::<(usize, pdf_renderer::PageTextLayout)>();
 
         if let Err(error) = std::thread::Builder::new()
             .name("pdf-text-extractor".into())
@@ -178,7 +179,9 @@ impl PdfViewer {
 
         let container_width: f32 = {
             let w: f32 = bounds.size.width.into();
-            if w > 0.0 { w } else {
+            if w > 0.0 {
+                w
+            } else {
                 log::debug!("pdf_viewer: hit test — container_width=0");
                 return None;
             }
@@ -210,13 +213,17 @@ impl PdfViewer {
              scroll_y={:.0} content_y={:.0} centering_pad={:.0} content_y_adjusted={:.0} \
              container_width={:.0} viewport_height={:.0} total_content_h={:.0} \
              text_layouts_count={} zoom={:.2}",
-            window_x, window_y,
-            bounds_origin_x, bounds_origin_y,
+            window_x,
+            window_y,
+            bounds_origin_x,
+            bounds_origin_y,
             scroll_offset_y,
             content_y,
             centering_pad,
             content_y_adjusted,
-            container_width, viewport_height, total_content_h,
+            container_width,
+            viewport_height,
+            total_content_h,
             self.text_layouts.len(),
             self.zoom_level,
         );
@@ -244,7 +251,8 @@ impl PdfViewer {
             if content_y_adjusted < accumulated_y {
                 log::debug!(
                     "pdf_viewer: hit test — in gap between pages {} and {}",
-                    index + 1, index + 2
+                    index + 1,
+                    index + 2
                 );
                 return None;
             }
@@ -276,17 +284,22 @@ impl PdfViewer {
             "pdf_viewer: hit test — page {} (dim={:.0}x{:.0}) fit_scale={:.3} scale={:.3} \
              page_display_width={:.0} page_left={:.0} pan_x={:.0} content_x={:.0} page_local_y={:.0}",
             page_index + 1,
-            page_dim.width, page_dim.height,
-            fit_scale, scale,
-            page_display_width, page_left_in_container,
+            page_dim.width,
+            page_dim.height,
+            fit_scale,
+            scale,
+            page_display_width,
+            page_left_in_container,
             pan_x_f32,
-            content_x, page_local_y,
+            content_x,
+            page_local_y,
         );
 
         if content_x < 0.0 || content_x > page_display_width {
             log::debug!(
                 "pdf_viewer: hit test — outside page horizontally (content_x={:.0}, page_width={:.0})",
-                content_x, page_display_width
+                content_x,
+                page_display_width
             );
             return None;
         }
@@ -296,7 +309,8 @@ impl PdfViewer {
 
         log::debug!(
             "pdf_viewer: hit test — pdf coords ({:.1}, {:.1})",
-            pdf_x, pdf_y
+            pdf_x,
+            pdf_y
         );
 
         let layout = match self.text_layouts.get(&page_index) {
@@ -322,7 +336,12 @@ impl PdfViewer {
                 if let Some(glyph) = layout.glyphs.get(idx) {
                     log::debug!(
                         "pdf_viewer: hit test — matched glyph {} '{}' at ({:.1},{:.1}) w={:.1} fs={:.1}",
-                        idx, glyph.character, glyph.x, glyph.y, glyph.width, glyph.font_size
+                        idx,
+                        glyph.character,
+                        glyph.x,
+                        glyph.y,
+                        glyph.width,
+                        glyph.font_size
                     );
                 }
                 idx
@@ -486,9 +505,12 @@ impl PdfViewer {
                     log::debug!(
                         "pdf_viewer: first highlight glyph '{}' — pdf({:.1},{:.1}) display({:.0},{:.0}) size({:.0}x{:.0})",
                         glyph.character,
-                        glyph.x, glyph.y,
-                        display_x, display_y,
-                        display_width, display_height,
+                        glyph.x,
+                        glyph.y,
+                        display_x,
+                        display_y,
+                        display_width,
+                        display_height,
                     );
                 }
 

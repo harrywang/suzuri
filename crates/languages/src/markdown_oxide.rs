@@ -74,13 +74,8 @@ impl LspInstaller for MarkdownOxideLspAdapter {
         _: &mut AsyncApp,
     ) -> Result<GitHubLspBinaryVersion> {
         let release =
-            get_release_by_tag_name(REPOSITORY, PINNED_RELEASE_TAG, delegate.http_client())
-                .await?;
-        let asset_name = format!(
-            "{}.{}",
-            Self::asset_stem()?,
-            Self::asset_kind_extension()
-        );
+            get_release_by_tag_name(REPOSITORY, PINNED_RELEASE_TAG, delegate.http_client()).await?;
+        let asset_name = format!("{}.{}", Self::asset_stem()?, Self::asset_kind_extension());
         let asset = release
             .assets
             .iter()
@@ -260,9 +255,7 @@ mod tests {
         );
         let binary = MarkdownOxideLspAdapter::binary_in(std::path::Path::new("dir"));
         assert!(
-            binary
-                .to_string_lossy()
-                .starts_with("dir/markdown-oxide")
+            binary.to_string_lossy().starts_with("dir/markdown-oxide")
                 || binary.to_string_lossy().starts_with("dir\\markdown-oxide"),
             "{binary:?}"
         );

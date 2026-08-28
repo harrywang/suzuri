@@ -26,17 +26,16 @@ use std::time::Duration;
 
 use file_icons::FileIcons;
 use gpui::{
-    actions, div, img, point, px, AnyElement, App, Context, CursorStyle, Entity,
-    EventEmitter, FocusHandle, Focusable, Font, IntoElement, MouseButton,
-    ParentElement, Pixels, Point, RenderImage, Render, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, Styled, Task, Window,
+    AnyElement, App, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, Font,
+    IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
+    ScrollHandle, ScrollWheelEvent, SharedString, Styled, Task, Window, actions, div, img, point,
+    px,
 };
 use project::Project;
-use ui::prelude::*;
 use ui::WithScrollbar;
+use ui::prelude::*;
 use workspace::{
-    Pane, ToolbarItemLocation,
-    WorkspaceId,
+    Pane, ToolbarItemLocation, WorkspaceId,
     invalid_item_view::InvalidItemView,
     item::{HighlightedText, Item, ProjectItem, TabContentParams},
 };
@@ -156,11 +155,12 @@ impl PdfViewer {
         // Live-preview loop: the item reloads itself when the file changes
         // on disk (e.g. a Typst/LaTeX recompile); rebuild rendering state
         // but keep zoom and scroll so the document doesn't jump.
-        cx.subscribe(pdf_item, |this, _, event: &pdf_item::PdfItemEvent, cx| {
-            match event {
+        cx.subscribe(
+            pdf_item,
+            |this, _, event: &pdf_item::PdfItemEvent, cx| match event {
                 pdf_item::PdfItemEvent::Reloaded => this.reload_document(cx),
-            }
-        })
+            },
+        )
         .detach();
         // Free the sprite-atlas tiles of every page still displayed when the
         // tab closes. Dropping the view frees the CPU bitmaps, but a
@@ -493,9 +493,7 @@ impl PdfViewer {
                 let pdf = match pdf_renderer::open_pdf(&pdf_bytes) {
                     Ok(pdf) => pdf,
                     Err(error) => {
-                        log::error!(
-                            "pdf_viewer: failed to open PDF for rendering: {error:#}"
-                        );
+                        log::error!("pdf_viewer: failed to open PDF for rendering: {error:#}");
                         return;
                     }
                 };
@@ -505,12 +503,7 @@ impl PdfViewer {
                         break;
                     }
                     log::debug!("pdf_viewer: rendering page {}...", page_index + 1);
-                    match pdf_renderer::render_single_page(
-                        &pdf,
-                        page_index,
-                        render_scale,
-                        WHITE,
-                    ) {
+                    match pdf_renderer::render_single_page(&pdf, page_index, render_scale, WHITE) {
                         Ok(rendered) => {
                             log::debug!(
                                 "pdf_viewer: page {} rendered ({}x{})",
@@ -627,10 +620,8 @@ impl PdfViewer {
                 let bounds = self.scroll_handle.bounds();
                 let offset = self.scroll_handle.offset();
 
-                let cursor_in_container = point(
-                    cursor.x - bounds.origin.x,
-                    cursor.y - bounds.origin.y,
-                );
+                let cursor_in_container =
+                    point(cursor.x - bounds.origin.x, cursor.y - bounds.origin.y);
 
                 let content_x = cursor_in_container.x - offset.x;
                 let content_y = cursor_in_container.y - offset.y;
@@ -746,10 +737,7 @@ impl Render for PdfViewer {
             let container_width = if container_width > 0.0 {
                 container_width
             } else {
-                dimensions
-                    .iter()
-                    .map(|d| d.width)
-                    .fold(0.0_f32, f32::max)
+                dimensions.iter().map(|d| d.width).fold(0.0_f32, f32::max)
             };
 
             // When all pages fit inside the viewport, centre them vertically
@@ -850,15 +838,9 @@ impl Render for PdfViewer {
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(Self::handle_mouse_down),
-                    )
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
                     .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(Self::handle_mouse_up),
-                    )
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
                     .cursor(CursorStyle::IBeam)
                     .child(content)
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),

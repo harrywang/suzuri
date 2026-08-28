@@ -86,8 +86,8 @@ pub use block_map::{
 };
 pub use crease_map::*;
 pub use fold_map::{
-    Concealment,
-    ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldPlaceholder, FoldPoint,
+    ChunkRenderer, ChunkRendererContext, ChunkRendererId, Concealment, Fold, FoldId,
+    FoldPlaceholder, FoldPoint,
 };
 pub use inlay_map::{InlayOffset, InlayPoint};
 use invisibles::is_standalone_grapheme;
@@ -817,7 +817,8 @@ impl DisplayMap {
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
 
-        self.block_map.write(new_wrap_snapshot, new_wrap_edits, None);
+        self.block_map
+            .write(new_wrap_snapshot, new_wrap_edits, None);
     }
 
     /// Removes any folds with the given ranges.

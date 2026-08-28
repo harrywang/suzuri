@@ -88,10 +88,7 @@ impl ProjectItem for PdfItem {
         }
 
         let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
-        let abs_path = worktree
-            .read(cx)
-            .abs_path()
-            .join(path.path.as_std_path());
+        let abs_path = worktree.read(cx).abs_path().join(path.path.as_std_path());
         let project_path = path.clone();
         let project = project.clone();
         let background = cx.background_executor().clone();

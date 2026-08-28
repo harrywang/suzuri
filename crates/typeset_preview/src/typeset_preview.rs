@@ -65,7 +65,6 @@ fn typesetter_for(path: &Path) -> Option<Typesetter> {
     }
 }
 
-
 pub fn init(cx: &mut App) {
     cx.set_global(LiveCompileRegistry::default());
 
@@ -232,11 +231,7 @@ fn open_pdf_in_split(
         return;
     }
 
-    let Some(project_path) = workspace
-        .project()
-        .read(cx)
-        .find_project_path(output, cx)
-    else {
+    let Some(project_path) = workspace.project().read(cx).find_project_path(output, cx) else {
         show_toast(
             workspace,
             "Compiled PDF is outside the project, open it manually.",
@@ -276,7 +271,9 @@ fn compile(path: PathBuf, workspace: Option<Entity<Workspace>>, cx: &mut Context
             })
             .await;
         cx.update(|cx| {
-            cx.global_mut::<LiveCompileRegistry>().in_flight.remove(&path);
+            cx.global_mut::<LiveCompileRegistry>()
+                .in_flight
+                .remove(&path);
             if let Some(workspace) = workspace {
                 workspace.update(cx, |workspace, cx| match &result {
                     Ok(()) => dismiss_toast(workspace, cx),
@@ -354,17 +351,13 @@ fn typst_asset_stem() -> Result<String> {
 /// "Downloading …" before the user waits on it.
 fn pending_download_name(path: &Path) -> Option<&'static str> {
     match typesetter_for(path)? {
-        Typesetter::Typst => {
-            (which::which("typst").is_err()
-                && !provisioned_binary("typst").ok()?.exists())
-            .then_some("the Typst compiler")
-        }
-        Typesetter::Latex => {
-            (which::which("tectonic").is_err()
-                && which::which("latexmk").is_err()
-                && !provisioned_binary("tectonic").ok()?.exists())
-            .then_some("the Tectonic LaTeX compiler")
-        }
+        Typesetter::Typst => (which::which("typst").is_err()
+            && !provisioned_binary("typst").ok()?.exists())
+        .then_some("the Typst compiler"),
+        Typesetter::Latex => (which::which("tectonic").is_err()
+            && which::which("latexmk").is_err()
+            && !provisioned_binary("tectonic").ok()?.exists())
+        .then_some("the Tectonic LaTeX compiler"),
         // Browsers are never downloaded on the user's behalf.
         Typesetter::Html => None,
     }
@@ -459,8 +452,7 @@ async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Resu
         // doesn't handle; fetch and hand it to the system tar, which
         // decompresses xz natively on macOS and Linux.
         let asset_name = format!("typst-{arch}-{os}.tar.xz");
-        let (url, digest) =
-            release_asset(&http, TYPST_REPOSITORY, TYPST_TAG, &asset_name).await?;
+        let (url, digest) = release_asset(&http, TYPST_REPOSITORY, TYPST_TAG, &asset_name).await?;
         let bytes = fetch_verified(&http, &url, digest.as_deref()).await?;
         std::fs::create_dir_all(&destination)
             .with_context(|| format!("creating {destination:?}"))?;
@@ -503,8 +495,15 @@ async fn ensure_tectonic(http: std::sync::Arc<dyn http_client::HttpClient>) -> R
             http_client::github::AssetKind::TarGz,
         )
     };
-    download_release_archive(&http, TECTONIC_REPOSITORY, TECTONIC_TAG, &asset_name, &destination, kind)
-        .await?;
+    download_release_archive(
+        &http,
+        TECTONIC_REPOSITORY,
+        TECTONIC_TAG,
+        &asset_name,
+        &destination,
+        kind,
+    )
+    .await?;
     anyhow::ensure!(
         binary.exists(),
         "downloaded tectonic archive did not contain {binary:?}"
@@ -528,9 +527,10 @@ async fn release_asset(
         .with_context(|| format!("no release asset named {asset_name:?}"))?;
     // The GitHub API returns digests as `sha256:<hex>`; the comparison side
     // wants bare hex.
-    let digest = asset.digest.as_deref().map(|digest| {
-        digest.strip_prefix("sha256:").unwrap_or(digest).to_string()
-    });
+    let digest = asset
+        .digest
+        .as_deref()
+        .map(|digest| digest.strip_prefix("sha256:").unwrap_or(digest).to_string());
     Ok((asset.browser_download_url.clone(), digest))
 }
 
@@ -641,7 +641,12 @@ fn run_until_artifact(command: CompileCommand, artifact: PathBuf) -> Result<()> 
             // Two equal readings mean the write has settled.
             Some(size) if size > 0 && last_size == Some(size) => break Ok(()),
             Some(size) => last_size = Some(size),
-            None if exited => break Err(anyhow::anyhow!("{} wrote no output", command.program.display())),
+            None if exited => {
+                break Err(anyhow::anyhow!(
+                    "{} wrote no output",
+                    command.program.display()
+                ));
+            }
             None => {}
         }
         if started.elapsed() > Duration::from_secs(60) {

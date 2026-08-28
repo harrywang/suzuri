@@ -4,6 +4,7 @@ use super::{
     Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
+use collections::HashMap;
 use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Stateful, Window};
 use language::{Edit, HighlightId, LanguageAwareStyling, Point};
 use multi_buffer::{
@@ -19,7 +20,6 @@ use std::{
     sync::Arc,
     usize,
 };
-use collections::HashMap;
 use sum_tree::{Bias, Cursor, Dimensions, FilterCursor, SumTree, Summary, TreeMap};
 use ui::IntoElement as _;
 use util::post_inc;
@@ -411,8 +411,9 @@ impl FoldMapWriter<'_> {
                         self.0.snapshot.fold_metadata_by_id.remove(&old.id);
                         self.0.concealment_content_keys.remove(&old.id);
                     }
-                    let fold_range =
-                        FoldRange(buffer.anchor_after(range.start)..buffer.anchor_before(range.end));
+                    let fold_range = FoldRange(
+                        buffer.anchor_after(range.start)..buffer.anchor_before(range.end),
+                    );
                     if buffer
                         .anchor_range_to_buffer_anchor_range(fold_range.0.clone())
                         .is_none()
@@ -435,8 +436,8 @@ impl FoldMapWriter<'_> {
                         range: fold_range,
                         placeholder: concealment.placeholder,
                     });
-                    let inlay_range = snapshot.to_inlay_offset(range.start)
-                        ..snapshot.to_inlay_offset(range.end);
+                    let inlay_range =
+                        snapshot.to_inlay_offset(range.start)..snapshot.to_inlay_offset(range.end);
                     edits.push(InlayEdit {
                         old: inlay_range.clone(),
                         new: inlay_range,
@@ -451,8 +452,7 @@ impl FoldMapWriter<'_> {
             self.0.snapshot.fold_metadata_by_id.remove(&old.id);
             self.0.concealment_content_keys.remove(&old.id);
             if end > start {
-                let inlay_range =
-                    snapshot.to_inlay_offset(start)..snapshot.to_inlay_offset(end);
+                let inlay_range = snapshot.to_inlay_offset(start)..snapshot.to_inlay_offset(end);
                 edits.push(InlayEdit {
                     old: inlay_range.clone(),
                     new: inlay_range,
@@ -460,8 +460,7 @@ impl FoldMapWriter<'_> {
             }
         }
 
-        new_items
-            .sort_unstable_by(|a, b| sum_tree::SeekTarget::cmp(&a.range, &b.range, &buffer));
+        new_items.sort_unstable_by(|a, b| sum_tree::SeekTarget::cmp(&a.range, &b.range, &buffer));
         let mut tree = SumTree::new(&buffer);
         for item in new_items {
             tree.push(item, &buffer);
@@ -646,18 +645,17 @@ impl FoldMap {
                     let inlay_snapshot = &inlay_snapshot;
                     move || {
                         // Merge real folds and concealments in range order.
-                        let next_is_fold =
-                            match (folds_cursor.item(), concealments_cursor.item()) {
-                                (Some(fold), Some(concealment)) => sum_tree::SeekTarget::cmp(
-                                    &fold.range,
-                                    &concealment.range,
-                                    &inlay_snapshot.buffer,
-                                )
-                                .is_le(),
-                                (Some(_), None) => true,
-                                (None, Some(_)) => false,
-                                (None, None) => true,
-                            };
+                        let next_is_fold = match (folds_cursor.item(), concealments_cursor.item()) {
+                            (Some(fold), Some(concealment)) => sum_tree::SeekTarget::cmp(
+                                &fold.range,
+                                &concealment.range,
+                                &inlay_snapshot.buffer,
+                            )
+                            .is_le(),
+                            (Some(_), None) => true,
+                            (None, Some(_)) => false,
+                            (None, None) => true,
+                        };
                         let active_cursor = if next_is_fold {
                             &mut folds_cursor
                         } else {
@@ -688,15 +686,12 @@ impl FoldMap {
 
                     assert!(fold_range.start.0 >= sum.input.len);
 
-                    while folds
-                        .peek()
-                        .is_some_and(|(next_fold, next_fold_range, _)| {
-                            next_fold_range.start < fold_range.end
-                                || (next_fold_range.start == fold_range.end
-                                    && fold.placeholder.merge_adjacent
-                                    && next_fold.placeholder.merge_adjacent)
-                        })
-                    {
+                    while folds.peek().is_some_and(|(next_fold, next_fold_range, _)| {
+                        next_fold_range.start < fold_range.end
+                            || (next_fold_range.start == fold_range.end
+                                && fold.placeholder.merge_adjacent
+                                && next_fold.placeholder.merge_adjacent)
+                    }) {
                         let (_, next_fold_range, next_is_concealment) = folds.next().unwrap();
                         // A region containing a real fold is a fold.
                         is_concealment &= next_is_concealment;

@@ -3,9 +3,8 @@ use gpui::Pixels;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{
-    DockSide, IntoGpui, ProjectPanelEntrySpacing, ProjectPanelSortDirection,
-    ProjectPanelSortMode, ProjectPanelSortOrder, RegisterSetting, Settings, ShowDiagnostics,
-    ShowIndentGuides,
+    DockSide, IntoGpui, ProjectPanelEntrySpacing, ProjectPanelSortDirection, ProjectPanelSortMode,
+    ProjectPanelSortOrder, RegisterSetting, Settings, ShowDiagnostics, ShowIndentGuides,
 };
 use ui::scrollbars::{ScrollbarVisibility, ShowScrollbar};
 

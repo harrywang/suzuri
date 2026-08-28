@@ -3,9 +3,7 @@ use ui::prelude::*;
 use ui::{IconButton, IconName, IconSize, Tooltip};
 use workspace::{ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView, item::ItemHandle};
 
-use super::{
-    CopyDocumentText, FitToView, PdfViewer, ResetZoom, ZoomIn, ZoomOut,
-};
+use super::{CopyDocumentText, FitToView, PdfViewer, ResetZoom, ZoomIn, ZoomOut};
 
 pub struct PdfViewToolbarControls {
     pdf_view: Option<WeakEntity<PdfViewer>>,

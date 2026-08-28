@@ -4,8 +4,7 @@ use std::time::Instant;
 
 #[test]
 fn dump_real_pdf_glyphs() {
-    let pdf_path =
-        std::env::var("PDF_DUMP_PATH").expect("set PDF_DUMP_PATH to a PDF file path");
+    let pdf_path = std::env::var("PDF_DUMP_PATH").expect("set PDF_DUMP_PATH to a PDF file path");
     let pdf_bytes = std::fs::read(&pdf_path).expect("Failed to read PDF file");
     let pdf = open_pdf(&pdf_bytes).expect("Failed to open PDF");
     let layout = extract_page_text(&pdf, 0).expect("Failed to extract text");
@@ -48,8 +47,7 @@ fn dump_real_pdf_glyphs() {
 
 #[test]
 fn bench_render_phases() {
-    let pdf_path =
-        std::env::var("PDF_BENCH_PATH").expect("set PDF_BENCH_PATH to a PDF file path");
+    let pdf_path = std::env::var("PDF_BENCH_PATH").expect("set PDF_BENCH_PATH to a PDF file path");
     let scale = std::env::var("PDF_BENCH_SCALE")
         .ok()
         .and_then(|s| s.parse::<f32>().ok())

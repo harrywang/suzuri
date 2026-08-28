@@ -2539,7 +2539,6 @@ impl settings::Settings for MarkdownAttachmentSettings {
     }
 }
 
-
 /// Inserts block-level markdown at the cursor, padded with blank lines so it
 /// cannot fuse with its neighbors: a following `---` would otherwise turn an
 /// inserted link line into a setext heading underline, and a preceding text
@@ -2713,8 +2712,7 @@ pub fn paste_clipboard_image(editor: &Editor, cx: &mut App) -> bool {
 
 /// `pasted-image-YYYYMMDD-HHMMSS`, local time when determinable.
 fn pasted_image_stem() -> String {
-    let now = time::OffsetDateTime::now_local()
-        .unwrap_or_else(|_| time::OffsetDateTime::now_utc());
+    let now = time::OffsetDateTime::now_local().unwrap_or_else(|_| time::OffsetDateTime::now_utc());
     format!(
         "pasted-image-{:04}{:02}{:02}-{:02}{:02}{:02}",
         now.year(),
@@ -2768,7 +2766,6 @@ fn handle_image_drop_on_markdown(
     paths: &[std::path::PathBuf],
     cx: &mut App,
 ) -> bool {
-
     let Some(buffer) = editor.buffer().read(cx).as_singleton() else {
         return false;
     };

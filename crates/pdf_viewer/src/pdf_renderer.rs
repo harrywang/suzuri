@@ -22,7 +22,6 @@ const SAME_LINE_THRESHOLD: f32 = 0.8;
 // that position words without explicit space glyphs.
 const SPACE_DIST: f32 = 0.15;
 
-
 /// Dimensions of a single PDF page in PDF points (1/72 inch).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PageDimensions {
@@ -194,8 +193,7 @@ impl PageTextLayout {
             if index > 0 {
                 let previous = &slice[index - 1];
                 let size = previous.font_size.max(glyph.font_size).max(1.0);
-                let same_line =
-                    (glyph.y - previous.y).abs() / size < SAME_LINE_THRESHOLD;
+                let same_line = (glyph.y - previous.y).abs() / size < SAME_LINE_THRESHOLD;
 
                 if same_line {
                     // Same line — insert a synthetic space for large
@@ -304,8 +302,6 @@ pub fn render_single_page(
     })
 }
 
-
-
 #[cfg(all(test, feature = "test-bench"))]
 #[path = "pdf_renderer_bench.rs"]
 mod pdf_renderer_bench;
@@ -351,7 +347,9 @@ mod tests {
         );
 
         let obj4_offset = pdf.len();
-        pdf.extend_from_slice(format!("4 0 obj\n<< /Length {stream_length} >>\nstream\n").as_bytes());
+        pdf.extend_from_slice(
+            format!("4 0 obj\n<< /Length {stream_length} >>\nstream\n").as_bytes(),
+        );
         pdf.extend_from_slice(stream_bytes);
         pdf.extend_from_slice(b"\nendstream\nendobj\n\n");
 
@@ -363,7 +361,13 @@ mod tests {
         let xref_offset = pdf.len();
         pdf.extend_from_slice(b"xref\n0 6\n");
         pdf.extend_from_slice(format!("{:010} 65535 f \n", 0).as_bytes());
-        for offset in [obj1_offset, obj2_offset, obj3_offset, obj4_offset, obj5_offset] {
+        for offset in [
+            obj1_offset,
+            obj2_offset,
+            obj3_offset,
+            obj4_offset,
+            obj5_offset,
+        ] {
             pdf.extend_from_slice(format!("{:010} 00000 n \n", offset).as_bytes());
         }
 
@@ -386,10 +390,7 @@ mod tests {
 
     #[test]
     fn text_extraction_multiple_lines() {
-        let pdf_bytes = build_pdf(&[
-            (72.0, 720.0, "First line"),
-            (72.0, 706.0, "Second line"),
-        ]);
+        let pdf_bytes = build_pdf(&[(72.0, 720.0, "First line"), (72.0, 706.0, "Second line")]);
         let pdf = open_pdf(&pdf_bytes).expect("Failed to open PDF");
         let layout = extract_page_text(&pdf, 0).expect("Failed to extract text");
 
@@ -474,10 +475,7 @@ mod tests {
     fn untagged_pdf_joins_lines() {
         // Without structure tags, different lines are joined with spaces
         // regardless of gap size (no heuristic paragraph detection).
-        let pdf_bytes = build_pdf(&[
-            (72.0, 720.0, "Heading"),
-            (72.0, 690.0, "Body text"),
-        ]);
+        let pdf_bytes = build_pdf(&[(72.0, 720.0, "Heading"), (72.0, 690.0, "Body text")]);
         let pdf = open_pdf(&pdf_bytes).expect("Failed to open PDF");
         let layout = extract_page_text(&pdf, 0).expect("Failed to extract text");
 
@@ -500,6 +498,4 @@ mod tests {
         let index = layout.glyph_index_at_point(hit_x, hit_y);
         assert_eq!(index, Some(1), "Expected to hit glyph 'B' at index 1");
     }
-
-
 }

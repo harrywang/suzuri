@@ -1920,10 +1920,7 @@ impl ProjectPanel {
                 cx.spawn_in(window, async move |_, cx| {
                     if open.await.log_err().is_some() {
                         cx.update(|window, cx| {
-                            window.dispatch_action(
-                                Box::new(typeset_preview::OpenLivePreview),
-                                cx,
-                            );
+                            window.dispatch_action(Box::new(typeset_preview::OpenLivePreview), cx);
                         })
                         .ok();
                     }
