@@ -1218,6 +1218,102 @@ mod tests {
         assert_eq!(pending_download(Path::new("paper.tex"), &external), None);
     }
 
+    /// Settings reach the store through `#[derive(RegisterSetting)]`, not an
+    /// explicit call at init, and `SettingsStore::get` *panics* on a type it
+    /// does not know. A missing derive therefore compiles cleanly and then
+    /// takes the app down the first time someone previews a document, so the
+    /// registration is pinned here rather than discovered at runtime.
+    ///
+    /// This also pins that `default.json` carries the key: `from_settings`
+    /// falls back to `Auto` silently, so a typo there would go unnoticed.
+    #[gpui::test]
+    fn settings_are_registered_and_default_to_auto(cx: &mut gpui::App) {
+        let store = settings::SettingsStore::new(cx, &settings::default_settings());
+        cx.set_global(store);
+        assert_eq!(
+            TypesetPreviewSettings::get_global(cx).latex_engine,
+            LatexEngine::Auto
+        );
+    }
+
+    /// Writes a document carrying the constraint that started all this:
+    /// AAAI's style opens with `\RequirePDFTeX`, so the document compiles
+    /// under pdfTeX and aborts under anything else. Reproducing just that
+    /// line keeps the fixture free of AAAI's own style files.
+    fn write_pdftex_only_document(directory: &Path) -> Result<String> {
+        std::fs::create_dir_all(directory)?;
+        let name = "pdftex-only.tex";
+        std::fs::write(
+            directory.join(name),
+            "\\documentclass{article}\n\
+             \\usepackage{iftex}\n\
+             \\RequirePDFTeX\n\
+             \\begin{document}\n\
+             Ink density saturates.\n\
+             \\end{document}\n",
+        )?;
+        Ok(name.to_string())
+    }
+
+    fn command_for(engine: &str, directory: &Path, file: String) -> Option<CompileCommand> {
+        let program = which::which(engine).ok()?;
+        let (_, mut arguments) = latex_invocation(&match engine {
+            "pdflatex" => LatexEngine::Pdflatex,
+            _ => LatexEngine::Xelatex,
+        });
+        arguments.push(file);
+        Some(CompileCommand {
+            program,
+            arguments,
+            working_directory: directory.to_path_buf(),
+            artifact: None,
+            path_prepend: None,
+            managed_texlive: None,
+        })
+    }
+
+    /// End-to-end against a real TeX installation, when one is present. This
+    /// is the regression that motivated making the engine configurable: the
+    /// same document must build under pdfTeX and fail under XeTeX, so an
+    /// engine chosen for the user silently decides whether their paper
+    /// previews at all.
+    #[test]
+    fn pdftex_only_document_builds_under_pdftex_and_fails_under_xetex() {
+        if which::which("pdflatex").is_err() || which::which("xelatex").is_err() {
+            // No TeX on this machine (CI); the unit tests above still pin the
+            // parsing and engine selection.
+            return;
+        }
+        let directory = std::env::temp_dir().join(format!(
+            "suzuri-typeset-{}-{}",
+            std::process::id(),
+            "pdftex-check"
+        ));
+        let file = write_pdftex_only_document(&directory).expect("writing the fixture");
+
+        let pdflatex = command_for("pdflatex", &directory, file.clone()).expect("pdflatex");
+        let run = futures::executor::block_on(run_once(&pdflatex)).expect("running pdflatex");
+        assert!(
+            run.success,
+            "pdfTeX should build a \\RequirePDFTeX document, got: {}",
+            run.message()
+        );
+
+        let xelatex = command_for("xelatex", &directory, file).expect("xelatex");
+        let run = futures::executor::block_on(run_once(&xelatex)).expect("running xelatex");
+        assert!(
+            !run.success,
+            "XeTeX must not build a \\RequirePDFTeX document"
+        );
+        assert!(
+            run.output.contains("pdfTeX is required"),
+            "the failure should name the cause, got: {}",
+            run.message()
+        );
+
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
     #[test]
     fn only_previewable_files_can_request_a_download() {
         assert_eq!(
