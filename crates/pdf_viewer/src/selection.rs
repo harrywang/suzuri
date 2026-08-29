@@ -53,8 +53,15 @@ impl PdfViewer {
                                 layout.glyphs.len(),
                                 page_index + 1
                             );
+                            // The receiver is gone because the view was
+                            // released or the document was reloaded under us,
+                            // so this run's layouts describe a PDF nobody is
+                            // showing any more. Expected, not a failure.
                             if sender.send_blocking((page_index, layout)).is_err() {
-                                log::error!("pdf_viewer: channel closed, aborting text extraction");
+                                log::debug!(
+                                    "pdf_viewer: text extraction superseded, stopping at page {}",
+                                    page_index + 1
+                                );
                                 break;
                             }
                         }

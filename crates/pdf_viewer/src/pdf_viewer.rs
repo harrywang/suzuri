@@ -230,6 +230,16 @@ impl PdfViewer {
         for image in take_rendered_pages(&mut self.rendered_pages) {
             cx.drop_image(image, None);
         }
+        // Stopping the extractor and clearing its output have to happen
+        // together. `extract_all_text` skips its work when `text_layouts`
+        // already holds a layout per page, and the extraction started for the
+        // *previous* PDF keeps streaming into the map across the await for the
+        // new metadata. Clearing alone lets that producer refill the map with
+        // the old document's glyph positions, after which the new extraction is
+        // skipped as already done and selection hit-tests against coordinates
+        // that no longer match what is on screen. Dropping the task closes the
+        // channel, which is also how the extractor thread learns to stop.
+        self.text_extraction_task = Task::ready(());
         self.text_layouts.clear();
         self.selection_start = None;
         self.selection_end = None;
