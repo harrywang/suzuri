@@ -557,6 +557,7 @@ impl PdfViewer {
         index: usize,
         dimensions: &PageDimensions,
         container_width: f32,
+        cx: &App,
     ) -> AnyElement {
         let fit_scale = if dimensions.width > 0.0 {
             container_width / dimensions.width
@@ -578,9 +579,7 @@ impl PdfViewer {
                 .id(("pdf-page-placeholder", index))
                 .w(display_width)
                 .h(display_height)
-                .bg(gpui::rgb(0xf0f0f0))
-                .border_1()
-                .border_color(gpui::rgb(0xe0e0e0))
+                .bg(cx.theme().colors().surface_background)
                 .flex()
                 .justify_center()
                 .items_center()
@@ -596,6 +595,18 @@ impl PdfViewer {
             .h(display_height)
             .child(page_content)
             .children(highlights)
+            // A page is white and so is a light theme's canvas, so without an
+            // outline consecutive pages read as one endless sheet and the page
+            // margins are invisible. Drawn as an overlay rather than a border
+            // on this div so the page box keeps the exact size the rendered
+            // bitmap and the selection highlights are positioned against.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .border_1()
+                    .border_color(cx.theme().colors().border),
+            )
             .into_any_element()
     }
 
@@ -763,7 +774,7 @@ impl Render for PdfViewer {
             }
             for (index, dim) in dimensions.iter().enumerate() {
                 pages_column =
-                    pages_column.child(self.render_page_element(index, dim, container_width));
+                    pages_column.child(self.render_page_element(index, dim, container_width, cx));
             }
             if centering_pad > 0.0 {
                 pages_column = pages_column.child(div().h(px(centering_pad)));
