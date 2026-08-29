@@ -871,6 +871,185 @@ async fn test_image_size_syntax(cx: &mut TestAppContext) {
     assert_eq!(widths, vec![Some(640.), Some(320.), None]);
 }
 
+/// Drives the drop half of an image drag: moves the image on `row` so it lands
+/// above `target_row`, which is what `finish_image_move` does on mouse up.
+fn drop_image_on_row(cx: &mut EditorTestContext, row: u32, target_row: u32) {
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let range = snapshot.anchor_before(Point::new(row, 0))
+            ..snapshot.anchor_after(Point::new(row, snapshot.line_len(MultiBufferRow(row))));
+        move_image_to_row(editor, &range, target_row, cx);
+    });
+    cx.executor().run_until_parked();
+}
+
+/// The pointer-to-row mapping that decides where a dragged image lands, driven
+/// against a really painted editor. It is the one piece of the drag built on
+/// hand-rolled geometry, and nothing else would catch it drifting.
+#[gpui::test]
+async fn test_the_pointer_maps_to_the_row_under_it(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇone\ntwo\nthree\n");
+    cx.executor().run_until_parked();
+
+    // `pixel_position_for` reports the middle of the row, not its top.
+    let row_center = |cx: &mut EditorTestContext, row: u32| {
+        cx.pixel_position_for(editor::DisplayPoint::new(
+            editor::display_map::DisplayRow(row),
+            0,
+        ))
+    };
+    let line_height = row_center(&mut cx, 1).y - row_center(&mut cx, 0).y;
+
+    for row in 0..4 {
+        let position = row_center(&mut cx, row);
+        let mapped = cx.update_editor(|editor, _, _| editor.buffer_row_at_position(position));
+        assert_eq!(
+            mapped.map(|row| row.0),
+            Some(row),
+            "a pointer inside row {row} mapped elsewhere, so an image dropped \
+             there would land on the wrong line"
+        );
+    }
+
+    // Below every line, so an image can be dropped past the end of the
+    // document rather than only ever above some existing line.
+    let below = row_center(&mut cx, 3);
+    let below = gpui::point(below.x, below.y + line_height * 2.);
+    let mapped = cx.update_editor(|editor, _, _| editor.buffer_row_at_position(below));
+    assert_eq!(mapped.map(|row| row.0), Some(4));
+}
+
+#[gpui::test]
+async fn test_dragging_an_image_moves_its_whole_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇfirst
+
+        ![shot](a.png)
+
+        last
+    "});
+    cx.executor().run_until_parked();
+
+    drop_image_on_row(&mut cx, 2, 0);
+
+    pretty_assertions::assert_eq!(
+        cx.buffer_text(),
+        indoc::indoc! {"
+            ![shot](a.png)
+
+            first
+
+            last
+        "},
+        "the image should have moved above the first line, taking one of the \
+         blank lines that surrounded it rather than leaving both behind"
+    );
+}
+
+#[gpui::test]
+async fn test_dragging_an_image_down_lands_above_the_target_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇ![shot](a.png)
+        one
+        two
+        three
+    "});
+    cx.executor().run_until_parked();
+
+    // Rows shift up by one once the image line is cut, which the move has to
+    // account for or the image lands a line short.
+    drop_image_on_row(&mut cx, 0, 3);
+
+    pretty_assertions::assert_eq!(
+        cx.buffer_text(),
+        indoc::indoc! {"
+            one
+            two
+
+            ![shot](a.png)
+
+            three
+        "},
+        "the image landed against its neighbours, which in markdown makes it \
+         part of their paragraph instead of a block of its own"
+    );
+}
+
+#[gpui::test]
+async fn test_dragging_an_image_past_the_last_line_appends_it(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇ![shot](a.png)\none\ntwo");
+    cx.executor().run_until_parked();
+
+    // One past the last row is what `buffer_row_at_position` reports when the
+    // pointer is below every line.
+    drop_image_on_row(&mut cx, 0, 3);
+
+    pretty_assertions::assert_eq!(cx.buffer_text(), "one\ntwo\n\n![shot](a.png)");
+}
+
+#[gpui::test]
+async fn test_dragging_the_last_line_image_up_leaves_no_blank_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    // No trailing newline, so the image's line has no newline of its own to
+    // travel with; the one in front of it has to move instead.
+    cx.set_state("ˇone\ntwo\n![shot](a.png)");
+    cx.executor().run_until_parked();
+
+    drop_image_on_row(&mut cx, 2, 0);
+
+    pretty_assertions::assert_eq!(cx.buffer_text(), "![shot](a.png)\n\none\ntwo");
+}
+
+#[gpui::test]
+async fn test_dropping_an_image_where_it_already_is_changes_nothing(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let original = indoc::indoc! {"
+        one
+        ![shot](a.png)
+        two
+    "};
+    cx.set_state(&format!("ˇ{original}"));
+    cx.executor().run_until_parked();
+
+    // Landing above its own line, and above the line under it, are both where
+    // the image already sits.
+    drop_image_on_row(&mut cx, 1, 1);
+    pretty_assertions::assert_eq!(cx.buffer_text(), original);
+    drop_image_on_row(&mut cx, 1, 2);
+    pretty_assertions::assert_eq!(cx.buffer_text(), original);
+}
+
+#[gpui::test]
+async fn test_a_moved_image_stays_selected(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇone
+        two
+        ![shot](a.png)
+    "});
+    cx.executor().run_until_parked();
+
+    drop_image_on_row(&mut cx, 2, 0);
+
+    let selected_row = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.selected_image.clone())
+            .map(|range| range.start.to_point(&snapshot).row)
+    });
+    assert_eq!(
+        selected_row,
+        Some(0),
+        "the widget lost its selection border on drop, so its handles vanish \
+         the moment it lands"
+    );
+}
+
 #[test]
 fn test_with_image_width_rewrites_alt() {
     assert_eq!(
@@ -3315,4 +3494,73 @@ async fn test_expanded_diff_hunks_reveal_plain_source(cx: &mut TestAppContext) {
         "collapsing the hunks brings the preview back"
     );
     assert!(cx.display_text().contains("some bold text"));
+}
+
+/// The image drag follows the pointer across the whole document, which only
+/// works because gpui delivers `on_drag_move` to every painted listener of the
+/// dragged type, not just those under the pointer. If upstream started gating
+/// it on the element's bounds, dragging an image would stop tracking the moment
+/// the pointer left the image itself.
+#[gpui::test]
+fn test_drag_move_fires_outside_the_element(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    struct Dragged;
+
+    struct DragSource(Rc<Cell<usize>>);
+
+    impl Render for DragSource {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let moves = self.0.clone();
+            div().size_full().child(
+                div()
+                    .id("source")
+                    .debug_selector(|| "SOURCE".into())
+                    .w(gpui::px(20.))
+                    .h(gpui::px(20.))
+                    .on_drag(Dragged, |_, _, _, cx| cx.new(|_| EmptyDragPreview))
+                    .on_drag_move::<Dragged>(move |_, _, _| {
+                        moves.set(moves.get() + 1);
+                    }),
+            )
+        }
+    }
+
+    let moves = Rc::new(Cell::new(0));
+    let (_view, cx) = cx.add_window_view({
+        let moves = moves.clone();
+        move |_window, _cx| DragSource(moves)
+    });
+    cx.run_until_parked();
+
+    let bounds = cx
+        .debug_bounds("SOURCE")
+        .expect("the drag source should have been laid out");
+    cx.simulate_event(MouseDownEvent {
+        position: bounds.center(),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    // Past the drag threshold, but still over the source, so the drag starts.
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: bounds.center() + gpui::point(gpui::px(8.), gpui::px(0.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.run_until_parked();
+
+    let moves_before = moves.get();
+    cx.simulate_event(gpui::MouseMoveEvent {
+        position: bounds.center() + gpui::point(gpui::px(300.), gpui::px(300.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+
+    assert!(
+        moves.get() > moves_before,
+        "gpui stopped delivering `on_drag_move` for pointer moves outside the \
+         dragged element, so an image drag can no longer track the pointer"
+    );
 }

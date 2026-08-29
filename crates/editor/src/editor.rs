@@ -7267,6 +7267,33 @@ impl Editor {
         self.selection_drag_state = SelectionDragState::None;
     }
 
+    /// SUZURI: markdown live preview lets the reader drag an image widget to
+    /// another line, which means turning a pointer position into the row the
+    /// image should land above. The position map that answers that is private
+    /// to the element, so expose just this much of it. Returns one past the
+    /// last row when the pointer is below every line, and `None` when it is
+    /// outside the text area entirely.
+    pub fn buffer_row_at_position(&self, position: gpui::Point<Pixels>) -> Option<MultiBufferRow> {
+        let position_map = self.last_position_map.as_ref()?;
+        if !position_map.text_hitbox.bounds.contains(&position) {
+            return None;
+        }
+        let snapshot = &position_map.snapshot;
+        let rows_above_content = snapshot.display_snapshot.max_point().row().0 as f64 + 1.
+            - position_map.scroll_position.y;
+        let content_bottom = position_map.text_hitbox.bounds.origin.y
+            + position_map.line_height * rows_above_content as f32;
+        if position.y >= content_bottom {
+            return Some(MultiBufferRow(
+                snapshot.buffer_snapshot().max_point().row + 1,
+            ));
+        }
+        let point = position_map.point_for_position(position).nearest_valid;
+        Some(MultiBufferRow(
+            snapshot.display_point_to_point(point, Bias::Left).row,
+        ))
+    }
+
     pub fn duplicate(
         &mut self,
         upwards: bool,
