@@ -52,7 +52,7 @@ use workspace::{
 /// Bump it in the same commit that gets tagged `suzuri-v<this version>`; the
 /// `check-version` job in `.github/workflows/suzuri-release.yml` enforces that
 /// the two agree.
-pub const SUZURI_VERSION: &str = "0.4.1";
+pub const SUZURI_VERSION: &str = "0.4.2";
 
 /// The repository whose releases describe newer Suzuri builds.
 const RELEASE_REPOSITORY: &str = "harrywang/suzuri";
