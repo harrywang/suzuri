@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use super::pdf_renderer;
-use super::{CopyDocumentText, PAGE_GAP_PX, PdfViewer, TextPosition};
+use super::{CopyDocumentText, PAGE_CANVAS_MARGIN_PX, PAGE_GAP_PX, PdfViewer, TextPosition};
 
 impl PdfViewer {
     pub(crate) fn extract_all_text(&mut self, cx: &mut Context<Self>) {
@@ -196,10 +196,14 @@ impl PdfViewer {
         let bounds = self.scroll_handle.bounds();
         let scroll_offset = self.scroll_handle.offset();
 
+        // The fit width, not the raw viewport width: layout fits pages inside
+        // the canvas gutters, and using the raw width here would inflate
+        // fit_scale by ~2% — a barely visible error on page 1 that accumulates
+        // through `display_height` into whole lines of offset by the last page.
         let container_width: f32 = {
             let w: f32 = bounds.size.width.into();
             if w > 0.0 {
-                w
+                Self::page_fit_width(w)
             } else {
                 log::debug!("pdf_viewer: hit test — container_width=0");
                 return None;
@@ -218,14 +222,19 @@ impl PdfViewer {
 
         let content_y = (window_y - bounds_origin_y) + scroll_offset_y.abs();
 
+        // Mirrors the vertical gutter and centering logic in `render` — the
+        // pages column starts PAGE_CANVAS_MARGIN_PX plus the centering pad
+        // below the content origin, and the two computations must agree or
+        // every hit lands offset into the wrong line.
         let total_content_h = self.total_content_height(container_width);
-        let centering_pad = if total_content_h < viewport_height {
-            (viewport_height - total_content_h) / 2.0
+        let viewport_avail = viewport_height - 2.0 * PAGE_CANVAS_MARGIN_PX;
+        let centering_pad = if total_content_h < viewport_avail {
+            (viewport_avail - total_content_h) / 2.0
         } else {
             0.0
         };
 
-        let content_y_adjusted = content_y - centering_pad;
+        let content_y_adjusted = content_y - PAGE_CANVAS_MARGIN_PX - centering_pad;
 
         log::debug!(
             "pdf_viewer: hit test — window=({:.0},{:.0}) bounds_origin=({:.0},{:.0}) \
@@ -295,7 +304,12 @@ impl PdfViewer {
         let scale = fit_scale * self.zoom_level;
         let page_display_width = page_dim.width * scale;
 
-        let page_left_in_container = (container_width - page_display_width) / 2.0;
+        // Centering, unlike scale, is relative to the full viewport: the flex
+        // column centres pages in the raw width, with the canvas gutters
+        // emerging from the leftover space. `container_width` here is the fit
+        // width, so the raw width is recovered by adding the gutters back.
+        let raw_container_width = container_width + 2.0 * PAGE_CANVAS_MARGIN_PX;
+        let page_left_in_container = (raw_container_width - page_display_width) / 2.0;
         let pan_x_f32: f32 = self.pan_x.into();
         let content_x = (window_x - bounds_origin_x) - page_left_in_container - pan_x_f32;
 
