@@ -95,6 +95,12 @@ pub struct PdfViewer {
     rendered_pages: RenderedPages,
     pages_in_flight: HashSet<usize>,
     cancel_token: Arc<AtomicBool>,
+    /// Loading metadata gets a field of its own rather than sharing
+    /// `render_task`. `request_visible_pages` runs from `render`, so a reload
+    /// notifying the window would otherwise overwrite the metadata task it had
+    /// just spawned and cancel it, stranding the view on the replaced
+    /// document's page count.
+    metadata_task: Task<()>,
     render_task: Task<()>,
     render_debounce: Task<()>,
     render_error: Option<SharedString>,
@@ -201,6 +207,7 @@ impl PdfViewer {
             rendered_pages: HashMap::new(),
             pages_in_flight: HashSet::new(),
             cancel_token: Arc::new(AtomicBool::new(false)),
+            metadata_task: Task::ready(()),
             render_task: Task::ready(()),
             render_debounce: Task::ready(()),
             render_error: None,
@@ -253,7 +260,7 @@ impl PdfViewer {
         let background_task =
             cx.background_spawn(async move { pdf_renderer::parse_metadata(&pdf_bytes) });
 
-        self.render_task = cx.spawn(async move |this, cx| {
+        self.metadata_task = cx.spawn(async move |this, cx| {
             let result = background_task.await;
             this.update(cx, |this, cx| match result {
                 Ok(metadata) => {
@@ -969,6 +976,7 @@ impl Item for PdfViewer {
                 rendered_pages: RenderedPages::new(),
                 pages_in_flight: HashSet::new(),
                 cancel_token: Arc::new(AtomicBool::new(false)),
+                metadata_task: Task::ready(()),
                 render_task: Task::ready(()),
                 render_debounce: Task::ready(()),
                 render_error: self.render_error.clone(),
