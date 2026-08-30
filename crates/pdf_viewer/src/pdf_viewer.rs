@@ -43,6 +43,9 @@ use workspace::{
 use pdf_renderer::{PageDimensions, PageTextLayout, PdfMetadata};
 
 const PAGE_GAP_PX: f32 = 20.0;
+/// Grey canvas showing on each side of a page at zoom 1.0, so a page reads
+/// as a sheet of paper on a desk rather than filling the pane edge to edge.
+const PAGE_CANVAS_MARGIN_PX: f32 = 24.0;
 const RENDER_BUFFER_PAGES: usize = 2;
 const SCREEN_SCALE_FACTOR: f32 = 2.0;
 // Metal texture atlas tiles cannot exceed 16384px in either dimension.
@@ -95,6 +98,12 @@ pub struct PdfViewer {
     rendered_pages: RenderedPages,
     pages_in_flight: HashSet<usize>,
     cancel_token: Arc<AtomicBool>,
+    /// Loading metadata gets a field of its own rather than sharing
+    /// `render_task`. `request_visible_pages` runs from `render`, so a reload
+    /// notifying the window would otherwise overwrite the metadata task it had
+    /// just spawned and cancel it, stranding the view on the replaced
+    /// document's page count.
+    metadata_task: Task<()>,
     render_task: Task<()>,
     render_debounce: Task<()>,
     render_error: Option<SharedString>,
@@ -201,6 +210,7 @@ impl PdfViewer {
             rendered_pages: HashMap::new(),
             pages_in_flight: HashSet::new(),
             cancel_token: Arc::new(AtomicBool::new(false)),
+            metadata_task: Task::ready(()),
             render_task: Task::ready(()),
             render_debounce: Task::ready(()),
             render_error: None,
@@ -230,6 +240,16 @@ impl PdfViewer {
         for image in take_rendered_pages(&mut self.rendered_pages) {
             cx.drop_image(image, None);
         }
+        // Stopping the extractor and clearing its output have to happen
+        // together. `extract_all_text` skips its work when `text_layouts`
+        // already holds a layout per page, and the extraction started for the
+        // *previous* PDF keeps streaming into the map across the await for the
+        // new metadata. Clearing alone lets that producer refill the map with
+        // the old document's glyph positions, after which the new extraction is
+        // skipped as already done and selection hit-tests against coordinates
+        // that no longer match what is on screen. Dropping the task closes the
+        // channel, which is also how the extractor thread learns to stop.
+        self.text_extraction_task = Task::ready(());
         self.text_layouts.clear();
         self.selection_start = None;
         self.selection_end = None;
@@ -243,7 +263,7 @@ impl PdfViewer {
         let background_task =
             cx.background_spawn(async move { pdf_renderer::parse_metadata(&pdf_bytes) });
 
-        self.render_task = cx.spawn(async move |this, cx| {
+        self.metadata_task = cx.spawn(async move |this, cx| {
             let result = background_task.await;
             this.update(cx, |this, cx| match result {
                 Ok(metadata) => {
@@ -295,6 +315,31 @@ impl PdfViewer {
             .map_or(&[], |metadata| &metadata.page_dimensions)
     }
 
+    /// The desk the pages sit on: the theme's editor background, shifted a
+    /// step darker in light themes and a step lighter in dark ones. Derived
+    /// rather than a named token because no theme token means "canvas behind
+    /// paper" — the closest, `element_background`, is a button colour that
+    /// some themes tint — and deriving keeps the theme's own hue while
+    /// guaranteeing contrast against a white page in every theme.
+    fn canvas_color(cx: &App) -> gpui::Hsla {
+        let mut canvas = cx.theme().colors().editor_background;
+        if canvas.l > 0.5 {
+            canvas.l = (canvas.l - 0.07).max(0.0);
+        } else {
+            canvas.l = (canvas.l + 0.05).min(1.0);
+        }
+        canvas
+    }
+
+    /// The width pages are fit to at zoom 1.0: the viewport minus the canvas
+    /// gutter on each side. Every consumer of the viewport width for page
+    /// geometry must go through this — layout, hit-testing, rasterisation
+    /// scale, and pan clamping all assume the same fit width, and one of them
+    /// using the raw viewport width would silently offset the others.
+    fn page_fit_width(viewport_width: f32) -> f32 {
+        (viewport_width - 2.0 * PAGE_CANVAS_MARGIN_PX).max(1.0)
+    }
+
     fn display_height(dim: &PageDimensions, container_width: f32, zoom: f32) -> f32 {
         if dim.width <= 0.0 {
             return dim.height * zoom;
@@ -323,9 +368,9 @@ impl PdfViewer {
         if viewport_width <= 0.0 {
             return;
         }
-        // At any zoom, every page has display_width = viewport_width * zoom
-        // (fit-to-view normalizes all pages to viewport_width at zoom 1.0).
-        let content_width = viewport_width * self.zoom_level;
+        // At any zoom, every page has display_width = fit_width * zoom
+        // (fit-to-view normalizes all pages to the fit width at zoom 1.0).
+        let content_width = Self::page_fit_width(viewport_width) * self.zoom_level;
         let overflow = (content_width - viewport_width).max(0.0);
         let half_overflow = overflow / 2.0;
         self.pan_x = self.pan_x.clamp(px(-half_overflow), px(half_overflow));
@@ -336,9 +381,11 @@ impl PdfViewer {
         if dimensions.is_empty() {
             return 0..0;
         }
+        let viewport_width = Self::page_fit_width(viewport_width);
 
         let scroll_y: f32 = self.scroll_handle.offset().y.into();
-        let scroll_offset = scroll_y.abs();
+        // The pages column starts one canvas gutter below the content origin.
+        let scroll_offset = (scroll_y.abs() - PAGE_CANVAS_MARGIN_PX).max(0.0);
 
         let mut y = 0.0_f32;
         let mut first_visible = None;
@@ -391,13 +438,14 @@ impl PdfViewer {
         // the PDF's point size leaves wide viewports upscaling a too-small
         // bitmap into a blur.
         let viewport_width: f32 = self.scroll_handle.bounds().size.width.into();
+        let fit_width = Self::page_fit_width(viewport_width);
         let max_width = self
             .page_dimensions()
             .iter()
             .map(|d| d.width)
             .fold(0.0_f32, f32::max);
         let fit_scale = if viewport_width > 0.0 && max_width > 0.0 {
-            viewport_width / max_width
+            fit_width / max_width
         } else {
             1.0
         };
@@ -497,10 +545,25 @@ impl PdfViewer {
                         return;
                     }
                 };
+                // `needed` was computed from `self.metadata`, but the bytes are
+                // read at spawn time. Across a reload the two can disagree for
+                // a moment — the request may name pages past the end of the
+                // document now on disk. Skip those rather than treating them as
+                // failures: the metadata task is already reloading, and its
+                // completion re-renders with matching indices.
+                let page_count = pdf.pages().len();
                 for page_index in needed {
                     if cancel_token.load(Ordering::Relaxed) {
                         log::debug!("pdf_viewer: render cancelled");
                         break;
+                    }
+                    if page_index >= page_count {
+                        log::debug!(
+                            "pdf_viewer: skipping page {} — document now has {} pages",
+                            page_index + 1,
+                            page_count
+                        );
+                        continue;
                     }
                     log::debug!("pdf_viewer: rendering page {}...", page_index + 1);
                     match pdf_renderer::render_single_page(&pdf, page_index, render_scale, WHITE) {
@@ -557,6 +620,7 @@ impl PdfViewer {
         index: usize,
         dimensions: &PageDimensions,
         container_width: f32,
+        cx: &App,
     ) -> AnyElement {
         let fit_scale = if dimensions.width > 0.0 {
             container_width / dimensions.width
@@ -578,9 +642,11 @@ impl PdfViewer {
                 .id(("pdf-page-placeholder", index))
                 .w(display_width)
                 .h(display_height)
-                .bg(gpui::rgb(0xf0f0f0))
-                .border_1()
-                .border_color(gpui::rgb(0xe0e0e0))
+                // Rendered pages arrive white (hayro rasterises onto WHITE),
+                // so the placeholder is white too, not a theme colour: it is
+                // standing in for a sheet of paper, and on the grey canvas it
+                // should read as one.
+                .bg(gpui::white())
                 .flex()
                 .justify_center()
                 .items_center()
@@ -594,8 +660,23 @@ impl PdfViewer {
             .relative()
             .w(display_width)
             .h(display_height)
+            // Word/Preview-style page framing: the scroll container paints a
+            // grey canvas, so each white page reads as a sheet of paper and
+            // the gaps between pages read as breaks. The shadow lifts the
+            // page off the canvas; the hairline crisps its edge.
+            .shadow_md()
             .child(page_content)
             .children(highlights)
+            // The outline is an overlay rather than a border on this div so
+            // the page box keeps the exact size the rendered bitmap and the
+            // selection highlights are positioned against.
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .border_1()
+                    .border_color(cx.theme().colors().border),
+            )
             .into_any_element()
     }
 
@@ -735,7 +816,7 @@ impl Render for PdfViewer {
             let bounds = self.scroll_handle.bounds();
             let container_width: f32 = bounds.size.width.into();
             let container_width = if container_width > 0.0 {
-                container_width
+                Self::page_fit_width(container_width)
             } else {
                 dimensions.iter().map(|d| d.width).fold(0.0_f32, f32::max)
             };
@@ -751,23 +832,24 @@ impl Render for PdfViewer {
                 if h > 0.0 { h } else { 800.0 }
             };
 
-            let centering_pad = if total_content_h < viewport_h {
-                (viewport_h - total_content_h) / 2.0
+            // Centering happens inside the space left after the canvas
+            // gutters; the hit-test in selection.rs mirrors this exact
+            // computation, so the two must change together.
+            let viewport_avail = viewport_h - 2.0 * PAGE_CANVAS_MARGIN_PX;
+            let centering_pad = if total_content_h < viewport_avail {
+                (viewport_avail - total_content_h) / 2.0
             } else {
                 0.0
             };
+            let vertical_gutter = PAGE_CANVAS_MARGIN_PX + centering_pad;
 
             let mut pages_column = v_flex().gap(px(PAGE_GAP_PX)).items_center();
-            if centering_pad > 0.0 {
-                pages_column = pages_column.child(div().h(px(centering_pad)));
-            }
+            pages_column = pages_column.child(div().h(px(vertical_gutter)));
             for (index, dim) in dimensions.iter().enumerate() {
                 pages_column =
-                    pages_column.child(self.render_page_element(index, dim, container_width));
+                    pages_column.child(self.render_page_element(index, dim, container_width, cx));
             }
-            if centering_pad > 0.0 {
-                pages_column = pages_column.child(div().h(px(centering_pad)));
-            }
+            pages_column = pages_column.child(div().h(px(vertical_gutter)));
 
             if self.pan_x != px(0.0) {
                 div()
@@ -835,6 +917,11 @@ impl Render for PdfViewer {
                 div()
                     .id("pdf-scroll-container")
                     .flex_1()
+                    // The canvas behind the pages. Deliberately darker than
+                    // `editor_background`: white pages on a white canvas have
+                    // no visible edges, so breaks and margins disappear —
+                    // Word and Preview grey the desk for the same reason.
+                    .bg(Self::canvas_color(cx))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
@@ -948,6 +1035,7 @@ impl Item for PdfViewer {
                 rendered_pages: RenderedPages::new(),
                 pages_in_flight: HashSet::new(),
                 cancel_token: Arc::new(AtomicBool::new(false)),
+                metadata_task: Task::ready(()),
                 render_task: Task::ready(()),
                 render_debounce: Task::ready(()),
                 render_error: self.render_error.clone(),
