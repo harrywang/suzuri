@@ -514,10 +514,25 @@ impl PdfViewer {
                         return;
                     }
                 };
+                // `needed` was computed from `self.metadata`, but the bytes are
+                // read at spawn time. Across a reload the two can disagree for
+                // a moment — the request may name pages past the end of the
+                // document now on disk. Skip those rather than treating them as
+                // failures: the metadata task is already reloading, and its
+                // completion re-renders with matching indices.
+                let page_count = pdf.pages().len();
                 for page_index in needed {
                     if cancel_token.load(Ordering::Relaxed) {
                         log::debug!("pdf_viewer: render cancelled");
                         break;
+                    }
+                    if page_index >= page_count {
+                        log::debug!(
+                            "pdf_viewer: skipping page {} — document now has {} pages",
+                            page_index + 1,
+                            page_count
+                        );
+                        continue;
                     }
                     log::debug!("pdf_viewer: rendering page {}...", page_index + 1);
                     match pdf_renderer::render_single_page(&pdf, page_index, render_scale, WHITE) {

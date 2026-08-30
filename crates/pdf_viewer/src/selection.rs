@@ -45,7 +45,19 @@ impl PdfViewer {
                         return;
                     }
                 };
-                for page_index in 0..page_count {
+                // `page_count` came from metadata, the bytes from the item at
+                // spawn time; across a reload the two can briefly describe
+                // different documents. Extract only what this document has —
+                // the metadata reload re-runs extraction with matching counts.
+                let actual_count = pdf.pages().len().min(page_count);
+                if actual_count < page_count {
+                    log::debug!(
+                        "pdf_viewer: extracting {} of {} requested pages — document changed",
+                        actual_count,
+                        page_count
+                    );
+                }
+                for page_index in 0..actual_count {
                     match pdf_renderer::extract_page_text(&pdf, page_index) {
                         Ok(layout) => {
                             log::debug!(
