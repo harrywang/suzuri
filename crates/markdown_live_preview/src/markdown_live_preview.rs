@@ -19,7 +19,7 @@ use std::{
 
 use collections::{HashMap, HashSet};
 use editor::{
-    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey,
+    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey, RowHighlightOptions,
     display_map::{
         BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId, RenderBlock,
     },
@@ -265,6 +265,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         handle_press: None,
         source_revealed: None,
         last_resize_at: None,
+        image_move: None,
         callout_collapse: Vec::new(),
         _subscriptions: subscriptions,
     });
@@ -315,6 +316,10 @@ struct LivePreviewAddon {
     /// When a resize drag last wrote a width, so selection isn't cleared by
     /// the selection refresh that buffer edits trigger mid-drag.
     last_resize_at: Option<std::time::Instant>,
+    /// The image widget currently being dragged to a new position, with the
+    /// row its line will land above (`None` while the pointer is outside the
+    /// text area). Set from `on_drag_move`, consumed on mouse up.
+    image_move: Option<(Range<Anchor>, Option<u32>)>,
     /// Callouts the reader has expanded or collapsed by clicking their title,
     /// overriding the `+`/`-` their syntax asks for. Anchored, so the state
     /// follows the callout as text above it changes.
@@ -3606,11 +3611,67 @@ struct ImageResizeDrag {
     content_left_offset: gpui::Pixels,
 }
 
+/// Drag payload for moving an image to another line. Carries the marker range
+/// of the image being moved, which is its whole line — `push_block_rows`
+/// anchors block markers to full lines, and an image only becomes a block
+/// widget when it is alone on its line.
+struct ImageMoveDrag {
+    range: Range<Anchor>,
+}
+
+/// Type tag scoping the row highlight that marks where a dragged image will
+/// land, so clearing it cannot disturb any other row highlight.
+struct ImageDropTarget;
+
 struct EmptyDragPreview;
 
 impl gpui::Render for EmptyDragPreview {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         Empty
+    }
+}
+
+/// The chip that trails the pointer while an image is being dragged,
+/// Obsidian-style: a comfortable distance below-right of the mouse, with the
+/// drop cursor and tinted line marking where the image will land.
+///
+/// gpui paints the drag element at `pointer - grab_offset` and ignores
+/// margins on its root, so the chip is placed with an absolutely-positioned
+/// child offset by `grab_offset` plus the trailing distance, which puts it at
+/// a fixed offset from the live pointer.
+struct ImageDragPreview {
+    name: SharedString,
+    grab_offset: gpui::Point<gpui::Pixels>,
+}
+
+impl gpui::Render for ImageDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div().size_0().child(
+            div()
+                .absolute()
+                .left(self.grab_offset.x + px(16.))
+                // Vertically centered on the pointer: half the chip's height.
+                .top(self.grab_offset.y - px(13.))
+                .occlude()
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface_background)
+                        .shadow_md()
+                        .child(
+                            Icon::new(IconName::Image)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(self.name.clone()).size(LabelSize::Small)),
+                ),
+        )
     }
 }
 
@@ -3693,6 +3754,8 @@ fn render_image_block(
         let reveal_range = range.clone();
         let drag_editor = editor.clone();
         let drag_range = range.clone();
+        let move_editor = editor.clone();
+        let move_drag_range = range.clone();
 
         // A direct image element lets the selection border hug the image
         // exactly; reference-style images (no inline destination) fall back
@@ -3701,6 +3764,23 @@ fn render_image_block(
             resolve_image_source(destination, base_directory.as_deref(), &image_cache)
         });
         let muted = block_cx.app.theme().colors().text_muted;
+        let preview_name: SharedString = destination
+            .as_deref()
+            .and_then(|destination| {
+                Path::new(destination)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .map(SharedString::from)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                if alt.is_empty() {
+                    SharedString::from("image")
+                } else {
+                    alt.clone()
+                }
+            });
+        let move_range = range.clone();
         let image_content: gpui::AnyElement = match (&destination, resolved) {
             (Some(_), Some(source)) => {
                 let fallback_alt = alt.clone();
@@ -3737,6 +3817,20 @@ fn render_image_block(
         };
 
         let mut content = div()
+            // `on_drag` is a stateful-element API, and the id must be unique
+            // per block: `Block::Custom` renders this closure with no id scope
+            // of its own, so a shared static id here would make every image
+            // block share one element-state entry — including the pending
+            // mouse-down that arms a drag, letting a different image's
+            // listener claim the gesture and drag the wrong image.
+            .id(block_cx.block_id)
+            // A no-op outside test builds.
+            .debug_selector(|| {
+                format!(
+                    "MDLP-IMAGE-{}",
+                    destination.as_deref().unwrap_or(alt.as_ref())
+                )
+            })
             .relative()
             .border_2()
             .rounded_sm()
@@ -3748,7 +3842,16 @@ fn render_image_block(
                 }
             })
             .when(content_width.is_none(), |this| this.max_w(max_width * 0.66))
-            .child(image_content);
+            .child(image_content)
+            .on_drag(
+                ImageMoveDrag { range: move_range },
+                move |_, grab_offset, _, cx| {
+                    cx.new(|_| ImageDragPreview {
+                        name: preview_name.clone(),
+                        grab_offset,
+                    })
+                },
+            );
 
         if selected {
             content = content
@@ -3834,6 +3937,48 @@ fn render_image_block(
                     })
                     .log_err();
             })
+            // `on_drag_move` fires for every pointer move while the drag is
+            // live, not just those over this block, which is what lets one
+            // image widget follow the pointer across the whole document. Every
+            // image block hears every move, so each only handles its own.
+            .on_drag_move::<ImageMoveDrag>({
+                let editor = move_editor.clone();
+                let range = move_drag_range;
+                move |event, window, cx| {
+                    if event.drag(cx).range != range {
+                        return;
+                    }
+                    let position = event.event.position;
+                    editor
+                        .update(cx, |editor, cx| {
+                            let boundary = editor
+                                .buffer_row_boundary_at_position(position)
+                                .map(|row| row.0);
+                            track_image_drop_target(editor, &range, boundary, window, cx);
+                        })
+                        .log_err();
+                }
+            })
+            // The drop can land anywhere, so it is caught on mouse up rather
+            // than through `on_drop`, which only fires over this block.
+            .on_mouse_up(MouseButton::Left, {
+                let editor = move_editor.clone();
+                move |_, _window, cx| {
+                    let dropped = cx.has_active_drag();
+                    editor
+                        .update(cx, |editor, cx| finish_image_move(editor, dropped, cx))
+                        .log_err();
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let editor = move_editor;
+                move |_, _window, cx| {
+                    let dropped = cx.has_active_drag();
+                    editor
+                        .update(cx, |editor, cx| finish_image_move(editor, dropped, cx))
+                        .log_err();
+                }
+            })
             // `flex()` is load-bearing: gpui's `div()` is `display: block`, so a
             // block child fills its parent's width and the bordered container
             // would stretch to its own `max_w` cap — leaving the selection
@@ -3876,6 +4021,197 @@ fn resize_image_to_width(
     editor.buffer().update(cx, |multibuffer, cx| {
         multibuffer.edit([(start..end, updated)], None, cx);
     });
+}
+
+/// Records the boundary a dragged image would land at and shows it two ways:
+/// the editor's own cursor moves to the drop point — a caret walking through
+/// the text as the reader drags, the same feedback dragging text gives — and
+/// the line the image will land above is tinted. `boundary` means "lands
+/// above this row"; it is `None` when the pointer is outside the text area,
+/// and may be one past the last row.
+fn track_image_drop_target(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    boundary: Option<u32>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let unchanged = editor.addon::<LivePreviewAddon>().is_some_and(|addon| {
+        addon
+            .image_move
+            .as_ref()
+            .is_some_and(|(_, row)| *row == boundary)
+    });
+    if unchanged {
+        return;
+    }
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.image_move = Some((range.clone(), boundary));
+    }
+    editor.clear_row_highlights::<ImageDropTarget>();
+    if let Some(boundary) = boundary {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let max_row = snapshot.max_point().row;
+        let cursor = if boundary > max_row {
+            snapshot.max_point()
+        } else {
+            Point::new(boundary, 0)
+        };
+        let cursor = snapshot.point_to_offset(cursor);
+        let row = boundary.min(max_row);
+        let start = snapshot.anchor_before(Point::new(row, 0));
+        let end = snapshot.anchor_after(Point::new(row, snapshot.line_len(MultiBufferRow(row))));
+        editor.highlight_rows::<ImageDropTarget>(
+            start..end,
+            |cx| {
+                let mut color = cx.theme().colors().text_accent;
+                color.a = 0.2;
+                color
+            },
+            RowHighlightOptions {
+                autoscroll: false,
+                include_gutter: true,
+            },
+            cx,
+        );
+        editor.change_selections(
+            editor::SelectionEffects::default().nav_history(false),
+            window,
+            cx,
+            |selections| {
+                selections.select_ranges([cursor..cursor]);
+            },
+        );
+    }
+    cx.notify();
+}
+
+/// Completes an image move: drops the image on the row the pointer last
+/// indicated, and clears the drag's highlight either way. Runs on every mouse
+/// up, so it must be a no-op when no image is being dragged. `dropped` is
+/// false when the gesture ended without a live drag — the pointer was released
+/// after Escape cancelled it — and the tracked position is then only cleared,
+/// never acted on.
+fn finish_image_move(editor: &mut Editor, dropped: bool, cx: &mut Context<Editor>) {
+    let Some((range, target_row)) = editor
+        .addon_mut::<LivePreviewAddon>()
+        .and_then(|addon| addon.image_move.take())
+    else {
+        return;
+    };
+    editor.clear_row_highlights::<ImageDropTarget>();
+    if let Some(target_row) = target_row
+        && dropped
+    {
+        move_image_to_row(editor, &range, target_row, cx);
+    }
+    cx.notify();
+}
+
+/// Moves an image's whole line so it lands above `target_row`, as one undo
+/// step; `target_row` may be one past the last row, meaning the end of the
+/// document. Moving the line rather than the image span is safe because an
+/// image only becomes a block widget when it is alone on its line.
+///
+/// Blank lines are adjusted around both ends so the image stays a block of its
+/// own: dropped against a paragraph it would otherwise join that paragraph, and
+/// lifted out from between two blank lines it would otherwise leave a widening
+/// gap behind.
+fn move_image_to_row(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    target_row: u32,
+    cx: &mut Context<Editor>,
+) {
+    if editor.read_only(cx) {
+        return;
+    }
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let row = range.start.to_point(&snapshot).row;
+    let max_row = snapshot.max_point().row;
+    let target_row = target_row.min(max_row + 1);
+    // Landing above its own line, or above the line under it, leaves the image
+    // exactly where it already is.
+    if target_row == row || target_row == row + 1 {
+        return;
+    }
+
+    let line = |row: u32| -> String {
+        let start = Point::new(row, 0);
+        let end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+        snapshot.text_for_range(start..end).collect()
+    };
+    let is_blank = |row: u32| line(row).trim().is_empty();
+    let line_text = line(row);
+
+    // The line's own newline travels with it, or the one in front of it when
+    // the image is the last line in the buffer.
+    let cut = if row < max_row {
+        // An image sitting alone between two blank lines takes one of them
+        // with it, so repeated moves do not widen the gap it leaves behind.
+        let stranded_blank = row > 0 && row + 1 < max_row && is_blank(row - 1) && is_blank(row + 1);
+        let cut_end_row = if stranded_blank { row + 2 } else { row + 1 };
+        Point::new(row, 0)..Point::new(cut_end_row, 0)
+    } else if row > 0 {
+        Point::new(row - 1, snapshot.line_len(MultiBufferRow(row - 1)))
+            ..Point::new(row, snapshot.line_len(MultiBufferRow(row)))
+    } else {
+        Point::new(row, 0)..Point::new(row, snapshot.line_len(MultiBufferRow(row)))
+    };
+
+    let (insert_at, insert_text, prefix_len) = if target_row > max_row {
+        let prefix = if is_blank(max_row) { "\n" } else { "\n\n" };
+        (
+            snapshot.max_point(),
+            format!("{prefix}{line_text}"),
+            prefix.len(),
+        )
+    } else {
+        let prefix = if target_row > 0 && !is_blank(target_row - 1) {
+            "\n"
+        } else {
+            ""
+        };
+        let suffix = if is_blank(target_row) { "" } else { "\n" };
+        (
+            Point::new(target_row, 0),
+            format!("{prefix}{line_text}\n{suffix}"),
+            prefix.len(),
+        )
+    };
+
+    let cut = snapshot.point_to_offset(cut.start)..snapshot.point_to_offset(cut.end);
+    let insert_at = snapshot.point_to_offset(insert_at);
+    // Where the image ends up, in the edited buffer: the insertion point, past
+    // any blank line added in front of it, less whatever the cut removed from
+    // above it.
+    let landed_offset = if cut.end <= insert_at {
+        insert_at + prefix_len - (cut.end - cut.start)
+    } else {
+        insert_at + prefix_len
+    };
+    let mut edits = vec![(cut, String::new()), (insert_at..insert_at, insert_text)];
+    edits.sort_by_key(|(range, _)| range.start);
+
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        // The edit refreshes selections, which would otherwise deselect the
+        // widget the reader just dropped.
+        addon.last_resize_at = Some(std::time::Instant::now());
+    }
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit(edits, None, cx);
+    });
+
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let landed_row = landed_offset.to_point(&snapshot).row;
+    let start = snapshot.anchor_before(Point::new(landed_row, 0));
+    let end = snapshot.anchor_after(Point::new(
+        landed_row,
+        snapshot.line_len(MultiBufferRow(landed_row)),
+    ));
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.selected_image = Some(start..end);
+    }
 }
 
 fn render_rule_block(
