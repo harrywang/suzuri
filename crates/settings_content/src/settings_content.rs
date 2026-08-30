@@ -408,6 +408,8 @@ fallible_options::flattened_deserialize!(SettingsContent {
         call_hierarchy, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
+        // SUZURI: the fork's own settings sections must be listed here too.
+        markdown_live_preview, typeset_preview,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
