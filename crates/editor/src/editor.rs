@@ -7268,30 +7268,60 @@ impl Editor {
     }
 
     /// SUZURI: markdown live preview lets the reader drag an image widget to
-    /// another line, which means turning a pointer position into the row the
-    /// image should land above. The position map that answers that is private
-    /// to the element, so expose just this much of it. Returns one past the
-    /// last row when the pointer is below every line, and `None` when it is
-    /// outside the text area entirely.
-    pub fn buffer_row_at_position(&self, position: gpui::Point<Pixels>) -> Option<MultiBufferRow> {
+    /// another line, which means turning a pointer position into the row
+    /// boundary the image should land at. The position map that answers that
+    /// is private to the element, so expose just this much of it.
+    ///
+    /// Returns the boundary nearest the pointer, with half-line precision:
+    /// the upper half of a line maps to the boundary above it, the lower half
+    /// to the boundary below, so hovering a tall block widget targets the
+    /// seam the pointer is closest to rather than always the widget's own
+    /// line. A boundary of `b` means "lands above buffer row `b`", where `b`
+    /// may be one past the last row; `None` means the pointer is outside the
+    /// text area entirely.
+    pub fn buffer_row_boundary_at_position(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> Option<MultiBufferRow> {
         let position_map = self.last_position_map.as_ref()?;
         if !position_map.text_hitbox.bounds.contains(&position) {
             return None;
         }
         let snapshot = &position_map.snapshot;
-        let rows_above_content = snapshot.display_snapshot.max_point().row().0 as f64 + 1.
-            - position_map.scroll_position.y;
-        let content_bottom = position_map.text_hitbox.bounds.origin.y
-            + position_map.line_height * rows_above_content as f32;
-        if position.y >= content_bottom {
-            return Some(MultiBufferRow(
-                snapshot.buffer_snapshot().max_point().row + 1,
-            ));
+        let buffer_max_row = snapshot.buffer_snapshot().max_point().row;
+        // The pointer's display row, kept fractional so the half-line test
+        // below can tell which side of a row's midline it is on.
+        let pointer_row = ((position.y - position_map.text_hitbox.bounds.origin.y)
+            / position_map.line_height) as f64
+            + position_map.scroll_position.y;
+        let max_display_row = snapshot.display_snapshot.max_point().row().0;
+        if pointer_row >= max_display_row as f64 + 1. {
+            return Some(MultiBufferRow(buffer_max_row + 1));
         }
-        let point = position_map.point_for_position(position).nearest_valid;
-        Some(MultiBufferRow(
-            snapshot.display_point_to_point(point, Bias::Left).row,
-        ))
+        let display_row = (pointer_row.max(0.) as u32).min(max_display_row);
+        let row = snapshot
+            .display_point_to_point(DisplayPoint::new(DisplayRow(display_row), 0), Bias::Left)
+            .row;
+        // The buffer row's full display extent: a block widget spans many
+        // display rows, and the midline of that whole span is what divides
+        // "above it" from "below it".
+        let span_start = snapshot
+            .point_to_display_point(Point::new(row, 0), Bias::Left)
+            .row()
+            .0;
+        let span_end = if row >= buffer_max_row {
+            max_display_row + 1
+        } else {
+            snapshot
+                .point_to_display_point(Point::new(row + 1, 0), Bias::Left)
+                .row()
+                .0
+        };
+        if pointer_row < (span_start + span_end) as f64 / 2. {
+            Some(MultiBufferRow(row))
+        } else {
+            Some(MultiBufferRow(row + 1))
+        }
     }
 
     pub fn duplicate(

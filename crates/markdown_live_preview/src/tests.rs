@@ -883,11 +883,133 @@ fn drop_image_on_row(cx: &mut EditorTestContext, row: u32, target_row: u32) {
     cx.executor().run_until_parked();
 }
 
-/// The pointer-to-row mapping that decides where a dragged image lands, driven
-/// against a really painted editor. It is the one piece of the drag built on
-/// hand-rolled geometry, and nothing else would catch it drifting.
+/// The whole gesture, end to end, through real event dispatch: press on one
+/// of two image widgets, drag past the arming threshold, cross the document,
+/// release. This is what catches wiring bugs the unit tests cannot — most
+/// importantly that the image that moves is the one that was pressed, which
+/// broke in the field when every image block shared one element id and any
+/// block's listener could claim the gesture.
 #[gpui::test]
-async fn test_the_pointer_maps_to_the_row_under_it(cx: &mut TestAppContext) {
+async fn test_the_full_drag_gesture_moves_the_pressed_image(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇtop\n\n![first](a.png)\n\n![second](b.png)\n\nbottom");
+    cx.executor().run_until_parked();
+
+    let first = cx
+        .cx
+        .debug_bounds("MDLP-IMAGE-a.png")
+        .expect("the first image widget should have been laid out");
+
+    // Press the first image and move past gpui's drag-arming threshold.
+    cx.cx.simulate_event(MouseDownEvent {
+        position: first.center(),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.cx.simulate_event(gpui::MouseMoveEvent {
+        position: first.center() + gpui::point(gpui::px(8.), gpui::px(8.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.executor().run_until_parked();
+
+    // Drag to the upper half of the last line, targeting the boundary above
+    // it, and release there.
+    let last_display_row =
+        cx.update_editor(|editor, _, cx| editor.display_snapshot(cx).max_point().row());
+    let last_line = cx.pixel_position_for(editor::DisplayPoint::new(last_display_row, 0));
+    let drop_position = gpui::point(last_line.x, last_line.y - gpui::px(2.));
+    cx.cx.simulate_event(gpui::MouseMoveEvent {
+        position: drop_position,
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.executor().run_until_parked();
+    cx.cx.simulate_event(gpui::MouseUpEvent {
+        position: drop_position,
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+    });
+    cx.executor().run_until_parked();
+
+    pretty_assertions::assert_eq!(
+        cx.buffer_text(),
+        "top\n\n![second](b.png)\n\n![first](a.png)\n\nbottom",
+        "the image that moves must be the one that was pressed"
+    );
+}
+
+/// Sweeping a drag across heading widgets and other image widgets must keep
+/// the drop cursor tracking the pointer the whole way; in the field the caret
+/// froze partway through such a sweep while the pointer kept moving.
+#[gpui::test]
+async fn test_drop_tracking_survives_a_sweep_across_widgets(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(
+        "ˇ# Title\n\nintro paragraph\n\n## Section\n\nfirst\n\n![a](a.png)\n\n![b](b.png)\n\nbottom",
+    );
+    cx.executor().run_until_parked();
+
+    let second = cx
+        .cx
+        .debug_bounds("MDLP-IMAGE-b.png")
+        .expect("the second image widget should have been laid out");
+    let first = cx
+        .cx
+        .debug_bounds("MDLP-IMAGE-a.png")
+        .expect("the first image widget should have been laid out");
+
+    cx.cx.simulate_event(MouseDownEvent {
+        position: second.center(),
+        button: MouseButton::Left,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.cx.simulate_event(gpui::MouseMoveEvent {
+        position: second.center() + gpui::point(gpui::px(8.), gpui::px(8.)),
+        pressed_button: Some(MouseButton::Left),
+        modifiers: Modifiers::default(),
+    });
+    cx.executor().run_until_parked();
+
+    // Sweep upward through the first image widget and the headings to the
+    // very top of the document, in small steps like a real pointer.
+    let x = first.center().x;
+    let mut y = second.center().y;
+    let top = gpui::px(4.);
+    while y > top {
+        y -= gpui::px(20.);
+        cx.cx.simulate_event(gpui::MouseMoveEvent {
+            position: gpui::point(x, y.max(top)),
+            pressed_button: Some(MouseButton::Left),
+            modifiers: Modifiers::default(),
+        });
+        cx.executor().run_until_parked();
+    }
+
+    let cursor_row = cx.update_editor(|editor, _, cx| {
+        editor
+            .selections
+            .newest::<Point>(&editor.display_snapshot(cx))
+            .head()
+            .row
+    });
+    assert_eq!(
+        cursor_row, 0,
+        "after sweeping to the top of the document the drop cursor should \
+         have followed the pointer to row 0, not frozen partway"
+    );
+}
+
+/// The pointer-to-boundary mapping that decides where a dragged image lands,
+/// driven against a really painted editor. It is the one piece of the drag
+/// built on hand-rolled geometry, and nothing else would catch it drifting.
+#[gpui::test]
+async fn test_the_pointer_maps_to_the_nearest_row_boundary(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     cx.set_state("ˇone\ntwo\nthree\n");
     cx.executor().run_until_parked();
@@ -901,14 +1023,29 @@ async fn test_the_pointer_maps_to_the_row_under_it(cx: &mut TestAppContext) {
     };
     let line_height = row_center(&mut cx, 1).y - row_center(&mut cx, 0).y;
 
+    let boundary_at = |cx: &mut EditorTestContext, position: gpui::Point<gpui::Pixels>| {
+        cx.update_editor(|editor, _, _| {
+            editor
+                .buffer_row_boundary_at_position(position)
+                .map(|row| row.0)
+        })
+    };
+
+    // The upper half of a line maps to the boundary above it, the lower half
+    // to the boundary below.
     for row in 0..4 {
-        let position = row_center(&mut cx, row);
-        let mapped = cx.update_editor(|editor, _, _| editor.buffer_row_at_position(position));
+        let center = row_center(&mut cx, row);
+        let upper = gpui::point(center.x, center.y - line_height / 4.);
+        let lower = gpui::point(center.x, center.y + line_height / 4.);
         assert_eq!(
-            mapped.map(|row| row.0),
+            boundary_at(&mut cx, upper),
             Some(row),
-            "a pointer inside row {row} mapped elsewhere, so an image dropped \
-             there would land on the wrong line"
+            "the upper half of row {row} should target the boundary above it"
+        );
+        assert_eq!(
+            boundary_at(&mut cx, lower),
+            Some(row + 1),
+            "the lower half of row {row} should target the boundary below it"
         );
     }
 
@@ -916,8 +1053,7 @@ async fn test_the_pointer_maps_to_the_row_under_it(cx: &mut TestAppContext) {
     // document rather than only ever above some existing line.
     let below = row_center(&mut cx, 3);
     let below = gpui::point(below.x, below.y + line_height * 2.);
-    let mapped = cx.update_editor(|editor, _, _| editor.buffer_row_at_position(below));
-    assert_eq!(mapped.map(|row| row.0), Some(4));
+    assert_eq!(boundary_at(&mut cx, below), Some(4));
 }
 
 #[gpui::test]
