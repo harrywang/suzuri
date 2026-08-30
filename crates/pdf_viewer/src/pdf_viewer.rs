@@ -315,6 +315,22 @@ impl PdfViewer {
             .map_or(&[], |metadata| &metadata.page_dimensions)
     }
 
+    /// The desk the pages sit on: the theme's editor background, shifted a
+    /// step darker in light themes and a step lighter in dark ones. Derived
+    /// rather than a named token because no theme token means "canvas behind
+    /// paper" — the closest, `element_background`, is a button colour that
+    /// some themes tint — and deriving keeps the theme's own hue while
+    /// guaranteeing contrast against a white page in every theme.
+    fn canvas_color(cx: &App) -> gpui::Hsla {
+        let mut canvas = cx.theme().colors().editor_background;
+        if canvas.l > 0.5 {
+            canvas.l = (canvas.l - 0.07).max(0.0);
+        } else {
+            canvas.l = (canvas.l + 0.05).min(1.0);
+        }
+        canvas
+    }
+
     /// The width pages are fit to at zoom 1.0: the viewport minus the canvas
     /// gutter on each side. Every consumer of the viewport width for page
     /// geometry must go through this — layout, hit-testing, rasterisation
@@ -905,7 +921,7 @@ impl Render for PdfViewer {
                     // `editor_background`: white pages on a white canvas have
                     // no visible edges, so breaks and margins disappear —
                     // Word and Preview grey the desk for the same reason.
-                    .bg(cx.theme().colors().element_background)
+                    .bg(Self::canvas_color(cx))
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
                     .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
