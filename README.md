@@ -15,7 +15,7 @@ Suzuri adds a writing environment to Zed without giving up the code editor: Obsi
 
 - **Reading** — A native PDF viewer with continuous scroll, zoom, and real text selection, built on [hayro](https://github.com/LaurenzV/hayro). PDFs reload in place when they change on disk.
 
-- **Typesetting** — Write [Typst](https://typst.app) or LaTeX in one pane and watch the PDF update in the other, a second after you stop typing. Compilers install themselves on first use.
+- **Typesetting** — Write [Typst](https://typst.app) or LaTeX in one pane and watch the PDF update in the other, a second after you stop typing. If you have no compiler installed, the first preview offers to fetch one.
 
 - **Linking** — `[[wikilinks]]` with completion, ⌘-click follow, backlinks, and broken-link diagnostics, built in with no extension to install.
 
@@ -49,7 +49,8 @@ Suzuri stands on generous shoulders:
 - [David Turnbull](https://github.com/dsturnbull) — the PDF viewer ([zed#51040](https://github.com/zed-industries/zed/pull/51040)) and the hayro text-extraction work it builds on
 - [hayro](https://github.com/LaurenzV/hayro) by Laurenz Stampfl — pure-Rust PDF rendering
 - [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide) by Felix Zeller — the PKM language server behind wikilinks, backlinks, and link diagnostics
-- [Typst](https://github.com/typst/typst) and [Tectonic](https://github.com/tectonic-typesetting/tectonic) — the typesetting engines behind live preview
+- [Typst](https://github.com/typst/typst) — the compiler behind Typst live preview
+- [TinyTeX](https://github.com/rstudio/tinytex) by Yihui Xie — the relocatable TeX Live behind LaTeX live preview
 
 ## Relationship to Zed
 
