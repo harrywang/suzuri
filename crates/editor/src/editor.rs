@@ -3363,6 +3363,10 @@ impl Editor {
         self.current_line_highlight = current_line_highlight;
     }
 
+    pub fn selection_is_from_search(&self) -> bool {
+        self.last_selection_from_search
+    }
+
     pub fn set_collapse_matches(&mut self, collapse_matches: bool) {
         self.collapse_matches = collapse_matches;
     }
@@ -9823,6 +9827,18 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn style_lines(
+        &mut self,
+        key: HighlightKey,
+        ranges: Vec<Range<Anchor>>,
+        style: display_map::LineStyle,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_map
+            .update(cx, |map, cx| map.style_lines(key, ranges, style, cx));
+        cx.notify();
+    }
+
     pub fn text_highlights<'a>(
         &'a self,
         key: HighlightKey,
@@ -9890,9 +9906,13 @@ impl Editor {
     }
 
     pub fn clear_highlights(&mut self, key: HighlightKey, cx: &mut Context<Self>) {
-        let cleared = self
-            .display_map
-            .update(cx, |map, _| map.clear_highlights(key));
+        let cleared = self.display_map.update(cx, |map, cx| {
+            let cleared = map.clear_highlights(key);
+            if cleared {
+                map.refresh_wrap_line_font_scales(cx);
+            }
+            cleared
+        });
         if cleared {
             cx.notify();
         }
@@ -9903,9 +9923,13 @@ impl Editor {
         f: &mut dyn FnMut(&HighlightKey) -> bool,
         cx: &mut Context<Self>,
     ) {
-        let cleared = self
-            .display_map
-            .update(cx, |map, _| map.clear_highlights_with(f));
+        let cleared = self.display_map.update(cx, |map, cx| {
+            let cleared = map.clear_highlights_with(f);
+            if cleared {
+                map.refresh_wrap_line_font_scales(cx);
+            }
+            cleared
+        });
         if cleared {
             cx.notify();
         }

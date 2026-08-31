@@ -141,11 +141,9 @@ impl Editor {
         if let Some(last_bounds) = self.expect_bounds_change.take()
             && scroll_position.y != 0.
         {
-            scroll_position.y +=
-                ScrollOffset::from((bounds.top() - last_bounds.top()) / line_height);
-            if scroll_position.y < 0. {
-                scroll_position.y = 0.;
-            }
+            let adjusted_visual_y = display_map.visual_y_for_row(scroll_position.y)
+                + ScrollOffset::from((bounds.top() - last_bounds.top()) / line_height);
+            scroll_position.y = display_map.row_for_visual_y(adjusted_visual_y.max(0.0));
         }
         if scroll_position.y > max_scroll_top {
             scroll_position.y = max_scroll_top;
@@ -168,8 +166,8 @@ impl Editor {
             self.highlighted_display_row_for_autoscroll(&display_map)
         {
             target_point = DisplayPoint::new(first_highlighted_row, 0);
-            target_top = target_point.row().as_f64();
-            target_bottom = target_top + 1.;
+            target_top = display_map.visual_y_for_row(target_point.row().as_f64());
+            target_bottom = display_map.visual_y_for_row(target_point.row().next_row().as_f64());
         } else {
             // Autoscroll only needs the first, last, and newest selections.
             target_point = self
@@ -177,15 +175,16 @@ impl Editor {
                 .first::<Point>(&display_map)
                 .head()
                 .to_display_point(&display_map);
-            target_top = target_point.row().as_f64();
-            target_bottom = self
-                .selections
-                .last::<Point>(&display_map)
-                .head()
-                .to_display_point(&display_map)
-                .row()
-                .next_row()
-                .as_f64();
+            target_top = display_map.visual_y_for_row(target_point.row().as_f64());
+            target_bottom = display_map.visual_y_for_row(
+                self.selections
+                    .last::<Point>(&display_map)
+                    .head()
+                    .to_display_point(&display_map)
+                    .row()
+                    .next_row()
+                    .as_f64(),
+            );
 
             let selections_fit = target_bottom - target_top <= visible_lines;
             if matches!(
@@ -199,8 +198,9 @@ impl Editor {
                     .newest::<Point>(&display_map)
                     .head()
                     .to_display_point(&display_map);
-                target_top = target_point.row().as_f64();
-                target_bottom = target_top + 1.;
+                target_top = display_map.visual_y_for_row(target_point.row().as_f64());
+                target_bottom =
+                    display_map.visual_y_for_row(target_point.row().next_row().as_f64());
             }
         }
 
@@ -226,8 +226,8 @@ impl Editor {
         };
         if let Autoscroll::Strategy(_, Some(anchor)) = autoscroll {
             target_point = anchor.to_display_point(&display_map);
-            target_top = target_point.row().as_f64();
-            target_bottom = target_top + 1.;
+            target_top = display_map.visual_y_for_row(target_point.row().as_f64());
+            target_bottom = display_map.visual_y_for_row(target_point.row().next_row().as_f64());
         }
 
         let visible_sticky_headers =
@@ -238,16 +238,16 @@ impl Editor {
                 let margin = margin.min(self.scroll_manager.vertical_scroll_margin);
                 let target_top = (target_top - margin - visible_sticky_headers as f64).max(0.0);
                 let target_bottom = target_bottom + margin;
-                let start_row = scroll_position.y;
+                let start_row = display_map.visual_y_for_row(scroll_position.y);
                 let end_row = start_row + visible_lines;
 
                 let needs_scroll_up = target_top < start_row;
                 let needs_scroll_down = target_bottom >= end_row;
 
                 if needs_scroll_up && !needs_scroll_down {
-                    scroll_position.y = target_top;
+                    scroll_position.y = display_map.row_for_visual_y(target_top);
                 } else if !needs_scroll_up && needs_scroll_down {
-                    scroll_position.y = target_bottom - visible_lines;
+                    scroll_position.y = display_map.row_for_visual_y(target_bottom - visible_lines);
                 }
 
                 if needs_scroll_up ^ needs_scroll_down {
@@ -257,28 +257,31 @@ impl Editor {
                 }
             }
             AutoscrollStrategy::Center => {
-                scroll_position.y = (target_top - margin).max(0.0);
+                scroll_position.y = display_map.row_for_visual_y((target_top - margin).max(0.0));
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
             AutoscrollStrategy::Focused => {
                 let margin = margin.min(self.scroll_manager.vertical_scroll_margin);
-                scroll_position.y = (target_top - margin).max(0.0);
+                scroll_position.y = display_map.row_for_visual_y((target_top - margin).max(0.0));
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
             AutoscrollStrategy::Top => {
-                scroll_position.y = (target_top).max(0.0);
+                scroll_position.y = display_map.row_for_visual_y(target_top.max(0.0));
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
             AutoscrollStrategy::Bottom => {
-                scroll_position.y = (target_bottom - visible_lines).max(0.0);
+                scroll_position.y =
+                    display_map.row_for_visual_y((target_bottom - visible_lines).max(0.0));
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
             AutoscrollStrategy::TopRelative(lines) => {
-                scroll_position.y = target_top - lines as ScrollOffset;
+                scroll_position.y =
+                    display_map.row_for_visual_y(target_top - lines as ScrollOffset);
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
             AutoscrollStrategy::BottomRelative(lines) => {
-                scroll_position.y = target_bottom + lines as ScrollOffset;
+                scroll_position.y =
+                    display_map.row_for_visual_y(target_bottom + lines as ScrollOffset);
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
         };
