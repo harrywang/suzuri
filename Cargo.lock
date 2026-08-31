@@ -10762,8 +10762,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "biblatex",
+ "clock",
  "collections",
  "editor",
+ "futures 0.3.32",
  "fuzzy",
  "gpui",
  "image",
