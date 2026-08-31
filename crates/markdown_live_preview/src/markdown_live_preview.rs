@@ -405,6 +405,11 @@ struct MarkerSet {
     /// Pandoc-style citation keys (`@key` including the `@`), styled as
     /// reference chips once the surrounding brackets are concealed.
     citations: Vec<Range<Anchor>>,
+    /// Bare in-text citation keys (`@key` outside any brackets). Pandoc
+    /// treats these as citations too, but prose is full of `@handles` that
+    /// cite nothing, so they only chip when the key resolves against the
+    /// bibliography — and are never flagged unresolved.
+    bare_citations: Vec<Range<Anchor>>,
     /// Bodies of Obsidian `==highlight==` marks, painted with a highlighter
     /// background once the `==` delimiters are concealed.
     highlights: Vec<Range<Anchor>>,
@@ -796,24 +801,34 @@ fn apply_emphasis_highlights(
     let bibliography = Bibliography::global(cx);
     let mut resolved_citations = markers.map(|markers| markers.citations.clone());
     let mut unknown_citations = markers.map(|_| Vec::new());
-    if let Some(citations) = resolved_citations.as_mut()
-        && !citations.is_empty()
+    if let Some(markers) = markers
+        && (!markers.citations.is_empty() || !markers.bare_citations.is_empty())
         && bibliography.read(cx).has_entries()
     {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
         let bibliography = bibliography.read(cx);
-        let mut known = Vec::with_capacity(citations.len());
-        let mut unknown = Vec::new();
-        for range in citations.drain(..) {
+        let resolves = |range: &Range<Anchor>| {
             let text: String = snapshot.text_for_range(range.clone()).collect();
             let key = text.strip_prefix('@').unwrap_or(&text);
-            if bibliography.resolve(key).is_some() {
-                known.push(range);
+            bibliography.resolve(key).is_some()
+        };
+        let mut known = Vec::with_capacity(markers.citations.len());
+        let mut unknown = Vec::new();
+        for range in &markers.citations {
+            if resolves(range) {
+                known.push(range.clone());
             } else {
-                unknown.push(range);
+                unknown.push(range.clone());
             }
         }
-        *citations = known;
+        // A bare key is only a citation if it cites something; an
+        // unresolved one is somebody's `@handle` and stays prose.
+        for range in &markers.bare_citations {
+            if resolves(range) {
+                known.push(range.clone());
+            }
+        }
+        resolved_citations = Some(known);
         unknown_citations = Some(unknown);
     }
 
@@ -5498,6 +5513,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges: Vec::new(),
         ordered_markers: Vec::new(),
         citations: Vec::new(),
+        bare_citations: Vec::new(),
         highlights: Vec::new(),
         tags: Vec::new(),
     };
@@ -5528,6 +5544,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        bare_citations,
         highlights,
         tags,
         ..
@@ -5568,6 +5585,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        bare_citations,
         highlights,
         tags,
     })
@@ -5593,6 +5611,7 @@ struct Extraction<'a> {
     definition_ranges: Vec<Range<Anchor>>,
     ordered_markers: Vec<Range<Anchor>>,
     citations: Vec<Range<Anchor>>,
+    bare_citations: Vec<Range<Anchor>>,
     highlights: Vec<Range<Anchor>>,
     tags: Vec<Range<Anchor>>,
 }
@@ -6217,6 +6236,10 @@ impl Extraction<'_> {
                 continue;
             };
             let mut search_from = 0;
+            // Every `[...]` span seen, kept or not, so the bare pass below
+            // never claims a key inside a bracket construct (a rejected
+            // group, a link label, a wikilink).
+            let mut bracket_spans: Vec<Range<usize>> = Vec::new();
             while let Some(open_offset) = region_text[search_from..].find('[') {
                 let open = search_from + open_offset;
                 search_from = open + 1;
@@ -6224,6 +6247,7 @@ impl Extraction<'_> {
                     break;
                 };
                 let close = open + 1 + close_offset;
+                bracket_spans.push(open..close + 1);
                 let inner = &region_text[open + 1..close];
                 if inner.is_empty() || inner.contains('\n') || inner.contains('[') {
                     continue;
@@ -6265,6 +6289,29 @@ impl Extraction<'_> {
                     self.citations.push(range);
                 }
                 search_from = close + 1;
+            }
+
+            // Pandoc also allows in-text citations with no brackets
+            // (`@hayashi2003 argues`), which is what accepting a bare `@`
+            // completion produces. `citation_keys`'s boundary rules already
+            // reject an email's or URL's infix `@`.
+            for key in citation_keys(region_text) {
+                if bracket_spans
+                    .iter()
+                    .any(|span| span.start < key.end && key.start < span.end)
+                {
+                    continue;
+                }
+                let start = region.start + key.start;
+                let end = region.start + key.end;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                self.bare_citations.push(self.anchor_range(start..end));
             }
         }
         self.prose_regions = regions;
