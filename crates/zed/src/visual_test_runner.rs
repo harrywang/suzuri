@@ -2567,8 +2567,8 @@ fn run_tool_permissions_visual_tests(
 
 /// Drives the citation pipeline in a real rendered window: opens a vault
 /// carrying a `.bib` and a note, waits for the bibliography to index, and
-/// captures two baselines — the note's citation styling (resolved chips, a
-/// red-flagged bracketed unknown, a bare unresolved key left as prose) and
+/// captures two baselines — the note's citation styling (resolved chips
+/// bracketed and bare, red-flagged unknowns, an email left as prose) and
 /// the cite-key completion menu opened by typing `@` at the end of the note.
 #[cfg(target_os = "macos")]
 fn run_citation_pipeline_visual_tests(
@@ -2604,7 +2604,7 @@ fn run_citation_pipeline_visual_tests(
         "# Citation check\n\n\
          Resolved keys chip: [@hayashi2003], grouped [@wong1987; @hayashi2003].\n\n\
          A bracketed unknown flags red: [@phantom1999].\n\n\
-         Bare resolved chips: @hayashi2003 argues. Bare unresolved stays prose: \
+         Bare resolved chips: @hayashi2003 argues. Bare unresolved flags too: \
          @somehandle. Emails never chip: curator@example.com.\n\n\
          Type below:\n\n",
     )?;

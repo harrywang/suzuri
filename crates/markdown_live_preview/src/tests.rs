@@ -3199,11 +3199,11 @@ async fn test_duplicate_bib_keys_complete_once(cx: &mut TestAppContext) {
 }
 
 /// Pandoc also allows in-text citations with no brackets (`@key argues`),
-/// which is what accepting a bare `@` completion produces. Prose is full of
-/// `@handles` that cite nothing, so a bare key chips only when it resolves —
-/// and is never flagged unresolved.
+/// which is what accepting a bare `@` completion produces. They verify
+/// exactly like bracketed ones — chip when resolved, red flag when not —
+/// while emails, infix `@`, and code spans never register at all.
 #[gpui::test]
-async fn test_bare_in_text_citations_chip_only_when_resolved(cx: &mut TestAppContext) {
+async fn test_bare_in_text_citations_chip_and_flag_like_bracketed(cx: &mut TestAppContext) {
     let (editor, _fs, cx) = markdown_vault_test_context(
         cx,
         &[
@@ -3225,12 +3225,12 @@ async fn test_bare_in_text_citations_chip_only_when_resolved(cx: &mut TestAppCon
     assert_eq!(
         highlighted_texts(&editor, CITATION, cx),
         vec!["@smith2020"],
-        "only the bare key that resolves chips"
+        "the bare key that resolves chips"
     );
     assert_eq!(
         highlighted_texts(&editor, CITATION_UNKNOWN, cx),
-        Vec::<String>::new(),
-        "an unresolved bare key is prose, never a red flag"
+        vec!["@somehandle"],
+        "the bare key that resolves to nothing flags, like a bracketed one"
     );
 }
 

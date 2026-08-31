@@ -412,9 +412,10 @@ struct MarkerSet {
     /// end (or forward-deleting at its start) removes the whole group.
     citation_groups: Vec<Range<Anchor>>,
     /// Bare in-text citation keys (`@key` outside any brackets). Pandoc
-    /// treats these as citations too, but prose is full of `@handles` that
-    /// cite nothing, so they only chip when the key resolves against the
-    /// bibliography — and are never flagged unresolved.
+    /// treats these as citations exactly like bracketed ones, and so does
+    /// the styling: chip when the key resolves, red flag when it does not.
+    /// The flagging only starts once the vault has a bibliography with
+    /// entries, which is what keeps `@handles` in bib-less prose unflagged.
     bare_citations: Vec<Range<Anchor>>,
     /// Bodies of Obsidian `==highlight==` marks, painted with a highlighter
     /// background once the `==` delimiters are concealed.
@@ -827,11 +828,11 @@ fn apply_emphasis_highlights(
                 unknown.push(range.clone());
             }
         }
-        // A bare key is only a citation if it cites something; an
-        // unresolved one is somebody's `@handle` and stays prose.
         for range in &markers.bare_citations {
             if resolves(range) {
                 known.push(range.clone());
+            } else {
+                unknown.push(range.clone());
             }
         }
         resolved_citations = Some(known);
