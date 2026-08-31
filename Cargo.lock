@@ -23372,6 +23372,7 @@ dependencies = [
  "title_bar",
  "toolchain_selector",
  "tracing",
+ "tree-sitter-md",
  "typeset_preview",
  "ui",
  "ui_prompt",

@@ -56,6 +56,7 @@ visual-tests = [
     "fs/test-support",
     "recent_projects/test-support",
     "title_bar/test-support",
+    "dep:tree-sitter-md",
 ]
 
 [[bin]]
@@ -141,6 +142,7 @@ semver.workspace = true
 system_specs.workspace = true
 tabular_data_preview.workspace = true
 tempfile = { workspace = true, optional = true }
+tree-sitter-md = { workspace = true, optional = true }
 
 edit_prediction.workspace = true
 edit_prediction_ui.workspace = true

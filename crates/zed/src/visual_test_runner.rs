@@ -103,8 +103,8 @@ use {
     feature_flags::FeatureFlagAppExt as _,
     git_ui::project_diff::ProjectDiff,
     gpui::{
-        App, AppContext as _, Bounds, Entity, KeyBinding, Modifiers, VisualTestAppContext,
-        WindowBounds, WindowHandle, WindowOptions, point, px, size,
+        App, AppContext as _, Bounds, Entity, Focusable as _, KeyBinding, Modifiers,
+        VisualTestAppContext, WindowBounds, WindowHandle, WindowOptions, point, px, size,
     },
     image::RgbaImage,
     project::{AgentId, Project},
@@ -224,6 +224,7 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             cx,
         );
         settings_ui::init(cx);
+        markdown_live_preview::init(cx);
 
         // Load default keymaps so tooltips can show keybindings like "f9" for ToggleBreakpoint
         // We load a minimal set of editor keybindings needed for visual tests
@@ -243,6 +244,20 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
             cx,
         );
     });
+
+    // The citation pipeline test renders live preview, which needs both real
+    // markdown grammars. Registered after init so no earlier test's file
+    // (main.rs, panels) picks up a language it did not have when its
+    // baseline was recorded.
+    app_state.languages.add(language::markdown_lang());
+    app_state.languages.add(Arc::new(language::Language::new(
+        language::LanguageConfig {
+            name: "Markdown-Inline".into(),
+            hidden: true,
+            ..language::LanguageConfig::default()
+        },
+        Some(tree_sitter_md::INLINE_LANGUAGE.into()),
+    )));
 
     // Run until all initialization tasks complete
     cx.run_until_parked();
@@ -621,6 +636,23 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
         Err(e) => {
             eprintln!("✗ settings_ui_subpage_auto_open: FAILED - {}", e);
+            failed += 1;
+        }
+    }
+
+    // Run Test 11: Citation pipeline (live preview chips + completion menu)
+    println!("\n--- Test 11: citation_pipeline (2 variants) ---");
+    match run_citation_pipeline_visual_tests(app_state.clone(), &mut cx, update_baseline) {
+        Ok(TestResult::Passed) => {
+            println!("✓ citation_pipeline: PASSED");
+            passed += 1;
+        }
+        Ok(TestResult::BaselineUpdated(_)) => {
+            println!("✓ citation_pipeline: Baselines updated");
+            updated += 1;
+        }
+        Err(e) => {
+            eprintln!("✗ citation_pipeline: FAILED - {}", e);
             failed += 1;
         }
     }
@@ -2531,6 +2563,192 @@ fn run_tool_permissions_visual_tests(
 
     // Return success - we're just capturing screenshots, not comparing baselines
     Ok(TestResult::Passed)
+}
+
+/// Drives the citation pipeline in a real rendered window: opens a vault
+/// carrying a `.bib` and a note, waits for the bibliography to index, and
+/// captures two baselines — the note's citation styling (resolved chips, a
+/// red-flagged bracketed unknown, a bare unresolved key left as prose) and
+/// the cite-key completion menu opened by typing `@` at the end of the note.
+#[cfg(target_os = "macos")]
+fn run_citation_pipeline_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    use markdown_live_preview::Bibliography;
+
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.keep();
+    let canonical_temp = temp_path.canonicalize()?;
+    let vault_dir = canonical_temp.join("vault");
+    std::fs::create_dir_all(&vault_dir)?;
+    std::fs::write(
+        vault_dir.join("refs.bib"),
+        r#"@article{hayashi2003,
+  author  = {Hayashi, Noriko and Duan, Wei},
+  title   = {Water Retention in Fine-Grained Slate},
+  journal = {Studies in Calligraphic Materials},
+  year    = {2003},
+}
+
+@book{wong1987,
+  author = {Wong, Mei-Ling},
+  title  = {Grinding Slow: A Practical Manual for the Inkstone},
+  date   = {1987-05-01},
+}
+"#,
+    )?;
+    std::fs::write(
+        vault_dir.join("citations.md"),
+        "# Citation check\n\n\
+         Resolved keys chip: [@hayashi2003], grouped [@wong1987; @hayashi2003].\n\n\
+         A bracketed unknown flags red: [@phantom1999].\n\n\
+         Bare resolved chips: @hayashi2003 argues. Bare unresolved stays prose: \
+         @somehandle. Emails never chip: curator@example.com.\n\n\
+         Type below:\n\n",
+    )?;
+
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(1280.0), px(800.0)),
+    };
+    let workspace_window: WindowHandle<Workspace> = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                cx.new(|cx| Workspace::new(None, project.clone(), app_state.clone(), window, cx))
+            },
+        )
+    })?;
+    cx.run_until_parked();
+
+    let add_worktree_task = workspace_window.update(cx, |workspace, _window, cx| {
+        workspace.project().update(cx, |project, cx| {
+            project.find_or_create_worktree(&vault_dir, true, cx)
+        })
+    })?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree_task)
+        .context("Failed to add vault worktree")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let open_task = workspace_window.update(cx, |workspace, window, cx| {
+        let worktree = workspace
+            .project()
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .context("vault worktree missing")?;
+        let worktree_id = worktree.read(cx).id();
+        let rel_path: std::sync::Arc<util::rel_path::RelPath> =
+            util::rel_path::rel_path("citations.md").into();
+        let project_path: project::ProjectPath = (worktree_id, rel_path).into();
+        anyhow::Ok(workspace.open_path(project_path, None, true, window, cx))
+    })??;
+    cx.background_executor.allow_parking();
+    let opened = cx.foreground_executor.block_test(open_task);
+    cx.background_executor.forbid_parking();
+    let item = opened.context("Failed to open citations.md")?;
+    cx.run_until_parked();
+
+    // The bibliography loads off the real filesystem on a detached task the
+    // test dispatcher cannot see the end of; poll it with parking allowed.
+    cx.background_executor.allow_parking();
+    for _ in 0..200 {
+        cx.run_until_parked();
+        let ready = cx.update(|cx| Bibliography::global(cx).read(cx).has_entries());
+        if ready {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    cx.background_executor.forbid_parking();
+    let ready = cx.update(|cx| Bibliography::global(cx).read(cx).has_entries());
+    anyhow::ensure!(ready, "bibliography never indexed refs.bib");
+    cx.run_until_parked();
+
+    let rendering = run_visual_test(
+        "citation_rendering",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+
+    // Park the cursor at the end of the note and type a bare `@`, which must
+    // pop the cite-key completion menu.
+    let editor = item
+        .downcast::<editor::Editor>()
+        .context("citations.md did not open in an editor")?;
+    workspace_window.update(cx, |_workspace, window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.move_to_end(&editor::actions::MoveToEnd, window, cx);
+        });
+        let focus_handle = editor.read(cx).focus_handle(cx);
+        window.focus(&focus_handle, cx);
+    })?;
+    cx.run_until_parked();
+    cx.simulate_input(workspace_window.into(), "@");
+    cx.run_until_parked();
+
+    let menu_open = cx.update_window(workspace_window.into(), |_, _, cx| {
+        editor.read(cx).context_menu_visible()
+    })?;
+    anyhow::ensure!(menu_open, "typing @ did not open the completion menu");
+
+    let completion = run_visual_test(
+        "citation_completion_menu",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+
+    workspace_window
+        .update(cx, |workspace, _window, cx| {
+            workspace.project().update(cx, |project, cx| {
+                let worktree_ids: Vec<_> =
+                    project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
+                for id in worktree_ids {
+                    project.remove_worktree(id, cx);
+                }
+            });
+        })
+        .log_err();
+    cx.update_window(workspace_window.into(), |_, window, _cx| {
+        window.remove_window();
+    })
+    .log_err();
+    cx.run_until_parked();
+
+    match (rendering?, completion?) {
+        (TestResult::Passed, TestResult::Passed) => Ok(TestResult::Passed),
+        (TestResult::BaselineUpdated(path), _) | (_, TestResult::BaselineUpdated(path)) => {
+            Ok(TestResult::BaselineUpdated(path))
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
