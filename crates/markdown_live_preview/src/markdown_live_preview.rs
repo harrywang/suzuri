@@ -25,10 +25,10 @@ use editor::{
     },
 };
 use gpui::{
-    App, AppContext as _, Context, Empty, Entity, Focusable as _, FontWeight, HighlightStyle, Hsla,
-    ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource, RetainAllImageCache,
-    SharedString, SharedUri, StrikethroughStyle, Subscription, TextStyleRefinement, WeakEntity,
-    Window, actions, img, rems,
+    App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
+    HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
+    RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
+    TextStyleRefinement, WeakEntity, Window, actions, img, rems,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -2828,6 +2828,23 @@ fn render_table_block(
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
         let max_width = block_cx.max_width;
+        // `max_width` includes the editor's horizontal scroll range, so any
+        // long line in the buffer would stretch the table with it. Cap the
+        // grid at the editor's visible width instead and scroll the overflow
+        // inside the block: replace blocks never extend the editor's own
+        // scroll range, so content past the viewport would be unreachable.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(max_width);
+        let grid_max_width =
+            (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
+                .max(gpui::px(200.));
         let colors = block_cx.app.theme().colors().clone();
 
         let (active_range, active_editor) = editor
@@ -2888,6 +2905,19 @@ fn render_table_block(
             })
             .unwrap_or((None, None, None));
 
+        // Fixed per-column widths keep every row's cells aligned without
+        // flex growth: growing distributed leftover space equally, which
+        // ballooned short columns whenever the block was wider than the
+        // table's content.
+        let column_width = |weight: f32| gpui::px((weight * 8. + 20.).max(48.));
+        let handle_width = gpui::px(14.);
+        // The grid needs its explicit content width: fixed-width cells only
+        // overflow their rows visually, so without it the scroll container
+        // measures no overflow and refuses to scroll.
+        let grid_width = column_weights
+            .iter()
+            .fold(handle_width, |total, weight| total + column_width(*weight));
+
         let render_cell = |cell_range: &Range<Anchor>,
                            markdown: &Entity<Markdown>,
                            column: usize,
@@ -2944,9 +2974,8 @@ fn render_table_block(
                             .unwrap_or_else(|| "h".into())
                     )
                 })
-                .flex_grow(1.)
-                .flex_basis(gpui::px(weight * 8.))
-                .min_w(gpui::px(48.))
+                .flex_none()
+                .w(column_width(weight))
                 .px_2()
                 .py_1()
                 .min_h(block_cx.line_height + gpui::px(10.))
@@ -3050,7 +3079,6 @@ fn render_table_block(
             cell
         };
 
-        let handle_width = gpui::px(14.);
         let record_press = {
             let weak = editor.clone();
             move |event: &gpui::MouseDownEvent, _: &mut Window, cx: &mut App| {
@@ -3111,7 +3139,7 @@ fn render_table_block(
                 })
         };
 
-        let mut grid = v_flex().flex_grow(1.);
+        let mut grid = v_flex().flex_none().w(grid_width);
         // Column handles.
         grid = grid.child(h_flex().child(div().w(handle_width)).children(
             structure.header.iter().enumerate().map(|(column, _)| {
@@ -3120,9 +3148,8 @@ fn render_table_block(
                 div()
                     .id(("mdlp-column-handle", column))
                     .debug_selector(|| format!("mdlp-column-handle-{column}"))
-                    .flex_grow(1.)
-                    .flex_basis(gpui::px(weight * 8.))
-                    .min_w(gpui::px(48.))
+                    .flex_none()
+                    .w(column_width(weight))
                     .h(gpui::px(10.))
                     .px_2()
                     .cursor_pointer()
@@ -3251,45 +3278,11 @@ fn render_table_block(
             }
         };
         let accent = colors.border_focused;
-        grid = grid.child(
-            h_flex()
-                .items_stretch()
-                .when_some(row_insertion(None), |this, after| {
-                    let bar = div()
-                        .absolute()
-                        .left_0()
-                        .right_0()
-                        .h(gpui::px(3.))
-                        .bg(accent);
-                    this.relative().child(if after {
-                        bar.bottom(gpui::px(-2.))
-                    } else {
-                        bar.top(gpui::px(-2.))
-                    })
-                })
-                .on_drag_move::<TableRowDrag>(row_track_drag(None))
-                .child(row_handle(None))
-                .child(
-                    h_flex().items_stretch().flex_grow(1.).children(
-                        header_markdown
-                            .iter()
-                            .enumerate()
-                            .map(|(column, markdown)| {
-                                let empty = Range {
-                                    start: Anchor::Min,
-                                    end: Anchor::Min,
-                                };
-                                let range = structure.header.get(column).unwrap_or(&empty);
-                                render_cell(range, markdown, column, None)
-                            }),
-                    ),
-                ),
-        );
-        for (row_index, row_markdown) in rows_markdown.iter().enumerate() {
-            grid = grid.child(
+        grid =
+            grid.child(
                 h_flex()
                     .items_stretch()
-                    .when_some(row_insertion(Some(row_index)), |this, after| {
+                    .when_some(row_insertion(None), |this, after| {
                         let bar = div()
                             .absolute()
                             .left_0()
@@ -3302,23 +3295,58 @@ fn render_table_block(
                             bar.top(gpui::px(-2.))
                         })
                     })
-                    .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
-                    .child(row_handle(Some(row_index)))
-                    .child(h_flex().items_stretch().flex_grow(1.).children(
-                        row_markdown.iter().enumerate().map(|(column, markdown)| {
-                            let empty = Range {
-                                start: Anchor::Min,
-                                end: Anchor::Min,
-                            };
-                            let range = structure
-                                .rows
-                                .get(row_index)
-                                .and_then(|row| row.get(column))
-                                .unwrap_or(&empty);
-                            render_cell(range, markdown, column, Some(row_index))
-                        }),
-                    )),
+                    .on_drag_move::<TableRowDrag>(row_track_drag(None))
+                    .child(row_handle(None))
+                    .child(
+                        h_flex()
+                            .items_stretch()
+                            .children(header_markdown.iter().enumerate().map(
+                                |(column, markdown)| {
+                                    let empty = Range {
+                                        start: Anchor::Min,
+                                        end: Anchor::Min,
+                                    };
+                                    let range = structure.header.get(column).unwrap_or(&empty);
+                                    render_cell(range, markdown, column, None)
+                                },
+                            )),
+                    ),
             );
+        for (row_index, row_markdown) in rows_markdown.iter().enumerate() {
+            grid =
+                grid.child(
+                    h_flex()
+                        .items_stretch()
+                        .when_some(row_insertion(Some(row_index)), |this, after| {
+                            let bar = div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .h(gpui::px(3.))
+                                .bg(accent);
+                            this.relative().child(if after {
+                                bar.bottom(gpui::px(-2.))
+                            } else {
+                                bar.top(gpui::px(-2.))
+                            })
+                        })
+                        .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
+                        .child(row_handle(Some(row_index)))
+                        .child(h_flex().items_stretch().children(
+                            row_markdown.iter().enumerate().map(|(column, markdown)| {
+                                let empty = Range {
+                                    start: Anchor::Min,
+                                    end: Anchor::Min,
+                                };
+                                let range = structure
+                                    .rows
+                                    .get(row_index)
+                                    .and_then(|row| row.get(column))
+                                    .unwrap_or(&empty);
+                                render_cell(range, markdown, column, Some(row_index))
+                            }),
+                        )),
+                );
         }
 
         let add_column_editor = editor.clone();
@@ -3479,6 +3507,9 @@ fn render_table_block(
         div()
             .pl(gutter_width)
             .w(max_width)
+            // Flex, not block: the table column should take its content
+            // width so the add-row strip and controls hug the grid.
+            .flex()
             .group("mdlp-table")
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
@@ -3487,89 +3518,105 @@ fn render_table_block(
             .on_drop::<TableColumnDrag>(container_column_drop)
             .child(
                 v_flex()
-                    .max_w(max_width * 0.95)
                     .children(controls)
                     .child(
-                        h_flex().items_stretch().child(grid).child(
-                            v_flex()
-                                .w(gpui::px(22.))
-                                .child(
-                                    // Reveal the table's markdown source.
-                                    div()
-                                        .id("mdlp-table-source")
-                                        .h(gpui::px(22.))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .text_color(colors.text_muted)
-                                        .opacity(0.)
-                                        .group_hover("mdlp-table", |this| this.opacity(0.7))
-                                        .hover(|this| this.opacity(1.))
-                                        .child(
-                                            Icon::new(IconName::Code)
-                                                .size(IconSize::XSmall)
-                                                .color(Color::Muted),
-                                        )
-                                        .tooltip(ui::Tooltip::text("Edit table source"))
-                                        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            reveal_source_editor
-                                                .update(cx, |editor, cx| {
-                                                    if let Some(addon) =
-                                                        editor.addon_mut::<LivePreviewAddon>()
-                                                    {
-                                                        addon.source_revealed =
-                                                            Some(reveal_source_range.clone());
-                                                    }
-                                                    let snapshot =
-                                                        editor.buffer().read(cx).snapshot(cx);
-                                                    let offset = reveal_source_range
-                                                        .start
-                                                        .to_offset(&snapshot);
-                                                    editor.change_selections(
-                                                        Default::default(),
-                                                        window,
-                                                        cx,
-                                                        |selections| {
-                                                            selections
-                                                                .select_ranges([offset..offset]);
-                                                        },
-                                                    );
-                                                })
-                                                .log_err();
-                                        }),
-                                )
-                                .child(
-                                    // Add column to the right.
-                                    div()
-                                        .id("mdlp-add-column")
-                                        .flex_grow(1.)
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .cursor_pointer()
-                                        .text_color(colors.text_muted)
-                                        .opacity(0.)
-                                        .group_hover("mdlp-table", |this| this.opacity(0.7))
-                                        .hover(|this| this.opacity(1.))
-                                        .child("+")
-                                        .tooltip(ui::Tooltip::text("Add column to the right"))
-                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                            cx.stop_propagation();
-                                            add_column_editor
-                                                .update(cx, |editor, cx| {
-                                                    apply_table_structural_change(
-                                                        editor,
-                                                        &add_column_range,
-                                                        TableStructuralChange::AddColumn,
-                                                        cx,
-                                                    );
-                                                })
-                                                .log_err();
-                                        }),
-                                ),
-                        ),
+                        h_flex()
+                            .items_stretch()
+                            .child(
+                                div()
+                                    .id(ElementId::from(block_cx.block_id))
+                                    .debug_selector(|| "mdlp-table-scroll".into())
+                                    .max_w(grid_max_width)
+                                    .overflow_x_scroll()
+                                    .child(grid),
+                            )
+                            .child(
+                                v_flex()
+                                    .w(gpui::px(22.))
+                                    .child(
+                                        // Reveal the table's markdown source.
+                                        div()
+                                            .id("mdlp-table-source")
+                                            .h(gpui::px(22.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .text_color(colors.text_muted)
+                                            .opacity(0.)
+                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                            .hover(|this| this.opacity(1.))
+                                            .child(
+                                                Icon::new(IconName::Code)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .tooltip(ui::Tooltip::text("Edit table source"))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_, window, cx| {
+                                                    cx.stop_propagation();
+                                                    reveal_source_editor
+                                                        .update(cx, |editor, cx| {
+                                                            if let Some(addon) = editor
+                                                                .addon_mut::<LivePreviewAddon>(
+                                                            ) {
+                                                                addon.source_revealed = Some(
+                                                                    reveal_source_range.clone(),
+                                                                );
+                                                            }
+                                                            let snapshot = editor
+                                                                .buffer()
+                                                                .read(cx)
+                                                                .snapshot(cx);
+                                                            let offset = reveal_source_range
+                                                                .start
+                                                                .to_offset(&snapshot);
+                                                            editor.change_selections(
+                                                                Default::default(),
+                                                                window,
+                                                                cx,
+                                                                |selections| {
+                                                                    selections.select_ranges([
+                                                                        offset..offset,
+                                                                    ]);
+                                                                },
+                                                            );
+                                                        })
+                                                        .log_err();
+                                                },
+                                            ),
+                                    )
+                                    .child(
+                                        // Add column to the right.
+                                        div()
+                                            .id("mdlp-add-column")
+                                            .flex_grow(1.)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .text_color(colors.text_muted)
+                                            .opacity(0.)
+                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                            .hover(|this| this.opacity(1.))
+                                            .child("+")
+                                            .tooltip(ui::Tooltip::text("Add column to the right"))
+                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                add_column_editor
+                                                    .update(cx, |editor, cx| {
+                                                        apply_table_structural_change(
+                                                            editor,
+                                                            &add_column_range,
+                                                            TableStructuralChange::AddColumn,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .log_err();
+                                            }),
+                                    ),
+                            ),
                     )
                     .child(
                         // Add row below.
