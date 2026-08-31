@@ -3143,6 +3143,61 @@ async fn test_citation_completion_offers_bib_keys(cx: &mut TestAppContext) {
     });
 }
 
+/// A vault often holds several copies of one master bibliography (a
+/// `references.bib` per paper); a key defined in many files is still one
+/// citation and must appear once in the menu.
+#[gpui::test]
+async fn test_duplicate_bib_keys_complete_once(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let shared = "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n";
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "cite [@smi"),
+            ("refs.bib", shared),
+            ("paper-copy.bib", shared),
+            ("another-copy.bib", shared),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let task = editor.update_in(cx, |editor, window, cx| {
+        let project = editor.project().expect("vault editor has a project").clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("cite [@smi".len());
+        provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        )
+    });
+    let responses = task.await.expect("completions succeed");
+
+    let keys: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .map(|completion| completion.new_text)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["smith2020"],
+        "a key defined in three .bib files is offered exactly once"
+    );
+}
+
 #[gpui::test]
 async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) {
     let cases: &[(&str, Option<usize>)] = &[

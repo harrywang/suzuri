@@ -332,8 +332,13 @@ impl CompletionProvider for CitationCompletionProvider {
         if let Some(replace_range) = citation {
             let bibliography = self.bibliography.read(cx);
             if bibliography.has_entries() {
+                // The same key routinely appears in several `.bib` files
+                // (per-paper copies of one master bibliography); the menu
+                // wants one row per key, not one per file.
+                let mut seen = HashSet::default();
                 let completions = bibliography
                     .entries()
+                    .filter(|entry| seen.insert(entry.key.clone()))
                     .map(|entry| Completion {
                         replace_range: replace_range.clone(),
                         new_text: entry.key.to_string(),
