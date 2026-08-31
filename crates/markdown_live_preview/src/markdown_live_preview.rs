@@ -38,7 +38,7 @@ use multi_buffer::{
     Anchor, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset as _, ToPoint as _,
 };
 use project::{PathChange, Project, ProjectPath};
-use settings::{RegisterSetting, Settings};
+use settings::{IntoGpui as _, RegisterSetting, Settings, SettingsStore};
 use text::Point;
 use ui::{Checkbox, ContextMenu, ContextMenuEntry, ToggleState, prelude::*};
 use util::ResultExt as _;
@@ -61,16 +61,155 @@ const MARKDOWN_INLINE: &str = "Markdown-Inline";
 mod bibliography;
 pub use bibliography::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
 
-#[derive(Clone, Copy, Debug, Default, RegisterSetting)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkdownHeadingStyle {
+    pub font_size: f32,
+    pub font_weight: FontWeight,
+}
+
+impl MarkdownHeadingStyle {
+    fn with_content(self, content: Option<settings::MarkdownHeadingStyleSettingsContent>) -> Self {
+        let Some(content) = content else {
+            return self;
+        };
+        Self {
+            font_size: content
+                .font_size
+                .filter(|size| size.is_finite() && *size > 0.0)
+                .unwrap_or(self.font_size),
+            font_weight: content
+                .font_weight
+                .map(|weight| weight.into_gpui())
+                .unwrap_or(self.font_weight),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkdownHeadingStyles {
+    pub h1: MarkdownHeadingStyle,
+    pub h2: MarkdownHeadingStyle,
+    pub h3: MarkdownHeadingStyle,
+    pub h4: MarkdownHeadingStyle,
+    pub h5: MarkdownHeadingStyle,
+    pub h6: MarkdownHeadingStyle,
+}
+
+impl Default for MarkdownHeadingStyles {
+    fn default() -> Self {
+        Self {
+            h1: MarkdownHeadingStyle {
+                font_size: 1.6,
+                font_weight: FontWeight::BLACK,
+            },
+            h2: MarkdownHeadingStyle {
+                font_size: 1.4,
+                font_weight: FontWeight::EXTRA_BOLD,
+            },
+            h3: MarkdownHeadingStyle {
+                font_size: 1.2,
+                font_weight: FontWeight::BOLD,
+            },
+            h4: MarkdownHeadingStyle {
+                font_size: 1.1,
+                font_weight: FontWeight::SEMIBOLD,
+            },
+            h5: MarkdownHeadingStyle {
+                font_size: 1.0,
+                font_weight: FontWeight::MEDIUM,
+            },
+            h6: MarkdownHeadingStyle {
+                font_size: 0.9,
+                font_weight: FontWeight::NORMAL,
+            },
+        }
+    }
+}
+
+impl MarkdownHeadingStyles {
+    fn for_level(self, level: u8) -> MarkdownHeadingStyle {
+        match level {
+            1 => self.h1,
+            2 => self.h2,
+            3 => self.h3,
+            4 => self.h4,
+            5 => self.h5,
+            _ => self.h6,
+        }
+    }
+}
+const HEADING_LINE_HEIGHT_MULTIPLIER: f32 = 1.25;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeadingMetrics {
+    text: MarkdownHeadingStyle,
+    font_size: gpui::Pixels,
+    content_line_height: gpui::Pixels,
+}
+
+fn heading_metrics(level: Option<u8>, cx: &App) -> HeadingMetrics {
+    let theme = theme_settings::ThemeSettings::get_global(cx);
+    let text = level.map_or(
+        MarkdownHeadingStyle {
+            font_size: 1.0,
+            font_weight: theme.buffer_font.weight,
+        },
+        |level| {
+            MarkdownLivePreviewSettings::get_global(cx)
+                .heading_styles
+                .for_level(level)
+        },
+    );
+    let base_font_size = theme.buffer_font_size(cx);
+    let font_size = base_font_size * text.font_size;
+    let content_line_height = level.map_or_else(
+        || (base_font_size * theme.line_height()).round(),
+        |_| {
+            let text_system = cx.text_system();
+            let font_id = text_system.resolve_font(&theme.buffer_font);
+            let glyph_height = text_system.ascent(font_id, font_size)
+                + text_system.descent(font_id, font_size).abs();
+            gpui::px(
+                (f32::from(font_size) * HEADING_LINE_HEIGHT_MULTIPLIER)
+                    .max(f32::from(glyph_height)),
+            )
+            .ceil()
+        },
+    );
+    HeadingMetrics {
+        text,
+        font_size,
+        content_line_height,
+    }
+}
+
+fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
+    let base = heading_metrics(None, cx).content_line_height;
+    let heading = heading_metrics(level, cx).content_line_height;
+    (heading / base).max(0.01)
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, RegisterSetting)]
+
 pub struct MarkdownLivePreviewSettings {
     pub enabled: bool,
+    pub heading_styles: MarkdownHeadingStyles,
 }
 
 impl Settings for MarkdownLivePreviewSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let content = content.markdown_live_preview.clone().unwrap_or_default();
+        let heading_content = content.heading_styles.unwrap_or_default();
+        let defaults = MarkdownHeadingStyles::default();
         Self {
             enabled: content.enabled.unwrap_or(true),
+            heading_styles: MarkdownHeadingStyles {
+                h1: defaults.h1.with_content(heading_content.h1),
+                h2: defaults.h2.with_content(heading_content.h2),
+                h3: defaults.h3.with_content(heading_content.h3),
+                h4: defaults.h4.with_content(heading_content.h4),
+                h5: defaults.h5.with_content(heading_content.h5),
+                h6: defaults.h6.with_content(heading_content.h6),
+            },
         }
     }
 }
@@ -137,6 +276,11 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
             .addon::<LivePreviewAddon>()
             .and_then(|addon| addon.markers.clone());
         apply_emphasis_highlights(editor, markers.as_deref(), cx);
+        apply_heading_line_styles(editor, markers.as_deref(), cx);
+    }));
+
+    subscriptions.push(cx.observe_global::<SettingsStore>(|editor, cx| {
+        recompute(editor, cx);
     }));
 
     let weak_editor = cx.weak_entity();
@@ -517,6 +661,10 @@ struct BlockMarker {
 enum BlockRenderKind {
     /// Rendered through `MarkdownElement`.
     Markdown,
+    /// An ATX heading. It stays rendered when selected, showing its raw
+    /// source inside the styled block so keyboard navigation does not collapse
+    /// the heading back to an ordinary editor line.
+    Heading { level: u8 },
     /// A horizontal rule, rendered as a plain divider: a lone `---` fed to
     /// the markdown parser would be misread as a frontmatter opener.
     Rule,
@@ -757,6 +905,9 @@ enum FrontmatterValue {
 struct AppliedBlock {
     range: Range<Anchor>,
     source: String,
+    kind: BlockRenderKind,
+    height_estimate: u32,
+    indent_columns: u32,
     /// True when the widget is placed below its source lines instead of
     /// replacing them — display math while its source is revealed.
     below: bool,
@@ -799,6 +950,7 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
     };
     addon.markers = markers.clone();
     apply_emphasis_highlights(editor, markers.as_deref(), cx);
+    apply_heading_line_styles(editor, markers.as_deref(), cx);
     apply_decorations(editor, cx);
 }
 
@@ -814,6 +966,7 @@ const CITATION: usize = 6;
 const HIGHLIGHT: usize = 7;
 const TAG: usize = 8;
 const CITATION_UNKNOWN: usize = 9;
+const HEADING_STYLE_BASE: usize = 100;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
 /// bold/italic styling, overriding the theme's source-mode markup colors
@@ -989,6 +1142,55 @@ fn apply_emphasis_highlights(
     }
 }
 
+fn apply_heading_line_styles(
+    editor: &mut Editor,
+    markers: Option<&MarkerSet>,
+    cx: &mut Context<Editor>,
+) {
+    for level in 1..=6 {
+        let key = HighlightKey::MarkdownLivePreview(HEADING_STYLE_BASE + level as usize);
+        let ranges = markers
+            .map(|markers| {
+                markers
+                    .blocks
+                    .iter()
+                    .filter_map(|marker| {
+                        matches!(marker.kind, BlockRenderKind::Heading { level: marker_level }
+                            if marker_level == level)
+                        .then(|| marker.range.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if ranges.is_empty() {
+            editor.clear_highlights(key, cx);
+            continue;
+        }
+        let heading_style = MarkdownLivePreviewSettings::get_global(cx)
+            .heading_styles
+            .for_level(level);
+        editor.highlight_text(
+            key,
+            ranges.clone(),
+            HighlightStyle {
+                color: Some(cx.theme().colors().text),
+                font_weight: Some(heading_style.font_weight),
+                ..Default::default()
+            },
+            cx,
+        );
+        editor.style_lines(
+            key,
+            ranges,
+            editor::display_map::LineStyle {
+                font_scale: heading_style.font_size,
+                line_height: heading_visual_rows(Some(level), cx),
+            },
+            cx,
+        );
+    }
+}
+
 /// A block widget `apply_decorations` wants on screen this pass, paired with
 /// everything the reuse check compares against the block already applied
 /// there.
@@ -1089,12 +1291,49 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             content_key: marker_content_key(&marker.kind),
         });
     }
+    for block in &markers.blocks {
+        let BlockRenderKind::Heading { level } = block.kind else {
+            continue;
+        };
+        let start = block.range.start.to_offset(&snapshot).0;
+        let end = block.range.end.to_offset(&snapshot).0;
+        let source: String = snapshot
+            .text_for_range(MultiBufferOffset(start)..MultiBufferOffset(end))
+            .collect();
+        let (_, content_start) = atx_heading_marker_offsets(&source, level);
+        if content_start == 0 {
+            continue;
+        }
+        let revealed = !editor.selection_is_from_search()
+            && selection_offsets
+                .iter()
+                .any(|selection| selection.start <= end && start <= selection.end);
+        if revealed {
+            continue;
+        }
+        let marker_range = snapshot.anchor_before(MultiBufferOffset(start))
+            ..snapshot.anchor_after(MultiBufferOffset(start + content_start));
+        let marker = InlineMarker {
+            range: marker_range,
+            kind: InlineKind::Hide {
+                reveal_span: block.range.clone(),
+            },
+        };
+        concealments.push(Concealment {
+            range: marker.range.clone(),
+            placeholder: fold_placeholder(&marker, weak_editor.clone()),
+            content_key: 0,
+        });
+    }
     editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), concealments, cx);
 
     // --- Block widgets ---
 
     let mut desired_blocks: HashMap<(usize, usize), DesiredBlock<'_>> = HashMap::default();
     for marker in &markers.blocks {
+        if matches!(marker.kind, BlockRenderKind::Heading { .. }) {
+            continue;
+        }
         let start = marker.range.start.to_point(&snapshot);
         let end = marker.range.end.to_point(&snapshot);
         if start > end {
@@ -1102,14 +1341,13 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         }
         let mut below = false;
         if rows_intersect(&selection_rows, start.row, end.row) {
-            // Casual clicks land the cursor on widget rows constantly, which
-            // made tables and images explode into source; those reveal only
-            // via their explicit `</>` button. Frontmatter joins them so the
-            // cursor sitting at the top of a freshly opened file doesn't
-            // dissolve the properties card into raw YAML.
-            let needs_explicit_reveal = matches!(
+            // Headings remain styled while selected and expose editing inside
+            // their replacement block. Other interactive widgets reveal source
+            // only through their explicit controls.
+            let keeps_widget_when_selected = matches!(
                 marker.kind,
-                BlockRenderKind::Table(_)
+                BlockRenderKind::Heading { .. }
+                    | BlockRenderKind::Table(_)
                     | BlockRenderKind::Image { .. }
                     | BlockRenderKind::Frontmatter
             );
@@ -1123,7 +1361,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 // widget moves below the revealed source and live-updates
                 // as the formula is typed, following Obsidian.
                 below = true;
-            } else if !needs_explicit_reveal || explicitly_revealed {
+            } else if !keeps_widget_when_selected || explicitly_revealed {
                 continue;
             }
         }
@@ -1182,23 +1420,39 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             },
         );
     }
+    let mut block_autoscroll = None;
 
+    let mounted_block_ids = applied_blocks
+        .iter()
+        .filter_map(|block| {
+            editor
+                .row_for_block(block.block_id, cx)
+                .is_some()
+                .then_some(block.block_id)
+        })
+        .collect::<HashSet<_>>();
     let mut new_applied_blocks = Vec::new();
     let mut block_ids_to_remove = HashSet::default();
     for applied in applied_blocks {
         let start = applied.range.start.to_offset(&snapshot).0;
         let end = applied.range.end.to_offset(&snapshot).0;
-        let keep = desired_blocks.get(&(start, end)).is_some_and(|desired| {
-            desired.source == applied.source
-                && desired.below == applied.below
-                && desired.collapsed == applied.collapsed
-        });
+        let key = (start, end);
+        let keep = mounted_block_ids.contains(&applied.block_id)
+            && desired_blocks.get(&key).is_some_and(|desired| {
+                desired.source == applied.source
+                    && desired.below == applied.below
+                    && desired.collapsed == applied.collapsed
+                    && desired.marker.kind == applied.kind
+                    && desired.marker.height_estimate == applied.height_estimate
+                    && desired.marker.indent_columns == applied.indent_columns
+            });
         if keep {
-            desired_blocks.remove(&(start, end));
+            desired_blocks.remove(&key);
             new_applied_blocks.push(applied);
-        } else {
-            block_ids_to_remove.insert(applied.block_id);
+            continue;
         }
+
+        block_ids_to_remove.insert(applied.block_id);
     }
 
     let mut blocks_to_insert = Vec::new();
@@ -1219,6 +1473,9 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     } in desired_blocks.into_values()
     {
         let render = match &marker.kind {
+            BlockRenderKind::Heading { .. } => {
+                unreachable!("headings use native line typography")
+            }
             BlockRenderKind::Markdown => {
                 let markdown = cx.new(|cx| {
                     Markdown::new_with_options(
@@ -1425,20 +1682,36 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             render,
             priority: 0,
         });
-        pending_applied.push((marker.range.clone(), source, below, collapsed));
+        pending_applied.push((
+            marker.range.clone(),
+            source,
+            below,
+            collapsed,
+            marker.kind.clone(),
+            marker.height_estimate,
+            marker.indent_columns,
+        ));
     }
 
     if !block_ids_to_remove.is_empty() {
-        editor.remove_blocks(block_ids_to_remove, None, cx);
+        let autoscroll = if blocks_to_insert.is_empty() {
+            block_autoscroll.take()
+        } else {
+            None
+        };
+        editor.remove_blocks(block_ids_to_remove, autoscroll, cx);
     }
     if !blocks_to_insert.is_empty() {
-        let block_ids = editor.insert_blocks(blocks_to_insert, None, cx);
-        for ((range, source, below, collapsed), block_id) in
+        let block_ids = editor.insert_blocks(blocks_to_insert, block_autoscroll.take(), cx);
+        for ((range, source, below, collapsed, kind, height_estimate, indent_columns), block_id) in
             pending_applied.into_iter().zip(block_ids)
         {
             new_applied_blocks.push(AppliedBlock {
                 range,
                 source,
+                kind,
+                height_estimate,
+                indent_columns,
                 below,
                 collapsed,
                 block_id,
@@ -2298,8 +2571,15 @@ fn reveal_at_source_index(
         .is_ok()
 }
 
-/// Per-column flex weights approximating content-based column sizing.
-/// Byte ranges of CommonMark code spans: a run of N backticks opens one and the
+fn atx_heading_marker_offsets(source: &str, level: u8) -> (usize, usize) {
+    let trimmed = source.trim_start_matches([' ', '\t']);
+    let indent = source.len().saturating_sub(trimmed.len());
+    let marker_end = (indent + level as usize).min(source.len());
+    let after_marker = source.get(marker_end..).unwrap_or("");
+    let content = after_marker.trim_start_matches([' ', '\t']);
+    let content_start = source.len().saturating_sub(content.len());
+    (marker_end, content_start)
+}
 /// next run of exactly N backticks closes it. An unclosed run opens nothing.
 fn code_span_ranges(text: &str) -> Vec<Range<usize>> {
     let bytes = text.as_bytes();
@@ -2610,20 +2890,29 @@ fn delete_adjacent_to_block(weak_editor: &WeakEntity<Editor>, forward: bool, cx:
     };
     editor.update(cx, |editor, cx| {
         let snapshot = editor.buffer().read(cx).snapshot(cx);
-        let block_ranges: Vec<Range<usize>> = editor
+        let decorated_ranges: Vec<Range<usize>> = editor
             .addon::<LivePreviewAddon>()
             .map(|addon| {
-                addon
+                let mut ranges = addon
                     .applied_blocks
                     .iter()
                     .map(|block| {
                         block.range.start.to_offset(&snapshot).0
                             ..block.range.end.to_offset(&snapshot).0
                     })
-                    .collect()
+                    .collect::<Vec<_>>();
+                if let Some(markers) = &addon.markers {
+                    ranges.extend(markers.blocks.iter().filter_map(|marker| {
+                        matches!(marker.kind, BlockRenderKind::Heading { .. }).then(|| {
+                            marker.range.start.to_offset(&snapshot).0
+                                ..marker.range.end.to_offset(&snapshot).0
+                        })
+                    }));
+                }
+                ranges
             })
             .unwrap_or_default();
-        if block_ranges.is_empty() {
+        if decorated_ranges.is_empty() {
             return false;
         }
         let selections = selection_offset_ranges(editor, &snapshot);
@@ -2646,12 +2935,12 @@ fn delete_adjacent_to_block(weak_editor: &WeakEntity<Editor>, forward: bool, cx:
             })
             .filter(|deletion| deletion.start < deletion.end)
             .collect();
-        let borders_block = deletions.iter().any(|deletion| {
-            block_ranges
+        let borders_decoration = deletions.iter().any(|deletion| {
+            decorated_ranges
                 .iter()
-                .any(|block| deletion.start <= block.end && block.start <= deletion.end)
+                .any(|range| deletion.start <= range.end && range.start <= deletion.end)
         });
-        if !borders_block || deletions.is_empty() {
+        if !borders_decoration || deletions.is_empty() {
             return false;
         }
         editor.buffer().update(cx, |multibuffer, cx| {
@@ -5937,20 +6226,31 @@ fn image_context_menu(
 
 fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
-    let heading = |size: f32, weight: FontWeight| {
+    let buffer_font = theme_settings::ThemeSettings::get_global(cx)
+        .buffer_font
+        .clone();
+    let font_family = buffer_font.family.clone();
+    style.base_text_style.font_family = font_family.clone();
+    style.container_style.text.font_family = Some(font_family.clone());
+    style.heading.text.font_family = Some(font_family.clone());
+
+    let heading = |level| {
+        let metrics = heading_metrics(Some(level), cx);
         Some(TextStyleRefinement {
-            font_size: Some(rems(size).into()),
-            font_weight: Some(weight),
+            font_family: Some(font_family.clone()),
+            font_size: Some(metrics.font_size.into()),
+            font_weight: Some(metrics.text.font_weight),
+            line_height: Some(metrics.content_line_height.into()),
             ..Default::default()
         })
     };
     style.heading_level_styles = Some(HeadingLevelStyles {
-        h1: heading(1.6, FontWeight::BOLD),
-        h2: heading(1.4, FontWeight::BOLD),
-        h3: heading(1.2, FontWeight::SEMIBOLD),
-        h4: heading(1.1, FontWeight::SEMIBOLD),
-        h5: heading(1.0, FontWeight::SEMIBOLD),
-        h6: heading(0.9, FontWeight::SEMIBOLD),
+        h1: heading(1),
+        h2: heading(2),
+        h3: heading(3),
+        h4: heading(4),
+        h5: heading(5),
+        h6: heading(6),
     });
     style
 }
@@ -6256,9 +6556,8 @@ impl Extraction<'_> {
             match node.kind() {
                 "atx_heading" => {
                     let (start_row, end_row) = self.node_rows(node);
-                    let level = heading_level(node);
-                    let height = if level <= 2 { 2 } else { 1 };
-                    self.push_block_rows(start_row, end_row, height, BlockRenderKind::Markdown);
+                    let level = heading_level(node) as u8;
+                    self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
                 }
                 "setext_heading" => {
                     let (start_row, end_row) = self.node_rows(node);

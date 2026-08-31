@@ -134,6 +134,16 @@
     // preview): syntax markers are hidden, and elements like headings,
     // tables, and images are rendered, except on lines the cursor is on.
     "enabled": true,
+    // Heading typography. Font sizes are rem units relative to the editor's
+    // base font size; weights use CSS values from 100 to 900.
+    "heading_styles": {
+      "h1": { "font_size": 1.6, "font_weight": 900 },
+      "h2": { "font_size": 1.4, "font_weight": 800 },
+      "h3": { "font_size": 1.2, "font_weight": 700 },
+      "h4": { "font_size": 1.1, "font_weight": 600 },
+      "h5": { "font_size": 1.0, "font_weight": 500 },
+      "h6": { "font_size": 0.9, "font_weight": 400 }
+    },
     // Folder for attachments dropped onto a markdown buffer, relative to the
     // note's folder. An empty string stores attachments in the note's folder.
     "attachments_folder": "attachments",
