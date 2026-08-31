@@ -817,7 +817,7 @@ fn apply_emphasis_highlights(
         let resolves = |range: &Range<Anchor>| {
             let text: String = snapshot.text_for_range(range.clone()).collect();
             let key = text.strip_prefix('@').unwrap_or(&text);
-            bibliography.resolve(key).is_some()
+            bibliography.contains_key(key)
         };
         let mut known = Vec::with_capacity(markers.citations.len());
         let mut unknown = Vec::new();

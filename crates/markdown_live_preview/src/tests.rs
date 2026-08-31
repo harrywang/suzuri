@@ -3234,6 +3234,150 @@ async fn test_bare_in_text_citations_chip_and_flag_like_bracketed(cx: &mut TestA
     );
 }
 
+/// Outside markdown the provider is a pass-through: `@` never triggers the
+/// citation menu, and a completion request yields no cite keys even with a
+/// populated bibliography — code buffers must feel exactly as before.
+#[gpui::test]
+async fn test_citation_provider_delegates_outside_markdown(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("notes.txt", "plain text @"),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "notes.txt",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let (triggers, task) = editor.update_in(cx, |editor, window, cx| {
+        let project = editor.project().expect("has project").clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("plain text @".len());
+        let triggers = provider.is_completion_trigger(&buffer, position, "@", false, cx);
+        let task = provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        );
+        (triggers, task)
+    });
+    assert!(!triggers, "@ in a non-markdown buffer must not open the menu");
+
+    let responses = task.await.expect("delegated completions succeed");
+    let cite_keys: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .filter(|completion| completion.new_text == "smith2020")
+        .collect();
+    assert!(
+        cite_keys.is_empty(),
+        "a non-markdown buffer must get no cite-key completions"
+    );
+}
+
+/// Deleting a whole `.bib` file drops its keys from the index the way
+/// deleting one entry does: keys only it provided flag red, keys other
+/// files still carry keep their chips.
+#[gpui::test]
+async fn test_deleting_a_bib_file_flags_its_keys(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "Both chip: [@kept2020] and [@doomed2021].\n"),
+            (
+                "kept.bib",
+                "@article{kept2020,\n  title = {Kept},\n  year = {2020},\n}\n",
+            ),
+            (
+                "doomed.bib",
+                "@article{doomed2021,\n  title = {Doomed},\n  year = {2021},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let mut resolved = highlighted_texts(&editor, CITATION, cx);
+    resolved.sort();
+    assert_eq!(resolved, vec!["@doomed2021", "@kept2020"]);
+
+    fs.remove_file("/vault/doomed.bib".as_ref(), Default::default())
+        .await
+        .expect("failed to delete doomed.bib");
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@kept2020"],
+        "the surviving bib's key keeps its chip"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@doomed2021"],
+        "the deleted bib's key flags red"
+    );
+}
+
+/// A `.bib` created after the project opened is discovered through the
+/// worktree change event, not the initial scan — and its arrival also turns
+/// verification on, so a key that sat unflagged in a bib-less vault gets its
+/// verdict once entries exist.
+#[gpui::test]
+async fn test_a_bib_created_later_starts_resolving(cx: &mut TestAppContext) {
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[("Note.md", "Cite [@late2020] and [@never2021].\n")],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let mut unverified = highlighted_texts(&editor, CITATION, cx);
+    unverified.sort();
+    assert_eq!(
+        unverified,
+        vec!["@late2020", "@never2021"],
+        "with no bibliography, citations chip without verification"
+    );
+
+    fs.insert_file(
+        "/vault/new.bib",
+        b"@article{late2020,\n  title = {Late Arrival},\n  year = {2020},\n}\n".to_vec(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@late2020"],
+        "the new bib's key resolves"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@never2021"],
+        "verification turns on with the first entries"
+    );
+}
+
 /// A citation arrives as one token through completion, so backspacing right
 /// after `]` (or forward-deleting right before `[`) removes the whole group,
 /// like the block widgets do. With the cursor inside the group, deletion
@@ -3244,6 +3388,12 @@ async fn test_backspace_after_a_citation_deletes_the_whole_group(cx: &mut TestAp
 
     cx.set_state("A claim [@doe2020]ˇ stands\n");
     cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    // One undo brings the whole citation back as one step.
+    cx.dispatch_action(editor::actions::Undo);
+    cx.assert_editor_state("A claim [@doe2020]ˇ stands\n");
     cx.dispatch_action(editor::actions::Backspace);
     cx.assert_editor_state("A claim ˇ stands\n");
 

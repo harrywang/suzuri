@@ -73,6 +73,10 @@ pub struct Bibliography {
     /// Parsed entries per absolute `.bib` path. A file that fails to parse
     /// holds an empty list, which also serves as its tombstone on deletion.
     files: HashMap<PathBuf, Vec<BibEntry>>,
+    /// Every key across `files`. The highlight pass resolves each citation
+    /// in a note on every keystroke, so membership has to be O(1) rather
+    /// than a scan over what may be a Zotero-sized library.
+    keys: HashSet<SharedString>,
     /// Projects whose worktrees have already been walked, so each is scanned
     /// once; later changes arrive through `WorktreeUpdatedEntries`.
     scanned_projects: HashSet<EntityId>,
@@ -89,6 +93,7 @@ impl Bibliography {
         }
         let bibliography = cx.new(|_| Bibliography {
             files: HashMap::default(),
+            keys: HashSet::default(),
             scanned_projects: HashSet::default(),
         });
         cx.set_global(GlobalBibliography(bibliography.clone()));
@@ -99,8 +104,21 @@ impl Bibliography {
         self.files.values().any(|entries| !entries.is_empty())
     }
 
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.keys.contains(key)
+    }
+
     pub fn resolve(&self, key: &str) -> Option<&BibEntry> {
         self.entries().find(|entry| entry.key.as_ref() == key)
+    }
+
+    fn rebuild_keys(&mut self) {
+        self.keys = self
+            .files
+            .values()
+            .flatten()
+            .map(|entry| entry.key.clone())
+            .collect();
     }
 
     pub fn entries(&self) -> impl Iterator<Item = &BibEntry> {
@@ -163,6 +181,7 @@ impl Bibliography {
                 for (path, entries) in results {
                     bibliography.files.insert(path, entries);
                 }
+                bibliography.rebuild_keys();
                 cx.notify();
             })
         })
@@ -172,6 +191,7 @@ impl Bibliography {
     pub fn remove_path(bibliography: &Entity<Bibliography>, path: &Path, cx: &mut App) {
         bibliography.update(cx, |bibliography, cx| {
             if bibliography.files.remove(path).is_some() {
+                bibliography.rebuild_keys();
                 cx.notify();
             }
         });
