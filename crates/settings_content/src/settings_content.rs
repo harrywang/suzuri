@@ -1315,6 +1315,28 @@ pub struct MarkdownPreviewSettingsContent {
     pub max_width: Option<PixelSetting>,
 }
 
+/// Typography for one rendered markdown heading level.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct MarkdownHeadingStyleSettingsContent {
+    /// Font size in rem units relative to the editor's base font size.
+    pub font_size: Option<f32>,
+    /// Font weight in CSS units from 100 to 900.
+    pub font_weight: Option<FontWeightContent>,
+}
+
+/// Typography for rendered markdown heading levels.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct MarkdownHeadingStylesSettingsContent {
+    pub h1: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h2: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h3: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h4: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h5: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h6: Option<MarkdownHeadingStyleSettingsContent>,
+}
+
 /// The settings for markdown live preview in the editor.
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
@@ -1325,6 +1347,8 @@ pub struct MarkdownLivePreviewSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// Typography overrides for rendered heading levels.
+    pub heading_styles: Option<MarkdownHeadingStylesSettingsContent>,
     /// Folder for attachments dropped onto a markdown buffer, relative to
     /// the note's folder. An empty string stores attachments directly in
     /// the note's folder.

@@ -88,24 +88,29 @@ is reached with `editor.addon_mut::<LivePreviewAddon>()`.
 
 **The cycle.** On buffer edit / selection change / theme change:
 `extract_markers` walks the tree-sitter tree (`Markdown` + `Markdown-Inline` grammars) into
-a `MarkerSet` of `InlineMarker`s and `BlockMarker`s → `recompute` → `apply_emphasis_highlights`
-+ `apply_decorations`. `apply_decorations` writes three kinds of decoration:
+a `MarkerSet` of `InlineMarker`s and `BlockMarker`s → `recompute` →
+`apply_emphasis_highlights` + `apply_heading_line_styles` + `apply_decorations`.
+`apply_decorations` writes four kinds of decoration:
 
 1. **Concealments** — `editor.set_concealments(owner, ..)` hides syntax markers (`**`, `` ` ``,
-   link targets, list bullets). This is a *rendering-only* mechanism added by this fork in
-   `fold_map.rs`, deliberately separate from real folds: user folds and other fold consumers
-   must not see them. `test_concealments_invisible_to_fold_machinery` pins that.
+   link targets, list bullets, heading prefixes). This is a *rendering-only* mechanism added
+   by this fork in `fold_map.rs`, deliberately separate from real folds: user folds and other
+   fold consumers must not see them. `test_concealments_invisible_to_fold_machinery` pins that.
 2. **Text highlights** — all under `HighlightKey::MarkdownLivePreview(index)`, where the
    index is one of the module-level constants `STRIKE`/`ITALIC`/`BOLD`/`LINK`/`DEFINITION`/
    `ORDERED_MARKER`. Each index is an independent namespace so one can be cleared without
    disturbing the others; that is a contract, not an implementation detail.
-3. **Replace blocks** — `editor.insert_blocks` with `BlockPlacement::Replace` for headings,
-   tables, images, rules, frontmatter, mermaid.
+3. **Line styles** — `editor.style_lines` keeps headings in the main editor while refining
+   their font scale, wrapping width, and line height. Search, Vim, selections, IME, and
+   accessibility therefore remain native editor behavior.
+4. **Replace blocks** — `editor.insert_blocks` with `BlockPlacement::Replace` for tables,
+   images, rules, frontmatter, mermaid, and other non-text widgets.
 
-**Reveal semantics.** Inline constructs reveal their source when the selection *touches*
-them; blocks reveal when the selection reaches their lines. Tables and images are the
-exception — they are edited through their widgets and only reveal source via the `</>`
-button (`source_revealed`).
+**Reveal semantics.** Inline constructs and heading prefixes reveal their source when the
+selection *touches* them; search-origin selections keep heading prefixes concealed. Blocks
+reveal when the selection reaches their lines. Tables and images are the exception — they
+are edited through their widgets and only reveal source via the `</>` button
+(`source_revealed`).
 
 **Do not resize your own `BlockStyle::Flex` blocks from a render closure.** The editor
 measures and resizes them during prepaint; doing it yourself fights the editor. This

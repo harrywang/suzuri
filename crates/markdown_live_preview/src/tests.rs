@@ -1,6 +1,7 @@
 use super::*;
+use editor::display_map::ToDisplayPoint as _;
 use editor::test::editor_test_context::EditorTestContext;
-use gpui::{Modifiers, TestAppContext};
+use gpui::{Modifiers, TestAppContext, UpdateGlobal as _};
 use language::{Language, LanguageConfig};
 use settings::SettingsStore;
 use std::{
@@ -8,6 +9,7 @@ use std::{
     rc::Rc,
     sync::{Arc, Mutex},
 };
+use workspace::searchable::{SearchToken, SearchableItem as _};
 
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -43,6 +45,170 @@ async fn markdown_test_context(cx: &mut TestAppContext) -> EditorTestContext {
     });
     cx.executor().run_until_parked();
     cx
+}
+
+#[test]
+fn test_heading_typography_defaults_and_overrides() {
+    let defaults =
+        MarkdownLivePreviewSettings::from_settings(&settings::SettingsContent::default());
+    assert_eq!(defaults.heading_styles.h1.font_size, 1.6);
+    assert_eq!(defaults.heading_styles.h1.font_weight, FontWeight::BLACK);
+
+    let mut content = settings::SettingsContent::default();
+    content.markdown_live_preview = Some(settings::MarkdownLivePreviewSettingsContent {
+        heading_styles: Some(settings::MarkdownHeadingStylesSettingsContent {
+            h1: Some(settings::MarkdownHeadingStyleSettingsContent {
+                font_size: Some(2.0),
+                font_weight: Some(settings::FontWeightContent::BLACK),
+            }),
+            h2: Some(settings::MarkdownHeadingStyleSettingsContent {
+                font_size: Some(0.0),
+                font_weight: Some(settings::FontWeightContent::EXTRA_BOLD),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    let custom = MarkdownLivePreviewSettings::from_settings(&content);
+    assert_eq!(custom.heading_styles.h1.font_size, 2.0);
+    assert_eq!(custom.heading_styles.h1.font_weight, FontWeight::BLACK);
+    assert_eq!(custom.heading_styles.h2.font_size, 1.4);
+    assert_eq!(custom.heading_styles.h2.font_weight, FontWeight::EXTRA_BOLD);
+    assert_eq!(
+        custom.heading_styles.h3,
+        MarkdownHeadingStyles::default().h3
+    );
+}
+
+#[gpui::test]
+async fn test_native_heading_line_typography_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("# Heading\nˇbody");
+    cx.executor().run_until_parked();
+
+    assert_eq!(applied_block_count(&mut cx), 0);
+    assert_eq!(cx.display_text(), "Heading\nbody");
+    let (heading_rows, expected_rows) = cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        (
+            display.visual_y_for_row(1.0),
+            heading_visual_rows(Some(1), cx) as f64,
+        )
+    });
+    assert!(
+        (heading_rows - expected_rows).abs() <= 0.0001,
+        "native H1 row used {heading_rows} base rows instead of {expected_rows}"
+    );
+
+    cx.update_editor(|editor, window, cx| {
+        editor.move_up(&Default::default(), window, cx);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(cx.display_text(), "# Heading\nbody");
+}
+#[gpui::test]
+async fn test_every_heading_level_has_distinct_content_line_height(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let heights = cx.update(|_window, cx| {
+        (1..=6)
+            .map(|level| heading_metrics(Some(level), cx).content_line_height)
+            .collect::<Vec<_>>()
+    });
+    for (levels, heights) in (1..=6)
+        .collect::<Vec<_>>()
+        .windows(2)
+        .zip(heights.windows(2))
+    {
+        assert!(
+            heights[0] > heights[1],
+            "H{} and H{} collapsed into the same content line height: {:?} and {:?}",
+            levels[0],
+            levels[1],
+            heights[0],
+            heights[1]
+        );
+    }
+}
+#[gpui::test]
+async fn test_native_heading_wraps_with_scaled_font_metrics(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let heading = "scaled native heading words ".repeat(80);
+    cx.set_state(&format!("# {heading}\nˇbody"));
+    cx.executor().run_until_parked();
+
+    let (wrapped_rows, visual_rows, expected_visual_rows) = cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        let body_row = Point::new(1, 0).to_display_point(&display).row().0;
+        (
+            body_row,
+            display.visual_y_for_row(body_row as f64),
+            body_row as f64 * heading_visual_rows(Some(1), cx) as f64,
+        )
+    });
+    assert!(wrapped_rows > 1, "long native heading did not soft-wrap");
+    assert!(
+        (visual_rows - expected_visual_rows).abs() <= 0.0001,
+        "wrapped native heading used {visual_rows} visual rows instead of \
+         {expected_visual_rows}"
+    );
+}
+
+#[gpui::test]
+async fn test_all_heading_levels_edit_in_the_main_editor(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let source = "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\nbody";
+    cx.set_state(&format!(
+        "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\nˇbody"
+    ));
+    cx.executor().run_until_parked();
+    assert_eq!(cx.buffer_text(), source);
+    assert_eq!(cx.display_text(), "One\nTwo\nThree\nFour\nFive\nSix\nbody");
+    assert_eq!(applied_block_count(&mut cx), 0);
+
+    cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        for level in 1..=6 {
+            let start = display.visual_y_for_row((level - 1) as f64);
+            let end = display.visual_y_for_row(level as f64);
+            let expected = heading_visual_rows(Some(level), cx) as f64;
+            assert!(
+                ((end - start) - expected).abs() <= 0.0001,
+                "H{level} used {} visual rows instead of {expected}",
+                end - start
+            );
+        }
+    });
+
+    let h4_offset = "# One\n## Two\n### Three\n".len();
+    cx.update_editor(|editor, window, cx| {
+        let cursor = MultiBufferOffset(h4_offset);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([cursor..cursor]);
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        cx.display_text(),
+        "One\nTwo\nThree\n#### Four\nFive\nSix\nbody"
+    );
+    assert_eq!(cx.buffer_text(), source);
+}
+
+#[gpui::test]
+async fn test_native_heading_composes_with_inline_concealments(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("# **Bold** and *italic*\nˇbody");
+    cx.executor().run_until_parked();
+    assert_eq!(cx.display_text(), "Bold and italic\nbody");
+    let (actual, expected) = cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        (
+            display.visual_y_for_row(1.0),
+            heading_visual_rows(Some(1), cx) as f64,
+        )
+    });
+    assert!((actual - expected).abs() <= 0.0001);
 }
 
 #[gpui::test]
@@ -266,12 +432,10 @@ async fn test_block_widgets(cx: &mut TestAppContext) {
     "});
     cx.executor().run_until_parked();
 
-    // Heading, table, horizontal rule, code block, and blockquote.
-    assert_eq!(applied_block_count(&mut cx), 5);
+    // Table, horizontal rule, code block, and blockquote. Headings use native line styles.
+    assert_eq!(applied_block_count(&mut cx), 4);
 
-    // Moving the cursor onto the heading's row reveals it (removes its
-    // block), while everything else stays rendered; an adjacent row does not
-    // reveal it.
+    // An adjacent row leaves the heading in its rendered state.
     cx.set_state(indoc::indoc! {"
         plain first line
         extra spacing line
@@ -293,7 +457,7 @@ async fn test_block_widgets(cx: &mut TestAppContext) {
         last line
     "});
     cx.executor().run_until_parked();
-    assert_eq!(applied_block_count(&mut cx), 5);
+    assert_eq!(applied_block_count(&mut cx), 4);
 
     cx.set_state(indoc::indoc! {"
         plain first line
@@ -515,62 +679,84 @@ fn applied_block_count(cx: &mut EditorTestContext) -> usize {
 }
 
 #[gpui::test]
-async fn test_keyboard_navigation_reaches_blocks(cx: &mut TestAppContext) {
+async fn test_buffer_search_highlights_native_heading_without_stealing_focus(
+    cx: &mut TestAppContext,
+) {
     let mut cx = markdown_test_context(cx).await;
-
-    cx.set_state(indoc::indoc! {"
-        ˇalpha
-
-        # Heading
-
-        omega
-    "});
+    cx.set_state("## Searchable heading\nSearchable bodyˇ");
     cx.executor().run_until_parked();
-    assert_eq!(applied_block_count(&mut cx), 1);
 
-    // Arrow down until the cursor reaches the heading's buffer row; the
-    // rendered block must dissolve so the heading is editable with the
-    // keyboard alone.
-    let mut reached = false;
-    for _ in 0..4 {
+    let matches = cx.update_editor(|editor, _window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let second_match_start = "## Searchable heading\n".len();
+        let ranges = vec![
+            snapshot.anchor_before(MultiBufferOffset(3))
+                ..snapshot.anchor_after(MultiBufferOffset(13)),
+            snapshot.anchor_before(MultiBufferOffset(second_match_start))
+                ..snapshot.anchor_after(MultiBufferOffset(second_match_start + 10)),
+        ];
+        editor.highlight_background(
+            HighlightKey::BufferSearchHighlights,
+            &ranges,
+            |_, theme| theme.colors().search_match_background,
+            cx,
+        );
+        editor.set_collapse_matches(true);
+        ranges
+    });
+
+    for match_index in [0, 1, 0] {
         cx.update_editor(|editor, window, cx| {
-            editor.move_down(&Default::default(), window, cx);
+            editor.activate_match(match_index, &matches, SearchToken::default(), window, cx);
         });
         cx.executor().run_until_parked();
-        let row = cx.update_editor(|editor, _, cx| {
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(cx.display_text(), "Searchable heading\nSearchable body");
+    }
+
+    let (head, visual_height, expected_visual_height) = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let display = editor.display_snapshot(cx);
+        (
             editor
                 .selections
                 .newest_anchor()
                 .head()
-                .to_point(&snapshot)
-                .row
-        });
-        if row == 2 {
-            reached = true;
-            break;
-        }
-    }
-    assert!(reached, "cursor never reached the heading row");
-    assert_eq!(applied_block_count(&mut cx), 0);
-    assert!(cx.display_text().contains("# Heading"));
+                .to_offset(&snapshot)
+                .0,
+            display.visual_y_for_row(1.0),
+            heading_visual_rows(Some(2), cx) as f64,
+        )
+    });
+    assert_eq!(
+        head, 3,
+        "reverse search did not return to the heading match"
+    );
+    assert!(
+        (visual_height - expected_visual_height).abs() <= 0.0001,
+        "search navigation changed the native H2 row height"
+    );
 }
 
 #[gpui::test]
-async fn test_heading_renders_after_typing(cx: &mut TestAppContext) {
+async fn test_heading_styles_after_typing_line_terminator(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
-
-    // Simulate typing a heading then pressing enter: the cursor ends up on
-    // the line below, and the heading should render immediately.
     cx.set_state("# helloˇ");
     cx.executor().run_until_parked();
-    assert_eq!(applied_block_count(&mut cx), 0);
+    assert_eq!(cx.display_text(), "# hello");
 
     cx.update_editor(|editor, window, cx| {
         editor.newline(&Default::default(), window, cx);
     });
     cx.executor().run_until_parked();
-    assert_eq!(applied_block_count(&mut cx), 1);
+    assert_eq!(cx.display_text(), "hello\n");
+    let (actual, expected) = cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        (
+            display.visual_y_for_row(1.0),
+            heading_visual_rows(Some(1), cx) as f64,
+        )
+    });
+    assert!((actual - expected).abs() <= 0.0001);
 }
 
 #[gpui::test]
@@ -604,6 +790,37 @@ async fn test_disabling_restores_raw_markdown(cx: &mut TestAppContext) {
     });
     cx.executor().run_until_parked();
     assert_ne!(cx.display_text(), cx.buffer_text());
+}
+
+#[gpui::test]
+async fn test_settings_changes_toggle_live_preview_without_reopening(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nsome **bold** text\n");
+    cx.executor().run_until_parked();
+    assert_ne!(cx.display_text(), cx.buffer_text());
+
+    cx.cx.update(|window, cx| {
+        let style = block_markdown_style(window, cx);
+        let buffer_font_family = theme_settings::ThemeSettings::get_global(cx)
+            .buffer_font
+            .family
+            .clone();
+        assert_eq!(style.base_text_style.font_family, buffer_font_family);
+    });
+
+    cx.cx.update(|_window, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content
+                    .markdown_live_preview
+                    .get_or_insert_default()
+                    .enabled = Some(false);
+            });
+        });
+    });
+    cx.executor().run_until_parked();
+
+    pretty_assertions::assert_eq!(cx.display_text(), cx.buffer_text());
 }
 
 #[gpui::test]
@@ -758,8 +975,7 @@ async fn test_images_section_context(cx: &mut TestAppContext) {
             .collect();
         (addon.applied_blocks.len(), rows)
     });
-    // Inline image, reference image, and linked image; the heading is
-    // revealed because the cursor sits on it.
+    // Inline image, reference image, and linked image. The heading is native text.
     assert_eq!(blocks, 3, "applied block rows: {rows:?}");
     assert!(
         rows.contains(&(12, 12)),
@@ -4371,18 +4587,15 @@ fn test_an_absolute_width_image_keeps_its_aspect_ratio(cx: &mut TestAppContext) 
 async fn test_heading_on_first_buffer_row(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
 
-    // A heading on row 0 renders like any other.
+    // A heading on row 0 uses native line typography rather than a replacement block.
     cx.set_state(indoc::indoc! {"
         # Suzuri
 
         bodyˇ
     "});
     cx.executor().run_until_parked();
-    assert_eq!(
-        applied_block_count(&mut cx),
-        1,
-        "row-0 heading should render"
-    );
+    assert_eq!(applied_block_count(&mut cx), 0);
+    assert_eq!(cx.display_text(), "Suzuri\n\nbody\n");
 
     // Deleting a leading empty line from the heading's start (where the
     // cursor lands when the rendered heading is clicked) must merge the
@@ -4399,20 +4612,14 @@ async fn test_heading_on_first_buffer_row(cx: &mut TestAppContext) {
     cx.dispatch_action(editor::actions::Backspace);
     cx.executor().run_until_parked();
     assert_eq!(cx.buffer_text(), "# Suzuri\n\nbody\n");
-    // The cursor now sits on the heading row, so it stays revealed.
     assert_eq!(applied_block_count(&mut cx), 0);
 
-    // Moving the cursor off the heading re-renders it, row 0 included.
     cx.update_editor(|editor, window, cx| {
         editor.move_down(&Default::default(), window, cx);
         editor.move_down(&Default::default(), window, cx);
     });
     cx.executor().run_until_parked();
-    assert_eq!(
-        applied_block_count(&mut cx),
-        1,
-        "row-0 heading should re-render after the cursor leaves"
-    );
+    assert_eq!(applied_block_count(&mut cx), 0);
 
     // Forward-delete from the empty first line, heading still rendered:
     // this deleted the newline plus the heading's whole replaced range
@@ -4424,7 +4631,7 @@ async fn test_heading_on_first_buffer_row(cx: &mut TestAppContext) {
         body
     "});
     cx.executor().run_until_parked();
-    assert_eq!(applied_block_count(&mut cx), 1);
+    assert_eq!(applied_block_count(&mut cx), 0);
     cx.dispatch_action(editor::actions::Delete);
     cx.executor().run_until_parked();
     assert_eq!(cx.buffer_text(), "# Suzuri\n\nbody\n");
@@ -4435,17 +4642,16 @@ async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppCon
     let mut cx = markdown_test_context(cx).await;
 
     cx.set_state(indoc::indoc! {"
-        # Suzuri
+        > Suzuri
 
         bodyˇ
     "});
     cx.executor().run_until_parked();
     assert_eq!(applied_block_count(&mut cx), 1);
 
-    // What `on_source_click` runs when the click lands on the rendered
-    // heading's own text (the wrapper's mouse-down never fires there —
-    // `MarkdownElement` claims the click and prevents default): the source
-    // reveals with the cursor at the clicked character.
+    // What `on_source_click` runs when the click lands on a generic rendered
+    // markdown widget's text: the source reveals with the cursor at the
+    // clicked character.
     let range = cx.update_editor(|editor, _, cx| {
         extract_markers(editor, cx)
             .unwrap()
@@ -4455,11 +4661,11 @@ async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppCon
                 BlockRenderKind::Markdown => Some(block.range.clone()),
                 _ => None,
             })
-            .expect("heading block")
+            .expect("markdown block")
     });
     let weak = cx.editor.downgrade();
     let handled =
-        cx.update(|window, cx| reveal_at_source_index(&weak, &range, "# Su".len(), window, cx));
+        cx.update(|window, cx| reveal_at_source_index(&weak, &range, "> Su".len(), window, cx));
     assert!(handled);
     cx.executor().run_until_parked();
 
@@ -4473,7 +4679,7 @@ async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppCon
             .to_offset(&snapshot)
             .0
     });
-    assert_eq!(head, "# Su".len(), "cursor lands on the clicked character");
+    assert_eq!(head, "> Su".len(), "cursor lands on the clicked character");
 
     // An index past the block (the widget's mini-document carries appended
     // reference definitions) clamps to the block's end.
@@ -4489,7 +4695,7 @@ async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppCon
             .to_offset(&snapshot)
             .0
     });
-    assert_eq!(head, "# Suzuri".len());
+    assert_eq!(head, "> Suzuri".len());
 }
 
 /// `register_editor` attaches to every full editor, and the git panel and
@@ -4584,8 +4790,8 @@ async fn test_expanded_diff_hunks_reveal_plain_source(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
     assert_eq!(
         applied_block_count(&mut cx),
-        1,
-        "heading renders as a block"
+        0,
+        "heading uses native line typography"
     );
     assert!(cx.display_text().contains("some bold text"));
 
@@ -4617,8 +4823,8 @@ async fn test_expanded_diff_hunks_reveal_plain_source(cx: &mut TestAppContext) {
     cx.executor().run_until_parked();
     assert_eq!(
         applied_block_count(&mut cx),
-        1,
-        "collapsing the hunks brings the preview back"
+        0,
+        "collapsing the hunks restores native heading typography"
     );
     assert!(cx.display_text().contains("some bold text"));
 }
