@@ -18,7 +18,7 @@ use std::{
 };
 
 use collections::{HashMap, HashSet};
-use editor::{CompletionProvider, Editor};
+use editor::{CompletionProvider, Editor, SemanticsProvider};
 use gpui::{App, AppContext as _, Context, Entity, EntityId, SharedString, Task, Window};
 use language::{Buffer, CodeLabel, LanguageName, ToOffset as _};
 use project::{
@@ -40,7 +40,9 @@ pub struct BibEntry {
 }
 
 impl BibEntry {
-    fn documentation(&self) -> Option<CompletionDocumentation> {
+    /// The reference as markdown — bolded title, authors and year, entry
+    /// type — shared by the completion card and the hover card.
+    fn reference_markdown(&self) -> Option<String> {
         let mut text = String::new();
         if let Some(title) = &self.title {
             text.push_str(&format!("**{title}**"));
@@ -65,7 +67,13 @@ impl BibEntry {
             return None;
         }
         text.push_str(&format!("\n\n*{}*", self.entry_type));
-        Some(CompletionDocumentation::MultiLineMarkdown(text.into()))
+        Some(text)
+    }
+
+    fn documentation(&self) -> Option<CompletionDocumentation> {
+        Some(CompletionDocumentation::MultiLineMarkdown(
+            self.reference_markdown()?.into(),
+        ))
     }
 }
 
@@ -297,14 +305,24 @@ impl CitationCompletionProvider {
 /// nothing but key characters between it and the cursor. Mirrors the
 /// tolerances of `citation_keys`, which decides what ultimately renders as a
 /// citation chip.
+fn is_citation_key_char(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '_' | ':' | '.' | '#' | '$' | '%' | '&' | '-' | '+' | '?' | '<' | '>' | '~' | '/'
+        )
+}
+
+/// Whether a citation boundary precedes the `@` the reversed iterator has
+/// stopped on: start of text, whitespace, a group separator, or `[`.
+fn citation_boundary(before_at: Option<char>) -> bool {
+    match before_at {
+        None => true,
+        Some(character) => character.is_whitespace() || matches!(character, ';' | '-' | '['),
+    }
+}
+
 pub(crate) fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize> {
-    let is_key_char = |character: char| {
-        character.is_ascii_alphanumeric()
-            || matches!(
-                character,
-                '_' | ':' | '.' | '#' | '$' | '%' | '&' | '-' | '+' | '?' | '<' | '>' | '~' | '/'
-            )
-    };
     let mut walked = 0;
     let mut characters = buffer.reversed_chars_at(offset);
     loop {
@@ -312,16 +330,64 @@ pub(crate) fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize
         if character == '@' {
             break;
         }
-        if !is_key_char(character) || walked > 128 {
+        if !is_citation_key_char(character) || walked > 128 {
             return None;
         }
         walked += character.len_utf8();
     }
-    let boundary = match characters.next() {
-        None => true,
-        Some(character) => character.is_whitespace() || matches!(character, ';' | '-' | '['),
-    };
-    boundary.then_some(offset - walked)
+    citation_boundary(characters.next()).then_some(offset - walked)
+}
+
+/// The citation key containing `offset`, if any: its full range including
+/// the `@`, plus the key text without it. Bracketed and bare citations look
+/// identical from here — an `@` after a boundary followed by key characters.
+pub(crate) fn citation_key_at(
+    buffer: &Buffer,
+    offset: usize,
+) -> Option<(std::ops::Range<usize>, SharedString)> {
+    let mut start = offset;
+    let mut characters = buffer.reversed_chars_at(offset);
+    let mut at_found = false;
+    while let Some(character) = characters.next() {
+        if character == '@' {
+            at_found = true;
+            start -= character.len_utf8();
+            break;
+        }
+        if !is_citation_key_char(character) || offset - start > 128 {
+            return None;
+        }
+        start -= character.len_utf8();
+    }
+    if !at_found || !citation_boundary(characters.next()) {
+        return None;
+    }
+    let mut end = offset;
+    for character in buffer.chars_at(offset) {
+        if !is_citation_key_char(character) || end - start > 256 {
+            break;
+        }
+        end += character.len_utf8();
+    }
+    let text: String = buffer.text_for_range(start..end).collect();
+    let key = text.strip_prefix('@')?;
+    // Punctuation is only valid inside a key, not at its edges, matching
+    // `citation_keys`.
+    let key = key
+        .trim_end_matches(|character: char| !(character.is_ascii_alphanumeric() || character == '_'));
+    if key.is_empty()
+        || !key
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return None;
+    }
+    let end = start + 1 + key.len();
+    if offset > end {
+        return None;
+    }
+    Some((start..end, SharedString::from(key.to_string())))
 }
 
 fn buffer_is_markdown(buffer: &Buffer) -> bool {
@@ -456,6 +522,165 @@ impl CompletionProvider for CitationCompletionProvider {
 
     fn show_snippets(&self) -> bool {
         self.inner.show_snippets()
+    }
+}
+
+/// Wraps the editor's stock (project-backed) semantics provider so hovering
+/// a resolved cite key shows the reference card; every other request — LSP
+/// hovers, definitions, rename, inlay hints — delegates untouched.
+pub struct CitationSemanticsProvider {
+    inner: Rc<dyn SemanticsProvider>,
+    bibliography: Entity<Bibliography>,
+}
+
+impl CitationSemanticsProvider {
+    pub fn new(inner: Rc<dyn SemanticsProvider>, cx: &mut App) -> Self {
+        Self {
+            inner,
+            bibliography: Bibliography::global(cx),
+        }
+    }
+}
+
+impl SemanticsProvider for CitationSemanticsProvider {
+    fn hover(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<Option<Vec<project::Hover>>>> {
+        {
+            let buffer_ref = buffer.read(cx);
+            if buffer_is_markdown(buffer_ref) {
+                let offset = position.to_offset(buffer_ref);
+                if let Some((range, key)) = citation_key_at(buffer_ref, offset)
+                    && let Some(entry) = self.bibliography.read(cx).resolve(&key)
+                    && let Some(markdown) = entry.reference_markdown()
+                {
+                    let range =
+                        buffer_ref.anchor_before(range.start)..buffer_ref.anchor_after(range.end);
+                    return Some(Task::ready(Some(vec![project::Hover {
+                        contents: vec![project::HoverBlock {
+                            text: markdown,
+                            kind: project::HoverBlockKind::Markdown,
+                        }],
+                        range: Some(range),
+                        language: None,
+                    }])));
+                }
+            }
+        }
+        self.inner.hover(buffer, position, cx)
+    }
+
+    fn inline_values(
+        &self,
+        buffer_handle: Entity<Buffer>,
+        range: std::ops::Range<text::Anchor>,
+        cx: &mut App,
+    ) -> Option<Task<anyhow::Result<Vec<project::InlayHint>>>> {
+        self.inner.inline_values(buffer_handle, range, cx)
+    }
+
+    fn applicable_inlay_chunks(
+        &self,
+        buffer: &Entity<Buffer>,
+        ranges: &[std::ops::Range<text::Anchor>],
+        cx: &mut App,
+    ) -> Vec<std::ops::Range<language::BufferRow>> {
+        self.inner.applicable_inlay_chunks(buffer, ranges, cx)
+    }
+
+    fn invalidate_inlay_hints(
+        &self,
+        for_buffers: &HashSet<language::BufferId>,
+        cx: &mut App,
+    ) {
+        self.inner.invalidate_inlay_hints(for_buffers, cx)
+    }
+
+    fn inlay_hints(
+        &self,
+        invalidate: project::InvalidationStrategy,
+        buffer: Entity<Buffer>,
+        ranges: Vec<std::ops::Range<text::Anchor>>,
+        known_chunks: Option<(
+            clock::Global,
+            HashSet<std::ops::Range<language::BufferRow>>,
+        )>,
+        cx: &mut App,
+    ) -> Option<
+        HashMap<
+            std::ops::Range<language::BufferRow>,
+            Task<anyhow::Result<project::lsp_store::CacheInlayHints>>,
+        >,
+    > {
+        self.inner
+            .inlay_hints(invalidate, buffer, ranges, known_chunks, cx)
+    }
+
+    fn semantic_tokens(
+        &self,
+        buffer: Entity<Buffer>,
+        cx: &mut App,
+    ) -> Option<
+        futures::future::Shared<
+            Task<
+                std::result::Result<
+                    project::lsp_store::BufferSemanticTokens,
+                    std::sync::Arc<anyhow::Error>,
+                >,
+            >,
+        >,
+    > {
+        self.inner.semantic_tokens(buffer, cx)
+    }
+
+    fn supports_inlay_hints(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
+        self.inner.supports_inlay_hints(buffer, cx)
+    }
+
+    fn supports_semantic_tokens(&self, buffer: &Entity<Buffer>, cx: &mut App) -> bool {
+        self.inner.supports_semantic_tokens(buffer, cx)
+    }
+
+    fn document_highlights(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Option<Task<anyhow::Result<Vec<project::DocumentHighlight>>>> {
+        self.inner.document_highlights(buffer, position, cx)
+    }
+
+    fn definitions(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        kind: editor::GotoDefinitionKind,
+        cx: &mut App,
+    ) -> Option<Task<anyhow::Result<Option<Vec<project::LocationLink>>>>> {
+        self.inner.definitions(buffer, position, kind, cx)
+    }
+
+    fn range_for_rename(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Option<std::ops::Range<text::Anchor>>>> {
+        self.inner.range_for_rename(buffer, position, cx)
+    }
+
+    fn perform_rename(
+        &self,
+        buffer: &Entity<Buffer>,
+        position: text::Anchor,
+        new_name: String,
+        cx: &mut App,
+    ) -> Option<Task<anyhow::Result<project::ProjectTransaction>>> {
+        self.inner
+            .perform_rename(buffer, position, new_name, cx)
     }
 }
 

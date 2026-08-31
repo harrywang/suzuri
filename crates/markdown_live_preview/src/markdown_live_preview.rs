@@ -59,7 +59,7 @@ const MARKDOWN: &str = "Markdown";
 const MARKDOWN_INLINE: &str = "Markdown-Inline";
 
 mod bibliography;
-pub use bibliography::{Bibliography, CitationCompletionProvider};
+pub use bibliography::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
 
 #[derive(Clone, Copy, Debug, Default, RegisterSetting)]
 pub struct MarkdownLivePreviewSettings {
@@ -206,6 +206,14 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
             project.clone(),
             cx,
         ))));
+        // Hovering a resolved cite key shows the reference card; wrapping
+        // (rather than replacing) keeps LSP hovers and the rest of the
+        // semantics surface working.
+        if let Some(semantics) = editor.semantics_provider() {
+            editor.set_semantics_provider(Some(Rc::new(CitationSemanticsProvider::new(
+                semantics, cx,
+            ))));
+        }
         subscriptions.push(cx.subscribe_in(&project, window, {
             let image_cache = image_cache.clone();
             let bibliography = bibliography.clone();

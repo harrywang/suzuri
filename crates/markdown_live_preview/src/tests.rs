@@ -3291,6 +3291,79 @@ async fn test_citation_provider_delegates_outside_markdown(cx: &mut TestAppConte
     );
 }
 
+/// Hovering a resolved cite key serves the reference card through the
+/// wrapped semantics provider; anywhere else the provider delegates, so LSP
+/// hovers keep working.
+#[gpui::test]
+async fn test_hovering_a_cite_key_shows_the_reference_card(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "See [@smith2020] and email me@smith2020 here.\n"),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study of Things},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let hover_on = |editor: &Entity<Editor>, cx: &mut gpui::VisualTestContext, offset: usize| {
+        editor.update(cx, |editor, cx| {
+            let provider = editor
+                .semantics_provider()
+                .expect("editor has a semantics provider");
+            let buffer = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("single buffer");
+            let position = buffer.read(cx).anchor_before(offset);
+            provider.hover(&buffer, position, cx)
+        })
+    };
+
+    // On the key: the reference card, immediately.
+    let task = hover_on(&editor, cx, "See [@smi".len()).expect("citation hover produced");
+    let hovers = task.await.expect("citation hover resolves");
+    let text = hovers
+        .first()
+        .and_then(|hover| hover.contents.first())
+        .map(|block| block.text.clone())
+        .unwrap_or_default();
+    assert!(
+        text.contains("A Study of Things") && text.contains("Jane Smith") && text.contains("2020"),
+        "hover card should carry the reference, got {text:?}"
+    );
+
+    // On the email's lookalike key: no card (the request delegates).
+    if let Some(task) = hover_on(&editor, cx, "See [@smith2020] and email me@smi".len()) {
+        let hovers = task.await.unwrap_or_default();
+        assert!(
+            hovers.iter().all(|hover| {
+                hover
+                    .contents
+                    .iter()
+                    .all(|block| !block.text.contains("A Study of Things"))
+            }),
+            "an email must not get a reference card"
+        );
+    }
+
+    // End to end: the editor's own hover pipeline pops the card.
+    editor.update_in(cx, |editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(MultiBufferOffset("See [@smi".len()));
+        editor::hover_popover::hover_at(editor, Some(anchor), None, window, cx);
+    });
+    cx.executor().advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    let popovers = editor.update(cx, |editor, _| editor.hover_state.info_popovers.len());
+    assert_eq!(popovers, 1, "the hover popover should be on screen");
+}
+
 /// Deleting a whole `.bib` file drops its keys from the index the way
 /// deleting one entry does: keys only it provided flag red, keys other
 /// files still carry keep their chips.
