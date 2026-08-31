@@ -3700,3 +3700,95 @@ fn test_drag_move_fires_outside_the_element(cx: &mut TestAppContext) {
          dragged element, so an image drag can no longer track the pointer"
     );
 }
+
+#[gpui::test]
+async fn test_narrow_table_columns_take_content_width(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | R | School | E |
+        | --- | --- | --- |
+        | 1 | Duke | 4.5 |
+    "});
+    cx.executor().run_until_parked();
+
+    let window_width = cx.update_editor(|_, window, _| window.bounds().size.width);
+    let mut total = gpui::px(0.);
+    for column in 0..3 {
+        let bounds = cx
+            .cx
+            .debug_bounds(format!("mdlp-cell-h-{column}").leak())
+            .expect("header cell rendered");
+        assert!(
+            bounds.size.width < gpui::px(120.),
+            "short column {column} should hug its content, got {:?}",
+            bounds.size.width
+        );
+        total += bounds.size.width;
+    }
+    assert!(
+        total < window_width / 2.,
+        "a small table should not stretch across the editor: {total:?} of {window_width:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
+    let header: String = (0..7).map(|i| format!("| Column {i} ")).collect::<String>() + "|";
+    let separator = "| --- ".repeat(7) + "|";
+    let row: String = (0..7).map(|_| format!("| {long} ")).collect::<String>() + "|";
+    cx.set_state(&format!("ˇplain line\n\n{header}\n{separator}\n{row}\n"));
+    cx.executor().run_until_parked();
+
+    let window_width = cx.update_editor(|_, window, _| window.bounds().size.width);
+    let container = cx
+        .cx
+        .debug_bounds("mdlp-table-scroll")
+        .expect("scroll container rendered");
+    assert!(
+        container.right() <= window_width,
+        "the scroll container must stay within the window: {container:?}"
+    );
+    let last_cell = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-6")
+        .expect("last header cell rendered");
+    assert!(
+        last_cell.right() > window_width,
+        "the grid content should overflow the window before scrolling: {last_cell:?}"
+    );
+
+    // Wheel over the table scrolls the grid in place instead of the editor.
+    cx.cx.simulate_mouse_move(
+        container.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+    cx.cx.simulate_event(gpui::ScrollWheelEvent {
+        position: container.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(-600.), gpui::px(0.))),
+        modifiers: gpui::Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
+    });
+    cx.executor().run_until_parked();
+    cx.update_editor(|_, _, cx| cx.notify());
+    cx.executor().run_until_parked();
+
+    let editor_scroll = cx.update_editor(|editor, _, cx| editor.scroll_position(cx));
+    assert_eq!(
+        editor_scroll.x, 0.0,
+        "the table consumes the horizontal wheel; the editor must not scroll"
+    );
+    let first_cell = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-0")
+        .expect("first header cell rendered");
+    assert!(
+        first_cell.origin.x < container.origin.x,
+        "the grid should have scrolled left: {first_cell:?} vs {container:?}"
+    );
+}
