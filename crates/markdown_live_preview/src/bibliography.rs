@@ -356,7 +356,11 @@ impl CompletionProvider for CitationCompletionProvider {
                     .collect();
                 return Task::ready(Ok(vec![CompletionResponse {
                     completions,
-                    display_options: CompletionDisplayOptions::default(),
+                    // Cite keys are short; without dynamic width the menu
+                    // pads out to the stock LSP width and dwarfs its rows.
+                    display_options: CompletionDisplayOptions {
+                        dynamic_width: true,
+                    },
                     is_incomplete: false,
                 }]));
             }
