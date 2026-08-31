@@ -165,6 +165,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     subscriptions.push(editor.register_action::<editor::actions::Backspace>(
         move |_, _window, cx| {
             if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, false, cx)
                 && !delete_adjacent_to_block(&weak_editor, false, cx)
             {
                 cx.propagate();
@@ -175,6 +176,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     subscriptions.push(
         editor.register_action::<editor::actions::Delete>(move |_, _window, cx| {
             if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, true, cx)
                 && !delete_adjacent_to_block(&weak_editor, true, cx)
             {
                 cx.propagate();
@@ -405,6 +407,10 @@ struct MarkerSet {
     /// Pandoc-style citation keys (`@key` including the `@`), styled as
     /// reference chips once the surrounding brackets are concealed.
     citations: Vec<Range<Anchor>>,
+    /// Whole bracketed citation groups (`[...]` inclusive). A citation is
+    /// inserted as one token through completion, so backspacing at a group's
+    /// end (or forward-deleting at its start) removes the whole group.
+    citation_groups: Vec<Range<Anchor>>,
     /// Bare in-text citation keys (`@key` outside any brackets). Pandoc
     /// treats these as citations too, but prose is full of `@handles` that
     /// cite nothing, so they only chip when the key resolves against the
@@ -2531,6 +2537,58 @@ fn delete_adjacent_to_block(weak_editor: &WeakEntity<Editor>, forward: bool, cx:
                 None,
                 cx,
             );
+        });
+        true
+    })
+}
+
+/// Deletes a whole bracketed citation group when a single caret backspaces
+/// at its end or forward-deletes at its start. A citation arrives as one
+/// token through completion, so it should leave the same way; editing a key
+/// letter by letter stays available by moving the cursor inside the group.
+/// Returns false when no caret borders a group so the caller can propagate.
+fn delete_adjacent_citation(weak_editor: &WeakEntity<Editor>, forward: bool, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let groups: Vec<Range<usize>> = editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.markers.as_ref())
+            .map(|markers| {
+                markers
+                    .citation_groups
+                    .iter()
+                    .map(|range| {
+                        range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if groups.is_empty() {
+            return false;
+        }
+        let selections = selection_offset_ranges(editor, &snapshot);
+        let [caret] = selections.as_slice() else {
+            return false;
+        };
+        if caret.start != caret.end {
+            return false;
+        }
+        let head = caret.start;
+        let Some(group) = groups.iter().find(|group| {
+            if forward {
+                group.start == head
+            } else {
+                group.end == head
+            }
+        }) else {
+            return false;
+        };
+        let deletion = MultiBufferOffset(group.start)..MultiBufferOffset(group.end);
+        editor.buffer().update(cx, |multibuffer, cx| {
+            multibuffer.edit([(deletion, "")], None, cx);
         });
         true
     })
@@ -5513,6 +5571,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges: Vec::new(),
         ordered_markers: Vec::new(),
         citations: Vec::new(),
+        citation_groups: Vec::new(),
         bare_citations: Vec::new(),
         highlights: Vec::new(),
         tags: Vec::new(),
@@ -5544,6 +5603,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        citation_groups,
         bare_citations,
         highlights,
         tags,
@@ -5585,6 +5645,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        citation_groups,
         bare_citations,
         highlights,
         tags,
@@ -5611,6 +5672,7 @@ struct Extraction<'a> {
     definition_ranges: Vec<Range<Anchor>>,
     ordered_markers: Vec<Range<Anchor>>,
     citations: Vec<Range<Anchor>>,
+    citation_groups: Vec<Range<Anchor>>,
     bare_citations: Vec<Range<Anchor>>,
     highlights: Vec<Range<Anchor>>,
     tags: Vec<Range<Anchor>>,
@@ -6284,6 +6346,7 @@ impl Extraction<'_> {
                 let reveal = start..end;
                 self.hide(start..start + 1, reveal.clone());
                 self.hide(end - 1..end, reveal.clone());
+                self.citation_groups.push(self.anchor_range(start..end));
                 for key in keys {
                     let range = self.anchor_range(start + 1 + key.start..start + 1 + key.end);
                     self.citations.push(range);

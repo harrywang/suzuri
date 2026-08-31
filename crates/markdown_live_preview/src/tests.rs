@@ -3234,6 +3234,31 @@ async fn test_bare_in_text_citations_chip_only_when_resolved(cx: &mut TestAppCon
     );
 }
 
+/// A citation arrives as one token through completion, so backspacing right
+/// after `]` (or forward-deleting right before `[`) removes the whole group,
+/// like the block widgets do. With the cursor inside the group, deletion
+/// stays per-character so a key can still be edited.
+#[gpui::test]
+async fn test_backspace_after_a_citation_deletes_the_whole_group(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state("A claim [@doe2020]ˇ stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    cx.set_state("A claim ˇ[@doe2020] stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Delete);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    // Inside the group the ordinary one-character deletion still applies.
+    cx.set_state("A claim [@doe2020ˇ] stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim [@doe202ˇ] stands\n");
+}
+
 #[gpui::test]
 async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) {
     let cases: &[(&str, Option<usize>)] = &[
