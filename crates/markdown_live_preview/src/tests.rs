@@ -2958,6 +2958,551 @@ async fn test_an_unresolved_embed_reports_itself(cx: &mut TestAppContext) {
     );
 }
 
+/// The keys carried by a highlight namespace, as buffer text, so citation
+/// tests can assert which keys resolved rather than counting ranges.
+fn highlighted_texts(
+    editor: &Entity<Editor>,
+    key: usize,
+    cx: &mut gpui::VisualTestContext,
+) -> Vec<String> {
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor
+            .text_highlights(HighlightKey::MarkdownLivePreview(key), cx)
+            .map_or(Vec::new(), |(_, ranges)| {
+                ranges
+                    .iter()
+                    .map(|range| snapshot.text_for_range(range.clone()).collect())
+                    .collect()
+            })
+    })
+}
+
+#[gpui::test]
+async fn test_cite_keys_resolve_against_the_vault_bibliography(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "As shown in [@smith2020] and [@missing2024].\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@smith2020"],
+        "the key present in refs.bib keeps the citation chip"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@missing2024"],
+        "the key absent from refs.bib is flagged unresolved"
+    );
+
+    // Adding the missing entry to the `.bib` clears the flag without
+    // touching the note: the worktree change reloads the index and the
+    // bibliography observer restyles.
+    fs.save(
+        "/vault/refs.bib".as_ref(),
+        &concat!(
+            "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+            "@article{missing2024,\n  title = {Found},\n  year = {2024},\n}\n"
+        )
+        .into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update refs.bib");
+    cx.run_until_parked();
+
+    let mut resolved = highlighted_texts(&editor, CITATION, cx);
+    resolved.sort();
+    assert_eq!(
+        resolved,
+        vec!["@missing2024", "@smith2020"],
+        "both keys resolve after the bib gains the entry"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        Vec::<String>::new()
+    );
+}
+
+#[gpui::test]
+async fn test_citations_stay_plain_without_a_bibliography(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[("Note.md", "A hunch [@unverified] in a vault with no bib.\n")],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@unverified"],
+        "citations keep the ordinary chip"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        Vec::<String>::new(),
+        "no bibliography means no unresolved flags"
+    );
+}
+
+#[gpui::test]
+async fn test_citation_completion_offers_bib_keys(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "cite [@smi"),
+            (
+                "refs.bib",
+                concat!(
+                    "@article{smith2020,\n  title = {A Study of Things},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+                    "@book{knuth1984,\n  title = {The Book},\n  year = {1984},\n}\n"
+                ),
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let task = editor.update_in(cx, |editor, window, cx| {
+        let project = editor
+            .project()
+            .expect("vault editor has a project")
+            .clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("cite [@smi".len());
+        provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        )
+    });
+    let responses = task.await.expect("completions succeed");
+
+    let completions: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .collect();
+    let mut keys: Vec<_> = completions
+        .iter()
+        .map(|completion| completion.new_text.clone())
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec!["knuth1984", "smith2020"],
+        "every bib entry is offered; the menu filters as the user types"
+    );
+
+    // The replacement covers only the typed key fragment, not the `@`, so
+    // accepting a completion yields `[@smith2020` rather than doubling up.
+    let smith = completions
+        .iter()
+        .find(|completion| completion.new_text == "smith2020")
+        .expect("smith2020 offered");
+    editor.update(cx, |editor, cx| {
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let buffer = buffer.read(cx);
+        let replaced = {
+            use text::ToOffset as _;
+            smith.replace_range.start.to_offset(buffer)..smith.replace_range.end.to_offset(buffer)
+        };
+        assert_eq!(&buffer.text()[replaced], "smi");
+    });
+}
+
+/// A vault often holds several copies of one master bibliography (a
+/// `references.bib` per paper); a key defined in many files is still one
+/// citation and must appear once in the menu.
+#[gpui::test]
+async fn test_duplicate_bib_keys_complete_once(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let shared = "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n";
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "cite [@smi"),
+            ("refs.bib", shared),
+            ("paper-copy.bib", shared),
+            ("another-copy.bib", shared),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let task = editor.update_in(cx, |editor, window, cx| {
+        let project = editor.project().expect("vault editor has a project").clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("cite [@smi".len());
+        provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        )
+    });
+    let responses = task.await.expect("completions succeed");
+
+    let keys: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .map(|completion| completion.new_text)
+        .collect();
+    assert_eq!(
+        keys,
+        vec!["smith2020"],
+        "a key defined in three .bib files is offered exactly once"
+    );
+}
+
+/// Pandoc also allows in-text citations with no brackets (`@key argues`),
+/// which is what accepting a bare `@` completion produces. They verify
+/// exactly like bracketed ones — chip when resolved, red flag when not —
+/// while emails, infix `@`, and code spans never register at all.
+#[gpui::test]
+async fn test_bare_in_text_citations_chip_and_flag_like_bracketed(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "Bare: @smith2020 argues this, though @somehandle disagrees, \
+                 and me@example.com or `@smith2020` never chip.\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@smith2020"],
+        "the bare key that resolves chips"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@somehandle"],
+        "the bare key that resolves to nothing flags, like a bracketed one"
+    );
+}
+
+/// Outside markdown the provider is a pass-through: `@` never triggers the
+/// citation menu, and a completion request yields no cite keys even with a
+/// populated bibliography — code buffers must feel exactly as before.
+#[gpui::test]
+async fn test_citation_provider_delegates_outside_markdown(cx: &mut TestAppContext) {
+    use editor::CompletionProvider as _;
+
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("notes.txt", "plain text @"),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "notes.txt",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let (triggers, task) = editor.update_in(cx, |editor, window, cx| {
+        let project = editor.project().expect("has project").clone();
+        let provider = CitationCompletionProvider::new(project, cx);
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("single buffer");
+        let position = buffer.read(cx).anchor_before("plain text @".len());
+        let triggers = provider.is_completion_trigger(&buffer, position, "@", false, cx);
+        let task = provider.completions(
+            &buffer,
+            position,
+            editor::CompletionContext {
+                trigger_kind: lsp::CompletionTriggerKind::INVOKED,
+                trigger_character: None,
+            },
+            window,
+            cx,
+        );
+        (triggers, task)
+    });
+    assert!(!triggers, "@ in a non-markdown buffer must not open the menu");
+
+    let responses = task.await.expect("delegated completions succeed");
+    let cite_keys: Vec<_> = responses
+        .into_iter()
+        .flat_map(|response| response.completions)
+        .filter(|completion| completion.new_text == "smith2020")
+        .collect();
+    assert!(
+        cite_keys.is_empty(),
+        "a non-markdown buffer must get no cite-key completions"
+    );
+}
+
+/// Hovering a resolved cite key serves the reference card through the
+/// wrapped semantics provider; anywhere else the provider delegates, so LSP
+/// hovers keep working.
+#[gpui::test]
+async fn test_hovering_a_cite_key_shows_the_reference_card(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "See [@smith2020] and email me@smith2020 here.\n"),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study of Things},\n  author = {Smith, Jane},\n  year = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let hover_on = |editor: &Entity<Editor>, cx: &mut gpui::VisualTestContext, offset: usize| {
+        editor.update(cx, |editor, cx| {
+            let provider = editor
+                .semantics_provider()
+                .expect("editor has a semantics provider");
+            let buffer = editor
+                .buffer()
+                .read(cx)
+                .as_singleton()
+                .expect("single buffer");
+            let position = buffer.read(cx).anchor_before(offset);
+            provider.hover(&buffer, position, cx)
+        })
+    };
+
+    // On the key: the reference card, immediately.
+    let task = hover_on(&editor, cx, "See [@smi".len()).expect("citation hover produced");
+    let hovers = task.await.expect("citation hover resolves");
+    let text = hovers
+        .first()
+        .and_then(|hover| hover.contents.first())
+        .map(|block| block.text.clone())
+        .unwrap_or_default();
+    assert!(
+        text.contains("A Study of Things") && text.contains("Jane Smith") && text.contains("2020"),
+        "hover card should carry the reference, got {text:?}"
+    );
+
+    // On the email's lookalike key: no card (the request delegates).
+    if let Some(task) = hover_on(&editor, cx, "See [@smith2020] and email me@smi".len()) {
+        let hovers = task.await.unwrap_or_default();
+        assert!(
+            hovers.iter().all(|hover| {
+                hover
+                    .contents
+                    .iter()
+                    .all(|block| !block.text.contains("A Study of Things"))
+            }),
+            "an email must not get a reference card"
+        );
+    }
+
+    // End to end: the editor's own hover pipeline pops the card.
+    editor.update_in(cx, |editor, window, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let anchor = snapshot.anchor_before(MultiBufferOffset("See [@smi".len()));
+        editor::hover_popover::hover_at(editor, Some(anchor), None, window, cx);
+    });
+    cx.executor().advance_clock(std::time::Duration::from_millis(700));
+    cx.run_until_parked();
+    let popovers = editor.update(cx, |editor, _| editor.hover_state.info_popovers.len());
+    assert_eq!(popovers, 1, "the hover popover should be on screen");
+}
+
+/// Deleting a whole `.bib` file drops its keys from the index the way
+/// deleting one entry does: keys only it provided flag red, keys other
+/// files still carry keep their chips.
+#[gpui::test]
+async fn test_deleting_a_bib_file_flags_its_keys(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            ("Note.md", "Both chip: [@kept2020] and [@doomed2021].\n"),
+            (
+                "kept.bib",
+                "@article{kept2020,\n  title = {Kept},\n  year = {2020},\n}\n",
+            ),
+            (
+                "doomed.bib",
+                "@article{doomed2021,\n  title = {Doomed},\n  year = {2021},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let mut resolved = highlighted_texts(&editor, CITATION, cx);
+    resolved.sort();
+    assert_eq!(resolved, vec!["@doomed2021", "@kept2020"]);
+
+    fs.remove_file("/vault/doomed.bib".as_ref(), Default::default())
+        .await
+        .expect("failed to delete doomed.bib");
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@kept2020"],
+        "the surviving bib's key keeps its chip"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@doomed2021"],
+        "the deleted bib's key flags red"
+    );
+}
+
+/// A `.bib` created after the project opened is discovered through the
+/// worktree change event, not the initial scan — and its arrival also turns
+/// verification on, so a key that sat unflagged in a bib-less vault gets its
+/// verdict once entries exist.
+#[gpui::test]
+async fn test_a_bib_created_later_starts_resolving(cx: &mut TestAppContext) {
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[("Note.md", "Cite [@late2020] and [@never2021].\n")],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let mut unverified = highlighted_texts(&editor, CITATION, cx);
+    unverified.sort();
+    assert_eq!(
+        unverified,
+        vec!["@late2020", "@never2021"],
+        "with no bibliography, citations chip without verification"
+    );
+
+    fs.insert_file(
+        "/vault/new.bib",
+        b"@article{late2020,\n  title = {Late Arrival},\n  year = {2020},\n}\n".to_vec(),
+    )
+    .await;
+    cx.run_until_parked();
+
+    assert_eq!(
+        highlighted_texts(&editor, CITATION, cx),
+        vec!["@late2020"],
+        "the new bib's key resolves"
+    );
+    assert_eq!(
+        highlighted_texts(&editor, CITATION_UNKNOWN, cx),
+        vec!["@never2021"],
+        "verification turns on with the first entries"
+    );
+}
+
+/// A citation arrives as one token through completion, so backspacing right
+/// after `]` (or forward-deleting right before `[`) removes the whole group,
+/// like the block widgets do. With the cursor inside the group, deletion
+/// stays per-character so a key can still be edited.
+#[gpui::test]
+async fn test_backspace_after_a_citation_deletes_the_whole_group(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state("A claim [@doe2020]ˇ stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    // One undo brings the whole citation back as one step.
+    cx.dispatch_action(editor::actions::Undo);
+    cx.assert_editor_state("A claim [@doe2020]ˇ stands\n");
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    cx.set_state("A claim ˇ[@doe2020] stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Delete);
+    cx.assert_editor_state("A claim ˇ stands\n");
+
+    // Inside the group the ordinary one-character deletion still applies.
+    cx.set_state("A claim [@doe2020ˇ] stands\n");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(editor::actions::Backspace);
+    cx.assert_editor_state("A claim [@doe202ˇ] stands\n");
+}
+
+#[gpui::test]
+async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) {
+    let cases: &[(&str, Option<usize>)] = &[
+        // Bracketed and bare citations complete after their `@`.
+        ("see [@smi", Some("see [@".len())),
+        ("see @smi", Some("see @".len())),
+        ("@smi", Some(1)),
+        ("[@a; @b", Some("[@a; @".len())),
+        // An email address or infix `@` is not a citation.
+        ("write me@exa", None),
+        // No `@` at all.
+        ("see [smi", None),
+    ];
+    for (text, expected) in cases {
+        let buffer = cx.new(|cx| language::Buffer::local(*text, cx));
+        let start =
+            cx.update(|cx| crate::bibliography::citation_key_start(buffer.read(cx), text.len()));
+        assert_eq!(start, *expected, "context detection for {text:?}");
+    }
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than

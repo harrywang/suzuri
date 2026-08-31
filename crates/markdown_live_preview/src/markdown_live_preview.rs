@@ -14,6 +14,7 @@ use std::{
     borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -28,7 +29,7 @@ use gpui::{
     App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
     HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
     RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
-    TextStyleRefinement, WeakEntity, Window, actions, img, rems,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, img, rems,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -56,6 +57,9 @@ struct LivePreviewFoldTag;
 
 const MARKDOWN: &str = "Markdown";
 const MARKDOWN_INLINE: &str = "Markdown-Inline";
+
+mod bibliography;
+pub use bibliography::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
 
 #[derive(Clone, Copy, Debug, Default, RegisterSetting)]
 pub struct MarkdownLivePreviewSettings {
@@ -161,6 +165,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     subscriptions.push(editor.register_action::<editor::actions::Backspace>(
         move |_, _window, cx| {
             if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, false, cx)
                 && !delete_adjacent_to_block(&weak_editor, false, cx)
             {
                 cx.propagate();
@@ -171,6 +176,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     subscriptions.push(
         editor.register_action::<editor::actions::Delete>(move |_, _window, cx| {
             if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, true, cx)
                 && !delete_adjacent_to_block(&weak_editor, true, cx)
             {
                 cx.propagate();
@@ -186,8 +192,31 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     // editor release every image it decoded.
     let image_cache = RetainAllImageCache::new(cx);
     if let Some(project) = editor.project().cloned() {
+        let bibliography = Bibliography::global(cx);
+        Bibliography::ensure_project(&bibliography, &project, cx);
+        // Restyle citations when a `.bib` finishes parsing, so keys resolve
+        // (or stop resolving) without waiting for the next edit.
+        subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
+            let markers = editor
+                .addon::<LivePreviewAddon>()
+                .and_then(|addon| addon.markers.clone());
+            apply_emphasis_highlights(editor, markers.as_deref(), cx);
+        }));
+        editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
+            project.clone(),
+            cx,
+        ))));
+        // Hovering a resolved cite key shows the reference card; wrapping
+        // (rather than replacing) keeps LSP hovers and the rest of the
+        // semantics surface working.
+        if let Some(semantics) = editor.semantics_provider() {
+            editor.set_semantics_provider(Some(Rc::new(CitationSemanticsProvider::new(
+                semantics, cx,
+            ))));
+        }
         subscriptions.push(cx.subscribe_in(&project, window, {
             let image_cache = image_cache.clone();
+            let bibliography = bibliography.clone();
             move |editor, project, event, window, cx| {
                 let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
                     return;
@@ -195,12 +224,28 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                 let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
                     return;
                 };
-                let (changed_images, changed_notes, note_created) = {
+                let (changed_images, changed_notes, note_created, changed_bibs, removed_bibs) = {
                     let worktree = worktree.read(cx);
                     let mut images = Vec::new();
                     let mut notes = Vec::new();
                     let mut created = false;
+                    let mut bibs = Vec::new();
+                    let mut removed_bibs = Vec::new();
                     for (path, _, change) in changes.iter() {
+                        // Unlike images and notes below, `.bib` files do want
+                        // the initial scan's `Loaded`: a worktree that
+                        // finishes scanning after the editor opened is how its
+                        // bibliography gets discovered at all, and reparsing
+                        // one already indexed is idempotent.
+                        if path.extension().is_some_and(|extension| extension == "bib") {
+                            let absolute = worktree.absolutize(path);
+                            if *change == PathChange::Removed {
+                                removed_bibs.push(absolute);
+                            } else {
+                                bibs.push(absolute);
+                            }
+                            continue;
+                        }
                         // `Loaded` is the initial scan reporting what was
                         // already there, not a change; acting on it would
                         // re-decode every image in the project on open.
@@ -223,8 +268,15 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                             notes.push(absolute);
                         }
                     }
-                    (images, notes, created)
+                    (images, notes, created, bibs, removed_bibs)
                 };
+
+                if !changed_bibs.is_empty() {
+                    Bibliography::reload_paths(&bibliography, project, changed_bibs, cx);
+                }
+                for path in removed_bibs {
+                    Bibliography::remove_path(&bibliography, &path, cx);
+                }
 
                 if !changed_images.is_empty() {
                     image_cache.update(cx, |image_cache, cx| {
@@ -363,6 +415,16 @@ struct MarkerSet {
     /// Pandoc-style citation keys (`@key` including the `@`), styled as
     /// reference chips once the surrounding brackets are concealed.
     citations: Vec<Range<Anchor>>,
+    /// Whole bracketed citation groups (`[...]` inclusive). A citation is
+    /// inserted as one token through completion, so backspacing at a group's
+    /// end (or forward-deleting at its start) removes the whole group.
+    citation_groups: Vec<Range<Anchor>>,
+    /// Bare in-text citation keys (`@key` outside any brackets). Pandoc
+    /// treats these as citations exactly like bracketed ones, and so does
+    /// the styling: chip when the key resolves, red flag when it does not.
+    /// The flagging only starts once the vault has a bibliography with
+    /// entries, which is what keeps `@handles` in bib-less prose unflagged.
+    bare_citations: Vec<Range<Anchor>>,
     /// Bodies of Obsidian `==highlight==` marks, painted with a highlighter
     /// background once the `==` delimiters are concealed.
     highlights: Vec<Range<Anchor>>,
@@ -720,6 +782,7 @@ const ORDERED_MARKER: usize = 5;
 const CITATION: usize = 6;
 const HIGHLIGHT: usize = 7;
 const TAG: usize = 8;
+const CITATION_UNKNOWN: usize = 9;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
 /// bold/italic styling, overriding the theme's source-mode markup colors
@@ -744,6 +807,46 @@ fn apply_emphasis_highlights(
     // works in one.
     let highlight_background = cx.theme().status().warning.opacity(0.28);
     let tag_background = cx.theme().status().info_background;
+    let error_color = cx.theme().status().error;
+
+    // A cite key that resolves to no `.bib` entry is the kind of silent error
+    // a submitted paper pays for, so it gets diagnostic styling. Only once
+    // the project has a bibliography with entries, though: someone writing
+    // `[@handle]` in a vault with no `.bib` is not citing anything.
+    let bibliography = Bibliography::global(cx);
+    let mut resolved_citations = markers.map(|markers| markers.citations.clone());
+    let mut unknown_citations = markers.map(|_| Vec::new());
+    if let Some(markers) = markers
+        && (!markers.citations.is_empty() || !markers.bare_citations.is_empty())
+        && bibliography.read(cx).has_entries()
+    {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let bibliography = bibliography.read(cx);
+        let resolves = |range: &Range<Anchor>| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let key = text.strip_prefix('@').unwrap_or(&text);
+            bibliography.contains_key(key)
+        };
+        let mut known = Vec::with_capacity(markers.citations.len());
+        let mut unknown = Vec::new();
+        for range in &markers.citations {
+            if resolves(range) {
+                known.push(range.clone());
+            } else {
+                unknown.push(range.clone());
+            }
+        }
+        for range in &markers.bare_citations {
+            if resolves(range) {
+                known.push(range.clone());
+            } else {
+                unknown.push(range.clone());
+            }
+        }
+        resolved_citations = Some(known);
+        unknown_citations = Some(unknown);
+    }
+
     let sets = [
         (
             STRIKE,
@@ -802,11 +905,26 @@ fn apply_emphasis_highlights(
         ),
         (
             CITATION,
-            markers.map(|markers| markers.citations.clone()),
+            resolved_citations,
             HighlightStyle {
                 color: Some(accent_color),
                 background_color: Some(citation_background),
                 font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            CITATION_UNKNOWN,
+            unknown_citations,
+            HighlightStyle {
+                color: Some(error_color),
+                background_color: Some(citation_background),
+                font_style: Some(gpui::FontStyle::Normal),
+                underline: Some(UnderlineStyle {
+                    thickness: gpui::px(1.),
+                    color: Some(error_color),
+                    wavy: true,
+                }),
                 ..Default::default()
             },
         ),
@@ -2428,6 +2546,58 @@ fn delete_adjacent_to_block(weak_editor: &WeakEntity<Editor>, forward: bool, cx:
                 None,
                 cx,
             );
+        });
+        true
+    })
+}
+
+/// Deletes a whole bracketed citation group when a single caret backspaces
+/// at its end or forward-deletes at its start. A citation arrives as one
+/// token through completion, so it should leave the same way; editing a key
+/// letter by letter stays available by moving the cursor inside the group.
+/// Returns false when no caret borders a group so the caller can propagate.
+fn delete_adjacent_citation(weak_editor: &WeakEntity<Editor>, forward: bool, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let groups: Vec<Range<usize>> = editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.markers.as_ref())
+            .map(|markers| {
+                markers
+                    .citation_groups
+                    .iter()
+                    .map(|range| {
+                        range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if groups.is_empty() {
+            return false;
+        }
+        let selections = selection_offset_ranges(editor, &snapshot);
+        let [caret] = selections.as_slice() else {
+            return false;
+        };
+        if caret.start != caret.end {
+            return false;
+        }
+        let head = caret.start;
+        let Some(group) = groups.iter().find(|group| {
+            if forward {
+                group.start == head
+            } else {
+                group.end == head
+            }
+        }) else {
+            return false;
+        };
+        let deletion = MultiBufferOffset(group.start)..MultiBufferOffset(group.end);
+        editor.buffer().update(cx, |multibuffer, cx| {
+            multibuffer.edit([(deletion, "")], None, cx);
         });
         true
     })
@@ -5410,6 +5580,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges: Vec::new(),
         ordered_markers: Vec::new(),
         citations: Vec::new(),
+        citation_groups: Vec::new(),
+        bare_citations: Vec::new(),
         highlights: Vec::new(),
         tags: Vec::new(),
     };
@@ -5440,6 +5612,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        citation_groups,
+        bare_citations,
         highlights,
         tags,
         ..
@@ -5480,6 +5654,8 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         definition_ranges,
         ordered_markers,
         citations,
+        citation_groups,
+        bare_citations,
         highlights,
         tags,
     })
@@ -5505,6 +5681,8 @@ struct Extraction<'a> {
     definition_ranges: Vec<Range<Anchor>>,
     ordered_markers: Vec<Range<Anchor>>,
     citations: Vec<Range<Anchor>>,
+    citation_groups: Vec<Range<Anchor>>,
+    bare_citations: Vec<Range<Anchor>>,
     highlights: Vec<Range<Anchor>>,
     tags: Vec<Range<Anchor>>,
 }
@@ -6129,6 +6307,10 @@ impl Extraction<'_> {
                 continue;
             };
             let mut search_from = 0;
+            // Every `[...]` span seen, kept or not, so the bare pass below
+            // never claims a key inside a bracket construct (a rejected
+            // group, a link label, a wikilink).
+            let mut bracket_spans: Vec<Range<usize>> = Vec::new();
             while let Some(open_offset) = region_text[search_from..].find('[') {
                 let open = search_from + open_offset;
                 search_from = open + 1;
@@ -6136,6 +6318,7 @@ impl Extraction<'_> {
                     break;
                 };
                 let close = open + 1 + close_offset;
+                bracket_spans.push(open..close + 1);
                 let inner = &region_text[open + 1..close];
                 if inner.is_empty() || inner.contains('\n') || inner.contains('[') {
                     continue;
@@ -6172,11 +6355,35 @@ impl Extraction<'_> {
                 let reveal = start..end;
                 self.hide(start..start + 1, reveal.clone());
                 self.hide(end - 1..end, reveal.clone());
+                self.citation_groups.push(self.anchor_range(start..end));
                 for key in keys {
                     let range = self.anchor_range(start + 1 + key.start..start + 1 + key.end);
                     self.citations.push(range);
                 }
                 search_from = close + 1;
+            }
+
+            // Pandoc also allows in-text citations with no brackets
+            // (`@hayashi2003 argues`), which is what accepting a bare `@`
+            // completion produces. `citation_keys`'s boundary rules already
+            // reject an email's or URL's infix `@`.
+            for key in citation_keys(region_text) {
+                if bracket_spans
+                    .iter()
+                    .any(|span| span.start < key.end && key.start < span.end)
+                {
+                    continue;
+                }
+                let start = region.start + key.start;
+                let end = region.start + key.end;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                self.bare_citations.push(self.anchor_range(start..end));
             }
         }
         self.prose_regions = regions;
