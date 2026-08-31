@@ -1690,7 +1690,6 @@ impl Element for TerminalElement {
                             };
                             let hr = HighlightedRange {
                                 start_y,
-                                line_height: layout.dimensions.line_height,
                                 lines: highlighted_range_lines,
                                 color: *color,
                                 corner_radius: corner_radius,
@@ -1976,6 +1975,7 @@ fn to_highlighted_range_lines(
         }
 
         highlighted_range_lines.push(HighlightedRangeLine {
+            line_height: layout.dimensions.line_height,
             start_x: origin.x + line_start as f32 * layout.dimensions.cell_width,
             end_x: origin.x + line_end as f32 * layout.dimensions.cell_width,
         });

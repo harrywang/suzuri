@@ -330,18 +330,23 @@ impl ScrollManager {
             ScrollBeyondLastLine::OnePage => scroll_top,
             ScrollBeyondLastLine::Off => {
                 if let Some(height_in_lines) = self.visible_line_count {
-                    let max_row = map.max_point().row().as_f64();
-                    scroll_top.min(max_row - height_in_lines + 1.).max(0.)
+                    let max_visual_row =
+                        map.visual_y_for_row(map.max_point().row().next_row().as_f64());
+                    let max_scroll_visual = (max_visual_row - height_in_lines).max(0.0);
+                    let scroll_visual = map.visual_y_for_row(scroll_top).min(max_scroll_visual);
+                    map.row_for_visual_y(scroll_visual)
                 } else {
                     scroll_top
                 }
             }
             ScrollBeyondLastLine::VerticalScrollMargin => {
                 if let Some(height_in_lines) = self.visible_line_count {
-                    let max_row = map.max_point().row().as_f64();
-                    scroll_top
-                        .min(max_row - height_in_lines + 1. + self.vertical_scroll_margin)
-                        .max(0.)
+                    let max_visual_row =
+                        map.visual_y_for_row(map.max_point().row().next_row().as_f64());
+                    let max_scroll_visual =
+                        (max_visual_row - height_in_lines + self.vertical_scroll_margin).max(0.0);
+                    let scroll_visual = map.visual_y_for_row(scroll_top).min(max_scroll_visual);
+                    map.row_for_visual_y(scroll_visual)
                 } else {
                     scroll_top
                 }
@@ -653,7 +658,11 @@ impl Editor {
             delta.y = 0.0;
         }
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
-        let position = self.scroll_manager.scroll_position(&display_map, cx) + delta.map(f64::from);
+        let mut position = self.scroll_manager.scroll_position(&display_map, cx);
+        position.x += f64::from(delta.x);
+        position.y = display_map.row_for_visual_y(
+            (display_map.visual_y_for_row(position.y) + f64::from(delta.y)).max(0.0),
+        );
         self.set_scroll_position_taking_display_map(position, true, false, display_map, window, cx);
     }
 
