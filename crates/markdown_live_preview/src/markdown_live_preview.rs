@@ -14,6 +14,7 @@ use std::{
     borrow::Cow,
     ops::Range,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -28,7 +29,7 @@ use gpui::{
     App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
     HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
     RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
-    TextStyleRefinement, WeakEntity, Window, actions, img, rems,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, img, rems,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -56,6 +57,9 @@ struct LivePreviewFoldTag;
 
 const MARKDOWN: &str = "Markdown";
 const MARKDOWN_INLINE: &str = "Markdown-Inline";
+
+mod bibliography;
+pub use bibliography::{Bibliography, CitationCompletionProvider};
 
 #[derive(Clone, Copy, Debug, Default, RegisterSetting)]
 pub struct MarkdownLivePreviewSettings {
@@ -186,8 +190,23 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     // editor release every image it decoded.
     let image_cache = RetainAllImageCache::new(cx);
     if let Some(project) = editor.project().cloned() {
+        let bibliography = Bibliography::global(cx);
+        Bibliography::ensure_project(&bibliography, &project, cx);
+        // Restyle citations when a `.bib` finishes parsing, so keys resolve
+        // (or stop resolving) without waiting for the next edit.
+        subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
+            let markers = editor
+                .addon::<LivePreviewAddon>()
+                .and_then(|addon| addon.markers.clone());
+            apply_emphasis_highlights(editor, markers.as_deref(), cx);
+        }));
+        editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
+            project.clone(),
+            cx,
+        ))));
         subscriptions.push(cx.subscribe_in(&project, window, {
             let image_cache = image_cache.clone();
+            let bibliography = bibliography.clone();
             move |editor, project, event, window, cx| {
                 let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
                     return;
@@ -195,12 +214,28 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                 let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
                     return;
                 };
-                let (changed_images, changed_notes, note_created) = {
+                let (changed_images, changed_notes, note_created, changed_bibs, removed_bibs) = {
                     let worktree = worktree.read(cx);
                     let mut images = Vec::new();
                     let mut notes = Vec::new();
                     let mut created = false;
+                    let mut bibs = Vec::new();
+                    let mut removed_bibs = Vec::new();
                     for (path, _, change) in changes.iter() {
+                        // Unlike images and notes below, `.bib` files do want
+                        // the initial scan's `Loaded`: a worktree that
+                        // finishes scanning after the editor opened is how its
+                        // bibliography gets discovered at all, and reparsing
+                        // one already indexed is idempotent.
+                        if path.extension().is_some_and(|extension| extension == "bib") {
+                            let absolute = worktree.absolutize(path);
+                            if *change == PathChange::Removed {
+                                removed_bibs.push(absolute);
+                            } else {
+                                bibs.push(absolute);
+                            }
+                            continue;
+                        }
                         // `Loaded` is the initial scan reporting what was
                         // already there, not a change; acting on it would
                         // re-decode every image in the project on open.
@@ -223,8 +258,15 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                             notes.push(absolute);
                         }
                     }
-                    (images, notes, created)
+                    (images, notes, created, bibs, removed_bibs)
                 };
+
+                if !changed_bibs.is_empty() {
+                    Bibliography::reload_paths(&bibliography, project, changed_bibs, cx);
+                }
+                for path in removed_bibs {
+                    Bibliography::remove_path(&bibliography, &path, cx);
+                }
 
                 if !changed_images.is_empty() {
                     image_cache.update(cx, |image_cache, cx| {
@@ -720,6 +762,7 @@ const ORDERED_MARKER: usize = 5;
 const CITATION: usize = 6;
 const HIGHLIGHT: usize = 7;
 const TAG: usize = 8;
+const CITATION_UNKNOWN: usize = 9;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
 /// bold/italic styling, overriding the theme's source-mode markup colors
@@ -744,6 +787,36 @@ fn apply_emphasis_highlights(
     // works in one.
     let highlight_background = cx.theme().status().warning.opacity(0.28);
     let tag_background = cx.theme().status().info_background;
+    let error_color = cx.theme().status().error;
+
+    // A cite key that resolves to no `.bib` entry is the kind of silent error
+    // a submitted paper pays for, so it gets diagnostic styling. Only once
+    // the project has a bibliography with entries, though: someone writing
+    // `[@handle]` in a vault with no `.bib` is not citing anything.
+    let bibliography = Bibliography::global(cx);
+    let mut resolved_citations = markers.map(|markers| markers.citations.clone());
+    let mut unknown_citations = markers.map(|_| Vec::new());
+    if let Some(citations) = resolved_citations.as_mut()
+        && !citations.is_empty()
+        && bibliography.read(cx).has_entries()
+    {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let bibliography = bibliography.read(cx);
+        let mut known = Vec::with_capacity(citations.len());
+        let mut unknown = Vec::new();
+        for range in citations.drain(..) {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let key = text.strip_prefix('@').unwrap_or(&text);
+            if bibliography.resolve(key).is_some() {
+                known.push(range);
+            } else {
+                unknown.push(range);
+            }
+        }
+        *citations = known;
+        unknown_citations = Some(unknown);
+    }
+
     let sets = [
         (
             STRIKE,
@@ -802,11 +875,26 @@ fn apply_emphasis_highlights(
         ),
         (
             CITATION,
-            markers.map(|markers| markers.citations.clone()),
+            resolved_citations,
             HighlightStyle {
                 color: Some(accent_color),
                 background_color: Some(citation_background),
                 font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            CITATION_UNKNOWN,
+            unknown_citations,
+            HighlightStyle {
+                color: Some(error_color),
+                background_color: Some(citation_background),
+                font_style: Some(gpui::FontStyle::Normal),
+                underline: Some(UnderlineStyle {
+                    thickness: gpui::px(1.),
+                    color: Some(error_color),
+                    wavy: true,
+                }),
                 ..Default::default()
             },
         ),
