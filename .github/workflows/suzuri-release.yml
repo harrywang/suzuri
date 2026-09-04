@@ -191,6 +191,28 @@ jobs:
       - name: Install build dependencies
         run: ./script/linux
 
+      # The prebuilt libwebrtc archive contains SME-enabled libyuv routines
+      # (rotate_sme.o) that call __arm_tpidr2_save, a helper only GCC 14+
+      # libgcc or LLVM 17+ compiler-rt provide. Zed's own ARM builds get it
+      # from a newer libgcc_s their runner image carries; this runner's GCC 11
+      # has no such symbol, so the link fails. Appending compiler-rt's
+      # builtins archive resolves it statically, adding no runtime dependency
+      # to the tarball. bundle-linux keeps whatever RUSTFLAGS it inherits.
+      - name: Provide SME helpers from compiler-rt
+        if: matrix.arch == 'aarch64'
+        run: |
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y libclang-rt-18-dev
+          builtins=$(find /usr/lib/llvm-18 -name 'libclang_rt.builtins*.a' | head -n 1)
+          if [ -z "${builtins}" ] || ! nm "${builtins}" | grep -q __arm_tpidr2_save; then
+            echo "::error::No compiler-rt builtins archive defining __arm_tpidr2_save under /usr/lib/llvm-18."
+            exit 1
+          fi
+          echo "Linking with ${builtins}"
+          echo "RUSTFLAGS=-C link-arg=${builtins}" >> "$GITHUB_ENV"
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: bundle-linux-${{ matrix.arch }}
