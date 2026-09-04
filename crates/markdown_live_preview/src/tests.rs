@@ -3775,6 +3775,46 @@ async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) 
 // behavior of its own. They exist so an upstream merge that changes those
 // semantics fails here, loudly, instead of silently degrading live preview.
 
+/// Live preview relies on editor line styles changing vertical geometry without
+/// changing logical row identity. If those coordinate transforms diverge, headings
+/// render at the right size while cursors, hit-testing, and scrolling use the wrong row.
+#[gpui::test]
+async fn test_line_style_row_geometry_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇheading\nbody");
+    cx.executor().run_until_parked();
+
+    let style = editor::display_map::LineStyle {
+        font_scale: 1.25,
+        line_height: 1.5,
+    };
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor.style_lines(
+            HighlightKey::MarkdownLivePreview(usize::MAX),
+            vec![
+                snapshot.anchor_before(MultiBufferOffset(0))
+                    ..snapshot.anchor_after(MultiBufferOffset("heading".len())),
+            ],
+            style,
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        assert_eq!(
+            display.line_style_for_row(editor::display_map::DisplayRow(0)),
+            Some(style)
+        );
+        assert!((display.visual_y_for_row(1.0) - 1.5).abs() <= 0.0001);
+        assert!((display.visual_y_for_row(2.0) - 2.5).abs() <= 0.0001);
+        assert!((display.row_for_visual_y(0.75) - 0.5).abs() <= 0.0001);
+        assert!((display.row_for_visual_y(1.5) - 1.0).abs() <= 0.0001);
+    });
+}
+
 /// Live preview's text decorations all hang off `HighlightKey::MarkdownLivePreview`,
 /// keyed per decoration kind. Highlights written under one key must not be
 /// disturbed when another key is cleared, or disabling one decoration would
