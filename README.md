@@ -28,8 +28,19 @@ Download the latest installer:
 - [macOS — Apple Silicon](../../releases/latest/download/suzuri-aarch64.dmg)
 - [macOS — Intel](../../releases/latest/download/suzuri-x86_64.dmg)
 - [Windows](../../releases/latest/download/suzuri-windows-x86_64.exe)
+- [Linux — x86_64](../../releases/latest/download/suzuri-linux-x86_64.tar.gz)
+- [Linux — ARM64](../../releases/latest/download/suzuri-linux-aarch64.tar.gz)
 
 The macOS builds are signed and notarized — open the DMG and drag Suzuri to Applications. The Windows installer is not yet signed, so SmartScreen shows a warning: choose "More info → Run anyway".
+
+The Linux build is a plain tarball. Extract it somewhere permanent, put its `bin/suzuri` on your PATH, and optionally copy its `share/` folder into `~/.local/share` for an app-menu entry and icon:
+
+```sh
+mkdir -p ~/.local/bin
+tar -xzf suzuri-linux-x86_64.tar.gz -C ~/.local
+ln -sf ~/.local/suzuri.app/bin/suzuri ~/.local/bin/suzuri
+cp -r ~/.local/suzuri.app/share/. ~/.local/share/
+```
 
 Or build from source, the same way Zed builds:
 

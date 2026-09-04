@@ -1,7 +1,8 @@
 # Suzuri's release pipeline (AgentFit-style): push a `suzuri-v*` tag and a
-# GitHub Release appears with macOS DMGs (both architectures) and a Windows
-# installer. Deliberately separate from Zed's own release.yml, which targets
-# Namespace runners this fork does not have.
+# GitHub Release appears with macOS DMGs (both architectures), a Windows
+# installer, and Linux tarballs (both architectures). Deliberately separate
+# from Zed's own release.yml, which targets Namespace runners this fork does
+# not have.
 #
 # macOS builds sign and notarize automatically when the repo has the same
 # five secrets AgentFit's release flow uses: CERTIFICATE_P12,
@@ -155,8 +156,57 @@ jobs:
           name: windows-installer
           path: target/suzuri-windows-x86_64.exe
 
+  build-linux:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest hosted image still offered. The tarball links against
+          # the builder's glibc, so a newer image would shut out users on
+          # older distributions; Zed builds on 20.04 for the same reason.
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 350
+    env:
+      CC: clang
+      CXX: clang++
+      # bundle-linux strips debug info anyway; not generating it keeps the
+      # target dir within a hosted runner's disk.
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
+    steps:
+      - uses: actions/checkout@v5
+
+      # Hosted Ubuntu images leave roughly 20G free, and a release build of
+      # the workspace needs more. Toolchains nothing here uses are the
+      # cheapest space to reclaim.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install build dependencies
+        run: ./script/linux
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: bundle-linux-${{ matrix.arch }}
+          cache-on-failure: true
+
+      - name: Build tarball
+        run: ./script/bundle-linux
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-${{ matrix.arch }}
+          path: target/release/suzuri-linux-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
   release:
-    needs: [build-mac, build-windows]
+    needs: [build-mac, build-windows, build-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v7

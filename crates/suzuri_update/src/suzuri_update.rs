@@ -313,6 +313,7 @@ fn download_url_for_host<'a>(release: &'a GithubRelease, os: &str, arch: &str) -
     let matches = |asset: &GithubReleaseAsset| match os {
         "macos" => asset.name.ends_with(".dmg") && asset.name.contains(arch),
         "windows" => asset.name.ends_with(".exe") && asset.name.contains("windows"),
+        "linux" => asset.name.ends_with(".tar.gz") && asset.name.contains(arch),
         _ => false,
     };
 
@@ -486,6 +487,8 @@ mod tests {
                 "suzuri-aarch64.dmg",
                 "suzuri-x86_64.dmg",
                 "suzuri-windows-x86_64.exe",
+                "suzuri-linux-x86_64.tar.gz",
+                "suzuri-linux-aarch64.tar.gz",
             ],
         );
 
@@ -501,9 +504,14 @@ mod tests {
             download_url_for_host(&release, "windows", "x86_64"),
             Some("https://example.test/suzuri-windows-x86_64.exe")
         );
-        // Linux has no artifact in the release workflow; callers fall back to
-        // the release page rather than offering a macOS disk image.
-        assert_eq!(download_url_for_host(&release, "linux", "x86_64"), None);
+        assert_eq!(
+            download_url_for_host(&release, "linux", "x86_64"),
+            Some("https://example.test/suzuri-linux-x86_64.tar.gz")
+        );
+        assert_eq!(
+            download_url_for_host(&release, "linux", "aarch64"),
+            Some("https://example.test/suzuri-linux-aarch64.tar.gz")
+        );
     }
 
     #[test]
