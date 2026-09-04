@@ -198,16 +198,18 @@ jobs:
       # has no such symbol, so the link fails. Appending compiler-rt's
       # builtins archive resolves it statically, adding no runtime dependency
       # to the tarball. bundle-linux keeps whatever RUSTFLAGS it inherits.
+      # LLVM 19 specifically: apt.llvm.org's 18 packages for jammy were built
+      # without the SME routines, so the nm check below guards the version.
       - name: Provide SME helpers from compiler-rt
         if: matrix.arch == 'aarch64'
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null
-          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | sudo tee /etc/apt/sources.list.d/llvm-18.list > /dev/null
+          echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-19 main" | sudo tee /etc/apt/sources.list.d/llvm-19.list > /dev/null
           sudo apt-get update
-          sudo apt-get install -y libclang-rt-18-dev
-          builtins=$(find /usr/lib/llvm-18 -name 'libclang_rt.builtins*.a' | head -n 1)
+          sudo apt-get install -y libclang-rt-19-dev
+          builtins=$(find /usr/lib/llvm-19 -name 'libclang_rt.builtins*.a' | head -n 1)
           if [ -z "${builtins}" ] || ! nm "${builtins}" | grep -q __arm_tpidr2_save; then
-            echo "::error::No compiler-rt builtins archive defining __arm_tpidr2_save under /usr/lib/llvm-18."
+            echo "::error::No compiler-rt builtins archive defining __arm_tpidr2_save under /usr/lib/llvm-19."
             exit 1
           fi
           echo "Linking with ${builtins}"
