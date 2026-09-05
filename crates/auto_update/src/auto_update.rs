@@ -676,6 +676,15 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
+        // SUZURI: Suzuri publishes its remote servers as GitHub release assets;
+        // the release index queried below only knows Zed's builds.
+        if asset == "zed-remote-server" {
+            return Ok(ReleaseAsset {
+                version: suzuri_update::SUZURI_VERSION.to_string(),
+                url: suzuri_update::remote_server_download_url(os, arch),
+            });
+        }
+
         let client = this.read_with(cx, |this, _| this.client.clone());
 
         let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {

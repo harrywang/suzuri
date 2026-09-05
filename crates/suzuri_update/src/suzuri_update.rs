@@ -14,6 +14,9 @@
 //!
 //! The version being compared is [`SUZURI_VERSION`], not the crate version —
 //! see that constant for why.
+//!
+//! The same constant also names the release a running build fetches its
+//! remote server from; see [`remote_server_download_url`].
 
 use anyhow::{Context as _, Result};
 use gpui::{
@@ -306,6 +309,21 @@ fn release_page_url(tag_name: &str) -> String {
     format!("https://github.com/{RELEASE_REPOSITORY}/releases/tag/{tag_name}")
 }
 
+/// Where this build fetches the remote server it copies onto an SSH host.
+///
+/// Zed's client asks its own release index for that binary, which knows nothing
+/// about Suzuri builds and, on the `dev` channel Suzuri ships on, refuses to ask
+/// at all. The release workflow publishes the same `zed-remote-server-<os>-<arch>`
+/// artifacts Zed does under this build's own tag, so the asset named here is
+/// the server built from the same commit as the client requesting it.
+pub fn remote_server_download_url(os: &str, arch: &str) -> String {
+    let extension = if os == "windows" { "zip" } else { "gz" };
+    format!(
+        "https://github.com/{RELEASE_REPOSITORY}/releases/download/\
+         {RELEASE_TAG_PREFIX}{SUZURI_VERSION}/zed-remote-server-{os}-{arch}.{extension}"
+    )
+}
+
 /// Picks the asset a user on this OS and CPU should download, matching on shape
 /// rather than exact filenames so that renaming an artifact in the release
 /// workflow degrades to the release page instead of linking to a 404.
@@ -477,6 +495,24 @@ mod tests {
         // though plain semver ordering would say otherwise.
         assert!(!is_newer(&Version::new(0, 2, 0), &current));
         assert!(!is_newer(&Version::new(0, 1, 9), &current));
+    }
+
+    #[test]
+    fn test_remote_server_download_url_names_this_builds_release() {
+        assert_eq!(
+            remote_server_download_url("linux", "x86_64"),
+            format!(
+                "https://github.com/harrywang/suzuri/releases/download/\
+                 suzuri-v{SUZURI_VERSION}/zed-remote-server-linux-x86_64.gz"
+            )
+        );
+        assert_eq!(
+            remote_server_download_url("windows", "aarch64"),
+            format!(
+                "https://github.com/harrywang/suzuri/releases/download/\
+                 suzuri-v{SUZURI_VERSION}/zed-remote-server-windows-aarch64.zip"
+            )
+        );
     }
 
     #[test]

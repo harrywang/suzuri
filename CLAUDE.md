@@ -33,6 +33,7 @@ The fork's own changes are small and additive:
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | Update notifications | `crates/suzuri_update/`, `crates/zed/src/zed/app_menus.rs` (the Check for Updates entry) |
+| Remote server provisioning on the dev channel (SSH/Docker/WSL remotes; see "Cutting a release") | `crates/auto_update/src/auto_update.rs` (`get_release_asset`), `crates/remote/src/transport/ssh.rs`, `docker.rs`, `wsl.rs` (`ensure_server_binary`) |
 | Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
 | Branding, CLI name, release infrastructure | `crates/zed/Cargo.toml` (bundle metadata), `crates/zed/resources/app-icon-suzuri*`, `crates/zed/resources/windows/app-icon-suzuri.ico`, `assets/images/suzuri_logo.svg`, `crates/install_cli/src/install_cli_binary.rs`, `script/bundle-mac`, `script/bundle-windows.ps1`, `script/bundle-linux`, `.github/workflows/suzuri-release.yml` |
 
@@ -286,6 +287,18 @@ upstream Zed's own (`Bump Zed to v1.17.0`), which upstream bumps on its own cade
 and every merge brings along — it tracks the Zed base this fork is built on, not
 Suzuri's releases, and the two number lines are unrelated. `SUZURI_VERSION` lives in
 a fork-owned file precisely so no merge can move it.
+
+**Remote development rides on the release assets.** A shipped build copies
+`zed-remote-server-<os>-<arch>` onto an SSH host, and fetches it from the GitHub
+release for `SUZURI_VERSION` (`suzuri_update::remote_server_download_url`). Upstream's
+`dev` channel refuses to download a server at all and names it `...-dev-build`, so the
+fork patches `ensure_server_binary` in the SSH/Docker/WSL transports and
+`AutoUpdater::get_release_asset` (all tagged `SUZURI:`) to treat `dev` like a release.
+Three consequences: every bundle job must publish its remote server (the workflow's
+upload steps do, with `if-no-files-found: error`); client and server must come from the
+same commit, so never replace a release's assets by hand; and a locally bundled,
+untagged build will look for a release that does not exist — dogfood remoting from a
+debug build, which compiles the server from source instead.
 
 `suzuri_update` only *notifies*; it never installs. Zed's installer (`auto_update`)
 is not wired up, and adopting it would need, at minimum, its hardcoded `Zed` DMG
