@@ -1,6 +1,8 @@
 # Suzuri's release pipeline (AgentFit-style): push a `suzuri-v*` tag and a
 # GitHub Release appears with macOS DMGs (both architectures), a Windows
-# installer, and Linux tarballs (both architectures). Deliberately separate
+# installer, and Linux tarballs (both architectures), plus the
+# `zed-remote-server-<os>-<arch>` binaries a running Suzuri copies onto an SSH
+# host (fetched by version tag; see `suzuri_update`). Deliberately separate
 # from Zed's own release.yml, which targets Namespace runners this fork does
 # not have.
 #
@@ -99,7 +101,10 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: dmg-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/suzuri-*.dmg
+          path: |
+            target/${{ matrix.target }}/release/suzuri-*.dmg
+            target/zed-remote-server-macos-*.gz
+          if-no-files-found: error
 
   build-windows:
     needs: check-version
@@ -154,7 +159,10 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: windows-installer
-          path: target/suzuri-windows-x86_64.exe
+          path: |
+            target/suzuri-windows-x86_64.exe
+            target/zed-remote-server-windows-x86_64.zip
+          if-no-files-found: error
 
   build-linux:
     needs: check-version
@@ -226,7 +234,12 @@ jobs:
       - uses: actions/upload-artifact@v6
         with:
           name: linux-${{ matrix.arch }}
-          path: target/release/suzuri-linux-${{ matrix.arch }}.tar.gz
+          # bundle-linux also builds the statically linked musl remote server;
+          # without it in the release, SSH remoting from a shipped build has
+          # nothing to install on the host.
+          path: |
+            target/release/suzuri-linux-${{ matrix.arch }}.tar.gz
+            target/zed-remote-server-linux-${{ matrix.arch }}.gz
           if-no-files-found: error
 
   release:
