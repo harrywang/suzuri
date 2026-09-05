@@ -218,7 +218,9 @@ impl DockerExecConnection {
                 let commit = commit.map(|s| s.full()).unwrap_or_default();
                 format!("{}-{}", version, commit)
             }
-            ReleaseChannel::Dev => "build".to_string(),
+            // SUZURI: dev builds are releases here, so name the server by
+            // version like the other channels; a fixed name would keep reusing
+            // a stale server on the host after the client updates.
             _ => version.to_string(),
         };
         let binary_name = format!(
@@ -272,16 +274,12 @@ impl DockerExecConnection {
             return Ok(dst_path.into());
         }
 
+        // SUZURI: dev builds download their server like a release does; see
+        // suzuri_update::remote_server_download_url for where from.
         let wanted_version = cx.update(|cx| match release_channel {
-            ReleaseChannel::Nightly => Ok(None),
-            ReleaseChannel::Dev => {
-                anyhow::bail!(
-                    "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
-                    dst_path
-                )
-            }
-            _ => Ok(Some(AppVersion::global(cx))),
-        })?;
+            ReleaseChannel::Nightly => None,
+            _ => Some(AppVersion::global(cx)),
+        });
 
         let tmp_path_gz = paths::remote_server_dir_relative().join(
             RelPath::from_unix_str(&format!(

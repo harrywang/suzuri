@@ -27,6 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
 smol.workspace = true
+suzuri_update.workspace = true # SUZURI: remote server download URL
 tempfile.workspace = true
 util.workspace = true
 workspace.workspace = true

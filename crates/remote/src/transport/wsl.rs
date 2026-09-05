@@ -194,10 +194,10 @@ impl WslRemoteConnection {
         version: Version,
         cx: &mut AsyncApp,
     ) -> Result<Arc<RelPath>> {
-        let version_str = match release_channel {
-            ReleaseChannel::Dev => "build".to_string(),
-            _ => version.to_string(),
-        };
+        // SUZURI: dev builds are releases here, so name the server by version
+        // like the other channels; a fixed name would keep reusing a stale
+        // server on the host after the client updates.
+        let version_str = version.to_string();
 
         let binary_name = format!(
             "zed-remote-server-{}-{}",
