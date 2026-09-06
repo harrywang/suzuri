@@ -103,7 +103,7 @@ use {
     feature_flags::FeatureFlagAppExt as _,
     git_ui::project_diff::ProjectDiff,
     gpui::{
-        App, AppContext as _, Bounds, Entity, Focusable as _, KeyBinding, Modifiers,
+        App, AppContext as _, Bounds, Entity, Focusable as _, KeyBinding, Modifiers, Pixels,
         VisualTestAppContext, WindowBounds, WindowHandle, WindowOptions, point, px, size,
     },
     image::RgbaImage,
@@ -653,6 +653,23 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
         Err(e) => {
             eprintln!("✗ citation_pipeline: FAILED - {}", e);
+            failed += 1;
+        }
+    }
+
+    // Run Test 12: Live preview links open their target on a plain click
+    println!("\n--- Test 12: link_click (4 variants) ---");
+    match run_link_click_visual_tests(app_state.clone(), &mut cx, update_baseline) {
+        Ok(TestResult::Passed) => {
+            println!("✓ link_click: PASSED");
+            passed += 1;
+        }
+        Ok(TestResult::BaselineUpdated(_)) => {
+            println!("✓ link_click: Baselines updated");
+            updated += 1;
+        }
+        Err(e) => {
+            eprintln!("✗ link_click: FAILED - {}", e);
             failed += 1;
         }
     }
@@ -2749,6 +2766,275 @@ fn run_citation_pipeline_visual_tests(
             Ok(TestResult::BaselineUpdated(path))
         }
     }
+}
+
+/// Drives live preview's click-to-open links in a real rendered window: a
+/// vault note carrying a wikilink and a markdown file link. Captures the
+/// note's rendering, then clicks the markdown link and the wikilink and
+/// checks each opened its target, and finally clicks past the end of a link's
+/// line to show the raw markdown coming back for editing.
+#[cfg(target_os = "macos")]
+fn run_link_click_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.keep();
+    let canonical_temp = temp_path.canonicalize()?;
+    let vault_dir = canonical_temp.join("vault");
+    std::fs::create_dir_all(vault_dir.join("notes"))?;
+    std::fs::write(
+        vault_dir.join("Note.md"),
+        "# Link check\n\n\
+         A wikilink [[Method]] opens a note in this vault.\n\n\
+         A markdown link opens a file beside this one: [Schedule](schedule-fall-2026.md)\n\n\
+         Also: alias [[notes/plan|the plan]], heading [[Method#Sampling]], \
+         site [Zed](https://zed.dev), missing [[Nowhere]], \
+         formatted [**bold** link](Method.md).\n",
+    )?;
+    std::fs::write(
+        vault_dir.join("Method.md"),
+        "# Method\n\nIntro paragraph.\n\n## Sampling\n\nWe sampled 40 participants.\n",
+    )?;
+    std::fs::write(
+        vault_dir.join("schedule-fall-2026.md"),
+        "# Fall 2026 schedule\n\nWeek 1: introductions.\n",
+    )?;
+    std::fs::write(vault_dir.join("notes/plan.md"), "# The plan\n\nStep one.\n")?;
+
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(1280.0), px(800.0)),
+    };
+    let workspace_window: WindowHandle<Workspace> = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                cx.new(|cx| Workspace::new(None, project.clone(), app_state.clone(), window, cx))
+            },
+        )
+    })?;
+    cx.run_until_parked();
+
+    let add_worktree_task = workspace_window.update(cx, |workspace, _window, cx| {
+        workspace.project().update(cx, |project, cx| {
+            project.find_or_create_worktree(&vault_dir, true, cx)
+        })
+    })?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree_task)
+        .context("Failed to add vault worktree")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let open_note = |cx: &mut VisualTestAppContext| -> Result<Entity<editor::Editor>> {
+        let open_task = workspace_window.update(cx, |workspace, window, cx| {
+            let worktree = workspace
+                .project()
+                .read(cx)
+                .worktrees(cx)
+                .next()
+                .context("vault worktree missing")?;
+            let worktree_id = worktree.read(cx).id();
+            let rel_path: std::sync::Arc<util::rel_path::RelPath> =
+                util::rel_path::rel_path("Note.md").into();
+            let project_path: project::ProjectPath = (worktree_id, rel_path).into();
+            anyhow::Ok(workspace.open_path(project_path, None, true, window, cx))
+        })??;
+        cx.background_executor.allow_parking();
+        let opened = cx.foreground_executor.block_test(open_task);
+        cx.background_executor.forbid_parking();
+        let item = opened.context("Failed to open Note.md")?;
+        cx.run_until_parked();
+        item.downcast::<editor::Editor>()
+            .context("Note.md did not open in an editor")
+    };
+    let editor = open_note(cx)?;
+
+    // Live preview needs a settled parse and a render before the links exist
+    // as click targets and the editor knows where it was drawn.
+    let rendering = run_visual_test(
+        "link_rendering",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+
+    // The window position of the character at `offset`, nudged into the
+    // middle of its line and a few pixels into the glyph so the click lands
+    // on the link element rather than its edge.
+    let pixel_at = |offset: usize, cx: &mut VisualTestAppContext| -> Result<gpui::Point<Pixels>> {
+        workspace_window.update(cx, |_workspace, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let anchor = snapshot
+                    .buffer_snapshot()
+                    .anchor_after(editor::MultiBufferOffset(offset));
+                let origin = editor.last_bounds().context("editor never drew")?.origin;
+                // `to_pixel_point` is relative to the text area, which sits
+                // to the right of the gutter.
+                let position = editor
+                    .to_pixel_point(anchor, &snapshot, window, cx)
+                    .context("offset is off screen")?;
+                let style = editor.style(cx).clone();
+                let rem_size = window.rem_size();
+                let font_id = window.text_system().resolve_font(&style.text.font());
+                let font_size = style.text.font_size.to_pixels(rem_size);
+                let line_height = style.text.line_height_in_pixels(rem_size);
+                let gutter = snapshot
+                    .gutter_dimensions(font_id, font_size, &style, window, cx)
+                    .full_width();
+                anyhow::Ok(origin + position + point(gutter + px(6.0), line_height / 2.0))
+            })
+        })?
+    };
+    let offset_of = |needle: &str, cx: &mut VisualTestAppContext| -> Result<usize> {
+        let text = cx.update(|cx| editor.read(cx).buffer().read(cx).snapshot(cx).text());
+        text.find(needle)
+            .with_context(|| format!("{needle:?} is not in the note"))
+    };
+    let active_file = |cx: &mut VisualTestAppContext| -> Option<String> {
+        workspace_window
+            .read_with(cx, |workspace, cx| {
+                let editor = workspace.active_item_as::<editor::Editor>(cx)?;
+                let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+                Some(buffer.read(cx).file()?.path().as_unix_str().to_string())
+            })
+            .ok()
+            .flatten()
+    };
+    // Opening a file reads the real filesystem on tasks the test dispatcher
+    // cannot see the end of; poll for the tab with parking allowed.
+    let wait_for_active = |file: &str, cx: &mut VisualTestAppContext| -> bool {
+        cx.background_executor.allow_parking();
+        let mut found = false;
+        for _ in 0..200 {
+            cx.run_until_parked();
+            if active_file(cx).as_deref() == Some(file) {
+                found = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        cx.background_executor.forbid_parking();
+        cx.run_until_parked();
+        found
+    };
+
+    // A plain click on the markdown link opens the file it names.
+    let schedule = offset_of("[Schedule]", cx)?;
+    let target = pixel_at(schedule, cx)?;
+    cx.simulate_mouse_move(workspace_window.into(), target, None, Modifiers::default());
+    cx.simulate_click(workspace_window.into(), target, Modifiers::default());
+    let opened = wait_for_active("schedule-fall-2026.md", cx);
+    let markdown_link = run_visual_test(
+        "link_click_opens_file",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    anyhow::ensure!(
+        opened,
+        "clicking [Schedule](schedule-fall-2026.md) did not open it; active: {:?}",
+        active_file(cx)
+    );
+
+    // Back on the note, a plain click on the wikilink opens its note.
+    open_note(cx)?;
+    anyhow::ensure!(wait_for_active("Note.md", cx), "Note.md did not come back");
+    let method = offset_of("[[Method]]", cx)?;
+    let target = pixel_at(method, cx)?;
+    cx.simulate_mouse_move(workspace_window.into(), target, None, Modifiers::default());
+    cx.simulate_click(workspace_window.into(), target, Modifiers::default());
+    anyhow::ensure!(
+        wait_for_active("Method.md", cx),
+        "clicking [[Method]] did not open it; active: {:?}",
+        active_file(cx)
+    );
+    let wikilink = run_visual_test(
+        "wikilink_click_opens_note",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+
+    // Clicking past the end of the line a link closes puts the cursor right
+    // after it, which touches the link and hands back its raw markdown,
+    // Obsidian-style. Reveal is per construct: a link earlier in the line
+    // would stay rendered.
+    open_note(cx)?;
+    anyhow::ensure!(wait_for_active("Note.md", cx), "Note.md did not come back");
+    let link_source = "[Schedule](schedule-fall-2026.md)";
+    let line_end = offset_of(link_source, cx)? + link_source.len();
+    let mut target = pixel_at(line_end, cx)?;
+    target.x += px(40.0);
+    cx.simulate_mouse_move(workspace_window.into(), target, None, Modifiers::default());
+    cx.simulate_click(workspace_window.into(), target, Modifiers::default());
+    cx.run_until_parked();
+    let source_reveal = run_visual_test(
+        "link_source_reveal",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    );
+    anyhow::ensure!(
+        active_file(cx).as_deref() == Some("Note.md"),
+        "clicking past the line end must not open anything"
+    );
+    let revealed = editor.update(cx, |editor, cx| editor.display_text(cx));
+    anyhow::ensure!(
+        revealed.contains(link_source),
+        "the cursor at the line end did not reveal the link's source:\n{revealed}"
+    );
+
+    workspace_window
+        .update(cx, |workspace, _window, cx| {
+            workspace.project().update(cx, |project, cx| {
+                let worktree_ids: Vec<_> =
+                    project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
+                for id in worktree_ids {
+                    project.remove_worktree(id, cx);
+                }
+            });
+        })
+        .log_err();
+    cx.update_window(workspace_window.into(), |_, window, _cx| {
+        window.remove_window();
+    })
+    .log_err();
+    cx.run_until_parked();
+
+    let results = [rendering?, markdown_link?, wikilink?, source_reveal?];
+    Ok(results
+        .into_iter()
+        .find_map(|result| match result {
+            TestResult::BaselineUpdated(path) => Some(TestResult::BaselineUpdated(path)),
+            TestResult::Passed => None,
+        })
+        .unwrap_or(TestResult::Passed))
 }
 
 #[cfg(target_os = "macos")]

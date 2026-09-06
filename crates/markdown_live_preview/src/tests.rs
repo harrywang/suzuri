@@ -1241,6 +1241,197 @@ async fn test_wikilinks_conceal(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_wikilinks_become_click_targets(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        see [[CLAUDE]] and [[notes/plan|the plan]] and [[Note#Method]] here
+    "});
+    cx.executor().run_until_parked();
+    let links: Vec<(String, String)> = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .expect("markdown buffer should produce markers")
+            .inline
+            .iter()
+            .filter_map(|marker| match &marker.kind {
+                InlineKind::Link {
+                    destination: LinkDestination::Wikilink(target),
+                    label,
+                } => Some((target.to_string(), label.to_string())),
+                _ => None,
+            })
+            .collect()
+    });
+    assert_eq!(
+        links,
+        vec![
+            ("CLAUDE".to_string(), "CLAUDE".to_string()),
+            ("notes/plan".to_string(), "the plan".to_string()),
+            ("Note#Method".to_string(), "Note#Method".to_string()),
+        ]
+    );
+
+    // The cursor next to a link hands back the raw markdown to edit.
+    cx.set_state(indoc::indoc! {"
+        plain line
+        see [[CLAUDE]]ˇ and [[notes/plan|the plan]] here
+    "});
+    cx.executor().run_until_parked();
+    let display = cx.display_text();
+    assert!(
+        display.contains("see [[CLAUDE]] and the plan here"),
+        "{display}"
+    );
+}
+
+#[gpui::test]
+async fn test_markdown_links_become_click_targets(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+        see [Schedule](schedule-fall-2026.md) and [the site](https://example.com) and <https://zed.dev>
+        marked up [**bold** link](x.md) and [ref link][ref] and [empty]()
+    "});
+    cx.executor().run_until_parked();
+    let links: Vec<(String, String)> = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .expect("markdown buffer should produce markers")
+            .inline
+            .iter()
+            .filter_map(|marker| match &marker.kind {
+                InlineKind::Link {
+                    destination: LinkDestination::Markdown(destination),
+                    label,
+                } => Some((destination.to_string(), label.to_string())),
+                _ => None,
+            })
+            .collect()
+    });
+    assert_eq!(
+        links,
+        vec![
+            ("schedule-fall-2026.md".to_string(), "Schedule".to_string()),
+            ("https://example.com".to_string(), "the site".to_string()),
+            ("https://zed.dev".to_string(), "https://zed.dev".to_string()),
+        ]
+    );
+    // Links that are not click targets still conceal their syntax.
+    let display = cx.display_text();
+    assert!(
+        display.contains("see Schedule and the site and https://zed.dev"),
+        "{display}"
+    );
+    assert!(
+        display.contains("marked up bold link and ref link and empty"),
+        "{display}"
+    );
+}
+
+#[gpui::test]
+async fn test_clicking_a_wikilink_opens_the_note(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    init_test(cx);
+    let fs = project::FakeFs::new(cx.executor());
+    fs.create_dir("/vault".as_ref())
+        .await
+        .expect("failed to create the vault");
+    fs.insert_file("/vault/Note.md", b"see [[Method]] here\n".to_vec())
+        .await;
+    fs.insert_file(
+        "/vault/Method.md",
+        b"# Method\n\n## Sampling\n\nWe sampled 40 participants.\n".to_vec(),
+    )
+    .await;
+    let project = project::Project::test(fs.clone(), ["/vault".as_ref()], cx).await;
+    let registry = project.read_with(cx, |project, _| project.languages().clone());
+    registry.add(language::markdown_lang());
+    registry.add(markdown_inline_lang());
+    let (workspace, cx) = cx
+        .add_window_view(|window, cx| workspace::Workspace::test_new(project.clone(), window, cx));
+
+    let open = |name: &str, cx: &mut gpui::VisualTestContext| {
+        let path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path(format!("/vault/{name}"), cx)
+            })
+            .expect("the note is in the vault");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.open_path(path, None, true, window, cx)
+        })
+    };
+    let note = open("Note.md", cx)
+        .await
+        .expect("failed to open the note")
+        .downcast::<Editor>()
+        .expect("a markdown file opens in an editor");
+    cx.run_until_parked();
+
+    let active_file = |cx: &mut gpui::VisualTestContext| {
+        workspace.read_with(cx, |workspace, cx| {
+            let editor = workspace.active_item_as::<Editor>(cx)?;
+            let buffer = editor.read(cx).buffer().read(cx).as_singleton()?;
+            Some(buffer.read(cx).file()?.path().as_unix_str().to_string())
+        })
+    };
+    assert_eq!(active_file(cx).as_deref(), Some("Note.md"));
+
+    // A plain click on the link opens its note.
+    let link = note.downgrade();
+    cx.update(|window, cx| open_wikilink(&link, "Method", window, cx));
+    cx.run_until_parked();
+    assert_eq!(active_file(cx).as_deref(), Some("Method.md"));
+
+    // A heading link lands the cursor on that heading.
+    cx.update(|window, cx| open_wikilink(&link, "Method#sampling", window, cx));
+    cx.run_until_parked();
+    let cursor = workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("an editor is active");
+        let editor = editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor.selections.newest_anchor().head().to_point(&snapshot)
+    });
+    assert_eq!(cursor, Point::new(2, 0));
+
+    // A name no note answers to leaves the reader where they are.
+    cx.update(|window, cx| open_wikilink(&link, "Nowhere", window, cx));
+    cx.run_until_parked();
+    assert_eq!(active_file(cx).as_deref(), Some("Method.md"));
+
+    // A markdown link resolves its path relative to the note, and a fragment
+    // spelled as a slug still finds its heading.
+    cx.update(|window, cx| open_markdown_link(&link, "Note.md", window, cx));
+    cx.run_until_parked();
+    assert_eq!(active_file(cx).as_deref(), Some("Note.md"));
+    cx.update(|window, cx| open_markdown_link(&link, "./Method.md#sampling", window, cx));
+    cx.run_until_parked();
+    assert_eq!(active_file(cx).as_deref(), Some("Method.md"));
+    let cursor = workspace.read_with(cx, |workspace, cx| {
+        let editor = workspace
+            .active_item_as::<Editor>(cx)
+            .expect("an editor is active");
+        let editor = editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor.selections.newest_anchor().head().to_point(&snapshot)
+    });
+    assert_eq!(cursor, Point::new(2, 0));
+
+    // A path with no file behind it leaves the reader where they are.
+    cx.update(|window, cx| open_markdown_link(&link, "Missing.md", window, cx));
+    cx.run_until_parked();
+    assert_eq!(active_file(cx).as_deref(), Some("Method.md"));
+}
+
+#[test]
+fn test_heading_slug() {
+    assert_eq!(heading_slug("my heading"), "my-heading");
+    assert_eq!(heading_slug("fall 2026 -- schedule!"), "fall-2026-schedule");
+    assert_eq!(heading_slug("  spaced  "), "spaced");
+}
+
+#[gpui::test]
 async fn test_obsidian_image_embed_renders_as_block(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     cx.set_state(indoc::indoc! {"

@@ -1415,6 +1415,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smol",
+ "suzuri_update",
  "tempfile",
  "util",
  "which",
