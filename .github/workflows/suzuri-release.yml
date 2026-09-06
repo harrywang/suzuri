@@ -251,6 +251,32 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # An artifact whose files come from different directories keeps them
+      # under their common parent, so the DMGs and tarballs land in
+      # subdirectories next to the top-level remote server archives. The
+      # release glob below is not recursive; v0.4.5 shipped without its DMGs
+      # and tarballs for exactly this reason, so flatten first and refuse to
+      # publish unless every expected asset is present.
+      - name: Collect release assets
+        run: |
+          find artifacts -mindepth 2 -type f -exec mv {} artifacts/ \;
+          find artifacts -mindepth 1 -type d -delete
+          ls -l artifacts
+          missing=0
+          for asset in \
+            suzuri-aarch64.dmg suzuri-x86_64.dmg \
+            suzuri-windows-x86_64.exe \
+            suzuri-linux-x86_64.tar.gz suzuri-linux-aarch64.tar.gz \
+            zed-remote-server-macos-aarch64.gz zed-remote-server-macos-x86_64.gz \
+            zed-remote-server-windows-x86_64.zip \
+            zed-remote-server-linux-x86_64.gz zed-remote-server-linux-aarch64.gz; do
+            if [ ! -f "artifacts/${asset}" ]; then
+              echo "::error::Expected release asset ${asset} is missing."
+              missing=1
+            fi
+          done
+          exit "${missing}"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
