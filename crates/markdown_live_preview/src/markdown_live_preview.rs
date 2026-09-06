@@ -461,6 +461,14 @@ enum InlineKind {
     /// A footnote reference (`[^label]`), rendered as a raised chip carrying
     /// the label, the way a preview renders a superscript marker.
     Footnote { label: SharedString },
+    /// A link rendered as its display text, opening its target on a plain
+    /// click the way Obsidian's live preview does. The whole construct is
+    /// concealed rather than just its syntax so the text can own the click;
+    /// putting the cursor next to it hands back the raw markdown to edit.
+    Link {
+        destination: LinkDestination,
+        label: SharedString,
+    },
     /// A LaTeX formula (`$x$` or `$$x$$`), rendered as a typeset image.
     ///
     /// Rendering is asynchronous, so the placeholder reads whatever the shared
@@ -471,6 +479,16 @@ enum InlineKind {
         source: SharedString,
         style: MathStyle,
     },
+}
+
+/// Where a clickable link leads.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LinkDestination {
+    /// What follows `[[` up to the alias pipe: a note name, with its
+    /// `#heading` part if any, resolved against the whole project.
+    Wikilink(SharedString),
+    /// A markdown link's destination: a URL, or a path relative to the note.
+    Markdown(SharedString),
 }
 
 struct BlockMarker {
@@ -1027,6 +1045,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             InlineKind::Bullet
             | InlineKind::Checkbox { .. }
             | InlineKind::Footnote { .. }
+            | InlineKind::Link { .. }
             | InlineKind::Math { .. } => &marker.range,
         };
         let span = reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
@@ -1714,31 +1733,56 @@ fn resolve_embed_target(
     best.map(|(_, _, path, absolute)| (path, absolute))
 }
 
+/// A lowercase heading title as a GitHub-style anchor slug: punctuation
+/// dropped, whitespace and hyphens collapsed to single hyphens.
+fn heading_slug(title: &str) -> String {
+    let mut slug = String::with_capacity(title.len());
+    let mut pending_hyphen = false;
+    for character in title.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            if pending_hyphen && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_hyphen = false;
+            slug.push(character);
+        } else if character.is_whitespace() || character == '-' {
+            pending_hyphen = true;
+        }
+    }
+    slug
+}
+
+/// An ATX heading's level and trimmed title, or `None` for any other line.
+fn heading_title(line: &str) -> Option<(usize, &str)> {
+    let hashes = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    line.get(hashes..)
+        .map(str::trim)
+        .map(|title| (hashes, title))
+}
+
 /// The slice of a note under one heading: from that heading to the next one at
 /// the same or a higher level. Returns `None` when the note has no such
 /// heading, which the card reports rather than silently embedding everything.
 fn embed_section(text: &str, section: &str) -> Option<String> {
     let wanted = section.trim().to_lowercase();
-    let heading_level = |line: &str| {
-        let hashes = line
-            .chars()
-            .take_while(|character| *character == '#')
-            .count();
-        (1..=6).contains(&hashes).then_some(hashes)
-    };
 
     let mut lines = text.lines().enumerate();
     let (start, level) = lines.find_map(|(index, line)| {
-        let level = heading_level(line)?;
-        let title = line[level..].trim().to_lowercase();
-        (title == wanted).then_some((index, level))
+        let (level, title) = heading_title(line)?;
+        (title.to_lowercase() == wanted).then_some((index, level))
     })?;
 
     let end = text
         .lines()
         .enumerate()
         .skip(start + 1)
-        .find(|(_, line)| heading_level(line).is_some_and(|found| found <= level))
+        .find(|(_, line)| heading_title(line).is_some_and(|(found, _)| found <= level))
         .map_or(text.lines().count(), |(index, _)| index);
     Some(
         text.lines()
@@ -1864,6 +1908,9 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
     // element at its measured width.
     let collapsed_text = match &marker.kind {
         InlineKind::Hide { .. } => Some(SharedString::new_static("")),
+        // The label stands in for the link in the display text, so soft
+        // wrapping and the cursor's column math see the width that is drawn.
+        InlineKind::Link { label, .. } => Some(label.clone()),
         InlineKind::Bullet
         | InlineKind::Checkbox { .. }
         | InlineKind::Footnote { .. }
@@ -1901,6 +1948,31 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                     toggle_task_marker(&editor, &marker_range, checked, cx);
                 })
                 .into_any_element()
+            })
+        }
+        InlineKind::Link { destination, label } => {
+            let destination = destination.clone();
+            let label = label.clone();
+            Arc::new(move |fold_id, _, cx: &mut App| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                let editor = editor.clone();
+                let destination = destination.clone();
+                div()
+                    .id(fold_id)
+                    .cursor_pointer()
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(theme_settings.buffer_font_size(cx))
+                    .text_color(cx.theme().colors().text_accent)
+                    .hover(|style| style.underline())
+                    .child(label.clone())
+                    // Opening the note is the link's job, so it claims the
+                    // press instead of letting the editor place the cursor
+                    // (which would reveal the source under the pointer).
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .on_click(move |_, window, cx| {
+                        open_link(&editor, &destination, window, cx);
+                    })
+                    .into_any_element()
             })
         }
         InlineKind::Footnote { label } => {
@@ -2013,6 +2085,15 @@ fn marker_content_key(kind: &InlineKind) -> u64 {
         InlineKind::Footnote { label } => {
             use std::hash::{Hash as _, Hasher as _};
             let mut hasher = collections::FxHasher::default();
+            label.hash(&mut hasher);
+            4 + hasher.finish()
+        }
+        // Both take part: the label is what is drawn, the destination is
+        // what a click opens, and either can change over an unchanged range.
+        InlineKind::Link { destination, label } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            destination.hash(&mut hasher);
             label.hash(&mut hasher);
             4 + hasher.finish()
         }
@@ -4458,6 +4539,238 @@ fn render_rule_block(
     })
 }
 
+fn open_link(
+    editor: &WeakEntity<Editor>,
+    destination: &LinkDestination,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match destination {
+        LinkDestination::Wikilink(target) => open_wikilink(editor, target, window, cx),
+        LinkDestination::Markdown(destination) => {
+            open_markdown_link(editor, destination, window, cx)
+        }
+    }
+}
+
+/// Opens a markdown link's destination: a URL goes to the browser, anything
+/// else is a file path relative to the note (absolute paths are taken as
+/// they are), opened in the workspace. A `#fragment` on a file puts the
+/// cursor on the heading it names. A path with no file behind it is reported
+/// in a toast rather than silently doing nothing.
+fn open_markdown_link(
+    editor: &WeakEntity<Editor>,
+    destination: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let destination = destination.trim();
+    if destination.is_empty() {
+        return;
+    }
+    let has_scheme = destination.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
+    });
+    if has_scheme {
+        cx.open_url(destination);
+        return;
+    }
+
+    let (path, fragment) = match destination.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment.to_string())),
+        None => (destination, None),
+    };
+    // Markdown links percent-encode spaces; the filesystem stores them raw.
+    let decoded = urlencoding::decode(path)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let Some((workspace, project, source_directory)) = editor
+        .read_with(cx, |editor, cx| {
+            Some((
+                editor.workspace()?,
+                editor.project()?.clone(),
+                buffer_base_directory(editor, cx),
+            ))
+        })
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+
+    if decoded.is_empty() {
+        // `[text](#heading)` stays in the current note.
+        if let Some(fragment) = fragment {
+            editor
+                .update(cx, |editor, cx| {
+                    jump_to_heading(editor, &fragment, window, cx)
+                })
+                .log_err();
+        }
+        return;
+    }
+
+    let path = Path::new(&decoded);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let Some(source_directory) = source_directory else {
+            return;
+        };
+        source_directory.join(path)
+    };
+    let fs = project.read(cx).fs().clone();
+    window
+        .spawn(cx, async move |cx| {
+            if !fs.is_file(&path).await {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::Named(
+                                "markdown-live-preview-link".into(),
+                            ),
+                            format!("No file at \u{201c}{}\u{201d}.", path.display()),
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+                return anyhow::Ok(());
+            }
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                // A file inside the project opens as one of its own; anything
+                // else is opened by absolute path, which the workspace adds
+                // as a single-file worktree.
+                match project.read(cx).find_project_path(&path, cx) {
+                    Some(project_path) => workspace.open_path(project_path, None, true, window, cx),
+                    None => workspace.open_abs_path(
+                        path.clone(),
+                        workspace::OpenOptions::default(),
+                        window,
+                        cx,
+                    ),
+                }
+            })?;
+            let item = open.await?;
+            if let Some(fragment) = fragment
+                && let Some(opened) = item.downcast::<Editor>()
+            {
+                opened.update_in(cx, |editor, window, cx| {
+                    jump_to_heading(editor, &fragment, window, cx)
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
+/// Opens the note a wikilink names, resolved like an embed's target, and
+/// puts the cursor on the heading when the link carries one
+/// (`[[Note#Heading]]`). `[[#Heading]]` names a heading of the current note
+/// and only moves the cursor. A name no note answers to is reported in a
+/// toast rather than silently doing nothing.
+fn open_wikilink(editor: &WeakEntity<Editor>, target: &str, window: &mut Window, cx: &mut App) {
+    let (note, section) = match target.split_once('#') {
+        Some((note, section)) => (note.trim(), Some(section.trim().to_string())),
+        None => (target.trim(), None),
+    };
+    let Some((workspace, project, source_directory)) = editor
+        .read_with(cx, |editor, cx| {
+            Some((
+                editor.workspace()?,
+                editor.project()?.clone(),
+                buffer_base_directory(editor, cx),
+            ))
+        })
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+
+    if note.is_empty() {
+        if let Some(section) = section {
+            editor
+                .update(cx, |editor, cx| {
+                    jump_to_heading(editor, &section, window, cx)
+                })
+                .log_err();
+        }
+        return;
+    }
+
+    let Some((path, _)) = resolve_embed_target(&project, source_directory.as_deref(), note, cx)
+    else {
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                workspace::Toast::new(
+                    workspace::notifications::NotificationId::Named(
+                        "markdown-live-preview-wikilink".into(),
+                    ),
+                    format!("No note named \u{201c}{note}\u{201d} in this project."),
+                )
+                .autohide(),
+                cx,
+            );
+        });
+        return;
+    };
+
+    let open = workspace.update(cx, |workspace, cx| {
+        workspace.open_path(path, None, true, window, cx)
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let item = open.await?;
+            if let Some(section) = section
+                && let Some(opened) = item.downcast::<Editor>()
+            {
+                opened.update_in(cx, |editor, window, cx| {
+                    jump_to_heading(editor, &section, window, cx)
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
+/// Moves the cursor to the first heading titled `section` (case-insensitive,
+/// any level), scrolling it into view. Markdown fragments usually spell the
+/// heading as a slug (`#my-heading` for `# My Heading`), so a slug of the
+/// title matches too. A note without that heading is left where it is.
+fn jump_to_heading(
+    editor: &mut Editor,
+    section: &str,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let wanted = section.to_lowercase();
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let row = (0..=snapshot.max_point().row).find(|row| {
+        let line: String = snapshot
+            .text_for_range(
+                Point::new(*row, 0)..Point::new(*row, snapshot.line_len(MultiBufferRow(*row))),
+            )
+            .collect();
+        heading_title(&line).is_some_and(|(_, title)| {
+            let title = title.to_lowercase();
+            title == wanted || heading_slug(&title) == wanted
+        })
+    });
+    if let Some(row) = row {
+        let start = Point::new(row, 0);
+        editor.change_selections(
+            editor::SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+            window,
+            cx,
+            |selections| selections.select_ranges([start..start]),
+        );
+    }
+}
+
 /// Opens the note a transclusion is showing, in the workspace the embedding
 /// editor belongs to.
 fn open_embedded_note(
@@ -6074,18 +6387,6 @@ impl Extraction<'_> {
                             _ => {}
                         }
                     }
-                    if let Some(open) = open_bracket {
-                        self.hide(open.byte_range(), node.byte_range());
-                    }
-                    if let Some(close) = close_bracket {
-                        self.hide(close.start_byte()..node.end_byte(), node.byte_range());
-                    }
-                    if let (Some(open), Some(close)) = (open_bracket, close_bracket)
-                        && open.end_byte() < close.start_byte()
-                    {
-                        let range = self.anchor_range(open.end_byte()..close.start_byte());
-                        self.link_text.push(range);
-                    }
                     // A standalone link wrapping an image renders as an image
                     // widget built from just the inner image markdown: the
                     // markdown renderer degrades a link-wrapped image to
@@ -6105,6 +6406,51 @@ impl Extraction<'_> {
                                 None
                             }
                         });
+                    if let (Some(open), Some(close)) = (open_bracket, close_bracket)
+                        && open.end_byte() < close.start_byte()
+                    {
+                        let range = self.anchor_range(open.end_byte()..close.start_byte());
+                        self.link_text.push(range);
+                    }
+                    // A link with a destination and plain text becomes a
+                    // click target that opens it. Link text carrying its own
+                    // markup (`[**bold**](x)`) keeps the bracket-only
+                    // concealment below, which renders that markup, since the
+                    // click target draws its label as plain text.
+                    let destination = (node.kind() == "inline_link" && wrapped_image.is_none())
+                        .then(|| self.link_node_destination(node))
+                        .flatten();
+                    let plain_label = match (open_bracket, close_bracket) {
+                        (Some(open), Some(close)) => self
+                            .text
+                            .get(open.end_byte()..close.start_byte())
+                            .map(str::trim)
+                            .filter(|label| {
+                                !label.is_empty()
+                                    && !label
+                                        .contains(['*', '_', '`', '[', ']', '!', '<', '\\', '\n'])
+                            }),
+                        _ => None,
+                    };
+                    if let (Some(destination), Some(label)) = (destination, plain_label) {
+                        self.inline.push(InlineMarker {
+                            range: self.anchor_range(node.byte_range()),
+                            kind: InlineKind::Link {
+                                destination: LinkDestination::Markdown(SharedString::from(
+                                    destination,
+                                )),
+                                label: SharedString::from(label.to_string()),
+                            },
+                        });
+                        push_children(node, &mut stack);
+                        continue;
+                    }
+                    if let Some(open) = open_bracket {
+                        self.hide(open.byte_range(), node.byte_range());
+                    }
+                    if let Some(close) = close_bracket {
+                        self.hide(close.start_byte()..node.end_byte(), node.byte_range());
+                    }
                     if let Some(image_node) = wrapped_image
                         && self.is_alone_on_line(node)
                     {
@@ -6127,9 +6473,28 @@ impl Extraction<'_> {
                 }
                 "uri_autolink" | "email_autolink" => {
                     let range = node.byte_range();
-                    if range.len() >= 2 {
-                        self.hide(range.start..range.start + 1, range.clone());
-                        self.hide(range.end - 1..range.end, range.clone());
+                    if range.len() < 2 {
+                        continue;
+                    }
+                    let inner = range.start + 1..range.end - 1;
+                    match self.text.get(inner.clone()).map(str::trim) {
+                        // `<https://..>` opens like any other link; the
+                        // angle brackets are its only syntax.
+                        Some(url) if node.kind() == "uri_autolink" && !url.is_empty() => {
+                            self.inline.push(InlineMarker {
+                                range: self.anchor_range(range.clone()),
+                                kind: InlineKind::Link {
+                                    destination: LinkDestination::Markdown(SharedString::from(
+                                        url.to_string(),
+                                    )),
+                                    label: SharedString::from(url.to_string()),
+                                },
+                            });
+                        }
+                        _ => {
+                            self.hide(range.start..range.start + 1, range.clone());
+                            self.hide(range.end - 1..range.end, range.clone());
+                        }
                     }
                 }
                 "image" => {
@@ -6200,20 +6565,24 @@ impl Extraction<'_> {
                     continue;
                 }
 
-                let reveal = start..end;
-                if let Some(pipe) = inner.find('|') {
-                    // `[[target|alias]]`: show only the alias.
-                    self.hide(start..start + 2 + pipe + 1, reveal.clone());
-                    self.hide(end - 2..end, reveal.clone());
-                    let alias_start = start + 2 + pipe + 1;
-                    let range = self.anchor_range(alias_start..end - 2);
-                    self.link_text.push(range);
-                } else {
-                    self.hide(start..start + 2, reveal.clone());
-                    self.hide(end - 2..end, reveal.clone());
-                    let range = self.anchor_range(start + 2..end - 2);
-                    self.link_text.push(range);
-                }
+                // `[[target|alias]]` shows only the alias. The link text is
+                // also colored as a link for when the cursor reveals the raw
+                // `[[..]]`.
+                let (target, label, label_start) = match inner.find('|') {
+                    Some(pipe) => (&inner[..pipe], &inner[pipe + 1..], start + 2 + pipe + 1),
+                    None => (inner, inner, start + 2),
+                };
+                let range = self.anchor_range(label_start..end - 2);
+                self.link_text.push(range);
+                self.inline.push(InlineMarker {
+                    range: self.anchor_range(start..end),
+                    kind: InlineKind::Link {
+                        destination: LinkDestination::Wikilink(SharedString::from(
+                            target.trim().to_string(),
+                        )),
+                        label: SharedString::from(label.trim().to_string()),
+                    },
+                });
             }
         }
         self.prose_regions = regions;
@@ -6580,6 +6949,19 @@ impl Extraction<'_> {
             .filter_map(|index| image_node.child(index))
             .find(|child| child.kind() == "image_description")?;
         self.text.get(description.byte_range())
+    }
+
+    /// A link's destination as written, or `None` for a link without one
+    /// (`[text]()`).
+    fn link_node_destination(&self, link_node: tree_sitter::Node) -> Option<String> {
+        let destination = (0..link_node.child_count())
+            .filter_map(|index| link_node.child(index))
+            .find(|child| child.kind() == "link_destination")?;
+        self.text
+            .get(destination.byte_range())
+            .map(str::trim)
+            .filter(|destination| !destination.is_empty())
+            .map(|destination| destination.to_string())
     }
 
     fn image_destination(&self, image_node: tree_sitter::Node) -> Option<String> {
