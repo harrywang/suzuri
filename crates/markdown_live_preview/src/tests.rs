@@ -883,6 +883,74 @@ fn drop_image_on_row(cx: &mut EditorTestContext, row: u32, target_row: u32) {
     cx.executor().run_until_parked();
 }
 
+/// Right-clicking an image widget must open the widget's own menu, whose
+/// reveal entry targets the image file, rather than the editor's default
+/// menu, whose reveal entry targets the note. The two are told apart by the
+/// cursor: the default menu moves it to the clicked line first. The menu
+/// itself cannot be observed here — it takes focus through next-frame
+/// callbacks, which the test platform only runs from inside gpui.
+#[gpui::test]
+async fn test_right_clicking_an_image_opens_the_image_menu(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇtop\n\n![shot](a.png)\n\nbottom");
+    cx.executor().run_until_parked();
+
+    let image = cx
+        .cx
+        .debug_bounds("MDLP-IMAGE-a.png")
+        .expect("the image widget should have been laid out");
+    cx.cx.simulate_event(MouseDownEvent {
+        position: image.center(),
+        button: MouseButton::Right,
+        modifiers: Modifiers::default(),
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.executor().run_until_parked();
+
+    cx.assert_editor_state("ˇtop\n\n![shot](a.png)\n\nbottom");
+    let selected_row = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.selected_image.clone())
+            .map(|range| range.start.to_point(&snapshot).row)
+    });
+    assert_eq!(
+        selected_row,
+        Some(2),
+        "the right-clicked image should be selected"
+    );
+}
+
+#[test]
+fn test_local_image_path_resolves_only_files_on_disk() {
+    let dir = tempfile::tempdir().expect("failed to create a temp dir");
+    let notes = dir.path().join("notes");
+    let images = dir.path().join("images");
+    std::fs::create_dir_all(&notes).unwrap();
+    std::fs::create_dir_all(&images).unwrap();
+    std::fs::write(images.join("my shot.png"), b"png").unwrap();
+
+    assert_eq!(
+        local_image_path("../images/my%20shot.png", Some(&notes)),
+        Some(std::fs::canonicalize(images.join("my shot.png")).unwrap())
+    );
+    assert_eq!(
+        local_image_path("../images/missing.png", Some(&notes)),
+        None
+    );
+    assert_eq!(
+        local_image_path("https://example.com/shot.png", Some(&notes)),
+        None
+    );
+    assert_eq!(
+        local_image_path("data:image/png;base64,AAAA", Some(&notes)),
+        None
+    );
+    assert_eq!(local_image_path("shot.png", None), None);
+}
+
 /// The whole gesture, end to end, through real event dispatch: press on one
 /// of two image widgets, drag past the arming threshold, cross the document,
 /// release. This is what catches wiring bugs the unit tests cannot — most
