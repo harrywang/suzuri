@@ -18,9 +18,9 @@ use std::{
 };
 
 use collections::{HashMap, HashSet};
-use editor::{CompletionProvider, Editor, SemanticsProvider};
+use editor::{CompletionProvider, Editor, RenameTarget, SemanticsProvider};
 use gpui::{App, AppContext as _, Context, Entity, EntityId, SharedString, Task, Window};
-use language::{Buffer, CodeLabel, LanguageName, ToOffset as _};
+use language::{Buffer, CodeLabel, LanguageName, LanguageServerId, ToOffset as _};
 use project::{
     Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource, Project,
     lsp_store::CompletionDocumentation,
@@ -373,8 +373,9 @@ pub(crate) fn citation_key_at(
     let key = text.strip_prefix('@')?;
     // Punctuation is only valid inside a key, not at its edges, matching
     // `citation_keys`.
-    let key = key
-        .trim_end_matches(|character: char| !(character.is_ascii_alphanumeric() || character == '_'));
+    let key = key.trim_end_matches(|character: char| {
+        !(character.is_ascii_alphanumeric() || character == '_')
+    });
     if key.is_empty()
         || !key
             .chars()
@@ -591,11 +592,7 @@ impl SemanticsProvider for CitationSemanticsProvider {
         self.inner.applicable_inlay_chunks(buffer, ranges, cx)
     }
 
-    fn invalidate_inlay_hints(
-        &self,
-        for_buffers: &HashSet<language::BufferId>,
-        cx: &mut App,
-    ) {
+    fn invalidate_inlay_hints(&self, for_buffers: &HashSet<language::BufferId>, cx: &mut App) {
         self.inner.invalidate_inlay_hints(for_buffers, cx)
     }
 
@@ -604,10 +601,7 @@ impl SemanticsProvider for CitationSemanticsProvider {
         invalidate: project::InvalidationStrategy,
         buffer: Entity<Buffer>,
         ranges: Vec<std::ops::Range<text::Anchor>>,
-        known_chunks: Option<(
-            clock::Global,
-            HashSet<std::ops::Range<language::BufferRow>>,
-        )>,
+        known_chunks: Option<(clock::Global, HashSet<std::ops::Range<language::BufferRow>>)>,
         cx: &mut App,
     ) -> Option<
         HashMap<
@@ -668,7 +662,7 @@ impl SemanticsProvider for CitationSemanticsProvider {
         buffer: &Entity<Buffer>,
         position: text::Anchor,
         cx: &mut App,
-    ) -> Task<anyhow::Result<Option<std::ops::Range<text::Anchor>>>> {
+    ) -> Task<anyhow::Result<Option<RenameTarget>>> {
         self.inner.range_for_rename(buffer, position, cx)
     }
 
@@ -677,10 +671,11 @@ impl SemanticsProvider for CitationSemanticsProvider {
         buffer: &Entity<Buffer>,
         position: text::Anchor,
         new_name: String,
+        language_server_id: Option<LanguageServerId>,
         cx: &mut App,
     ) -> Option<Task<anyhow::Result<project::ProjectTransaction>>> {
         self.inner
-            .perform_rename(buffer, position, new_name, cx)
+            .perform_rename(buffer, position, new_name, language_server_id, cx)
     }
 }
 

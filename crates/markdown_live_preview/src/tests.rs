@@ -3356,7 +3356,10 @@ async fn test_duplicate_bib_keys_complete_once(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let task = editor.update_in(cx, |editor, window, cx| {
-        let project = editor.project().expect("vault editor has a project").clone();
+        let project = editor
+            .project()
+            .expect("vault editor has a project")
+            .clone();
         let provider = CitationCompletionProvider::new(project, cx);
         let buffer = editor
             .buffer()
@@ -3468,7 +3471,10 @@ async fn test_citation_provider_delegates_outside_markdown(cx: &mut TestAppConte
         );
         (triggers, task)
     });
-    assert!(!triggers, "@ in a non-markdown buffer must not open the menu");
+    assert!(
+        !triggers,
+        "@ in a non-markdown buffer must not open the menu"
+    );
 
     let responses = task.await.expect("delegated completions succeed");
     let cite_keys: Vec<_> = responses
@@ -3549,7 +3555,8 @@ async fn test_hovering_a_cite_key_shows_the_reference_card(cx: &mut TestAppConte
         let anchor = snapshot.anchor_before(MultiBufferOffset("See [@smi".len()));
         editor::hover_popover::hover_at(editor, Some(anchor), None, window, cx);
     });
-    cx.executor().advance_clock(std::time::Duration::from_millis(700));
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(700));
     cx.run_until_parked();
     let popovers = editor.update(cx, |editor, _| editor.hover_state.info_popovers.len());
     assert_eq!(popovers, 1, "the hover popover should be on screen");
