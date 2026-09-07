@@ -20445,6 +20445,7 @@ dependencies = [
  "theme",
  "theme_settings",
  "tokio",
+ "tree-sitter-md",
  "ui",
  "util",
  "util_macros",

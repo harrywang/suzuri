@@ -1315,11 +1315,12 @@ pub struct MarkdownPreviewSettingsContent {
     pub max_width: Option<PixelSetting>,
 }
 
+// SUZURI: Live-preview headings need typography settings independent of replacement blocks.
 /// Typography for one rendered markdown heading level.
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
 pub struct MarkdownHeadingStyleSettingsContent {
-    /// Font size in rem units relative to the editor's base font size.
+    /// Multiplier of the editor's base font size.
     pub font_size: Option<f32>,
     /// Font weight in CSS units from 100 to 900.
     pub font_weight: Option<FontWeightContent>,
@@ -1347,6 +1348,7 @@ pub struct MarkdownLivePreviewSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    // SUZURI: Keep the native heading settings during upstream schema updates.
     /// Typography overrides for rendered heading levels.
     pub heading_styles: Option<MarkdownHeadingStylesSettingsContent>,
     /// Folder for attachments dropped onto a markdown buffer, relative to
