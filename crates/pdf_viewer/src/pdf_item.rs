@@ -1,15 +1,21 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context as _, Result};
 use gpui::{
     App, AppContext as _, BackgroundExecutor, Context, Entity, EventEmitter, Subscription, Task,
+    WeakEntity,
 };
 use project::{Project, ProjectEntryId, ProjectItem, ProjectPath};
 use util::ResultExt as _;
 
 pub struct PdfItem {
+    project: WeakEntity<Project>,
     project_path: ProjectPath,
+    /// Where the document lives from the worktree's point of view. For a
+    /// remote project this is a path on the host, so it is only ever shown
+    /// (tab tooltip, icon lookup), never read.
     abs_path: PathBuf,
     pdf_bytes: Arc<[u8]>,
     reload_task: Task<()>,
@@ -45,11 +51,13 @@ impl PdfItem {
     /// Reloads the bytes from disk when the file changes underneath us —
     /// a recompiled Typst/LaTeX document, a re-exported figure, an
     /// agent-rewritten file — and announces it so views re-render.
-    fn reload_from_disk(&mut self, cx: &mut Context<Self>) {
-        let abs_path = self.abs_path.clone();
-        let background = cx.background_executor().clone();
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some(project) = self.project.upgrade() else {
+            return;
+        };
+        let load = load_pdf(&project, &self.project_path, self.abs_path.clone(), cx);
         self.reload_task = cx.spawn(async move |this, cx| {
-            let Some(bytes) = load_pdf_bytes(abs_path, background).await.log_err() else {
+            let Some(bytes) = load.await.log_err() else {
                 // Still incomplete after waiting the writer out. Keep the
                 // document already on screen rather than replacing it with
                 // bytes that cannot be parsed.
@@ -74,6 +82,10 @@ pub fn is_pdf_file(path: &ProjectPath) -> bool {
 /// [`PDF_READ_RETRY_DELAY`]. A recompile rewrites the whole file, so this has
 /// to cover the largest document someone might preview, not a typical one.
 const PDF_READ_ATTEMPTS: usize = 20;
+/// A downloaded copy is written by a message handler that runs after the
+/// download request has already reported success, so the whole file may
+/// still be on its way to disk. Allow for a large document on a slow disk.
+const DOWNLOADED_PDF_READ_ATTEMPTS: usize = 300;
 const PDF_READ_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 /// `%%EOF` sits at the very end, after the cross-reference offset.
 const PDF_TRAILER_WINDOW: usize = 1024;
@@ -94,11 +106,118 @@ fn is_complete_pdf(bytes: &[u8]) -> bool {
         .any(|window| window == b"%%EOF")
 }
 
-fn load_pdf_bytes(abs_path: PathBuf, background: BackgroundExecutor) -> Task<Result<Arc<[u8]>>> {
+/// Loads the document's bytes from wherever the project keeps them.
+///
+/// A local worktree is read straight from disk. A remote worktree cannot be
+/// read at all from this side of the connection (`Worktree::load_binary_file`
+/// refuses for remote worktrees), so the bytes are fetched through the same
+/// download channel the project panel's "Download" action uses, which the
+/// remote server already serves for any path in the worktree.
+fn load_pdf(
+    project: &Entity<Project>,
+    project_path: &ProjectPath,
+    abs_path: PathBuf,
+    cx: &mut App,
+) -> Task<Result<Arc<[u8]>>> {
+    let is_local = project
+        .read(cx)
+        .worktree_for_id(project_path.worktree_id, cx)
+        .is_some_and(|worktree| worktree.read(cx).is_local());
+    if is_local {
+        load_pdf_bytes(
+            abs_path,
+            cx.background_executor().clone(),
+            PDF_READ_ATTEMPTS,
+        )
+    } else {
+        download_remote_pdf(project, project_path.clone(), &abs_path, cx)
+    }
+}
+
+static NEXT_DOWNLOAD_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Copies a remote PDF to a scratch file, reads it, and removes the copy.
+///
+/// The bytes are held in memory by [`PdfItem`], so nothing on disk needs to
+/// outlive this call; a stale copy would only go out of date on the next
+/// remote recompile anyway.
+fn download_remote_pdf(
+    project: &Entity<Project>,
+    project_path: ProjectPath,
+    abs_path: &Path,
+    cx: &mut App,
+) -> Task<Result<Arc<[u8]>>> {
+    let file_name = abs_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document.pdf")
+        .to_owned();
+    let download_id = NEXT_DOWNLOAD_ID.fetch_add(1, Ordering::SeqCst);
+    let destination =
+        remote_pdf_scratch_dir().join(format!("{}-{download_id}-{file_name}", std::process::id()));
+    let background = cx.background_executor().clone();
+    let project = project.clone();
+    let abs_path = abs_path.to_owned();
+
+    cx.spawn(async move |cx| {
+        background
+            .spawn(async { std::fs::create_dir_all(remote_pdf_scratch_dir()) })
+            .await
+            .context("Failed to create the scratch directory for remote PDFs")?;
+
+        let download = project.update(cx, |project, cx| {
+            project.download_file(
+                project_path.worktree_id,
+                project_path.path.clone(),
+                destination.clone(),
+                cx,
+            )
+        });
+        let result = match download.await {
+            Ok(()) => {
+                // Success here means the server has sent every chunk, not
+                // that the client has finished writing them, so keep
+                // reading until the trailer shows up.
+                load_pdf_bytes(
+                    destination.clone(),
+                    background.clone(),
+                    DOWNLOADED_PDF_READ_ATTEMPTS,
+                )
+                .await
+            }
+            Err(error) => Err(error),
+        }
+        .with_context(|| format!("Failed to download remote PDF: {}", abs_path.display()));
+
+        background
+            .spawn(async move {
+                if let Err(error) = std::fs::remove_file(&destination)
+                    && error.kind() != std::io::ErrorKind::NotFound
+                {
+                    log::warn!(
+                        "failed to remove downloaded PDF copy {}: {error}",
+                        destination.display()
+                    );
+                }
+            })
+            .await;
+        result
+    })
+}
+
+fn remote_pdf_scratch_dir() -> PathBuf {
+    paths::temp_dir().join("remote-pdfs")
+}
+
+fn load_pdf_bytes(
+    abs_path: PathBuf,
+    background: BackgroundExecutor,
+    attempts: usize,
+) -> Task<Result<Arc<[u8]>>> {
     let timers = background.clone();
     background.spawn(async move {
         let mut failure = None;
-        for attempt in 0..PDF_READ_ATTEMPTS {
+        for attempt in 0..attempts {
             if attempt > 0 {
                 timers.timer(PDF_READ_RETRY_DELAY).await;
             }
@@ -136,11 +255,11 @@ impl ProjectItem for PdfItem {
         let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
         let abs_path = worktree.read(cx).abs_path().join(path.path.as_std_path());
         let project_path = path.clone();
+        let load = load_pdf(project, &project_path, abs_path.clone(), cx);
         let project = project.clone();
-        let background = cx.background_executor().clone();
 
         Some(cx.spawn(async move |cx| {
-            let pdf_bytes = load_pdf_bytes(abs_path.clone(), background).await?;
+            let pdf_bytes = load.await?;
 
             let entity = cx.update(|cx| {
                 cx.new(|cx| {
@@ -157,12 +276,13 @@ impl ProjectItem for PdfItem {
                                         .iter()
                                         .any(|(path, _, _)| *path == this.project_path.path)
                                 {
-                                    this.reload_from_disk(cx);
+                                    this.reload(cx);
                                 }
                             }
                         },
                     );
                     PdfItem {
+                        project: project.downgrade(),
                         project_path,
                         abs_path,
                         pdf_bytes,
@@ -243,5 +363,248 @@ mod tests {
         // ...and the same document truncated inside that tail is not.
         let truncated = &bytes[..bytes.len() - 3];
         assert!(!is_complete_pdf(truncated));
+    }
+}
+
+/// Opening a PDF that lives on a remote host. Runs a real headless server
+/// over the fake transport, so the download RPC, the chunk reassembly, and
+/// the scratch-file cleanup are all exercised, not mocked.
+///
+/// The project writes the downloaded file with `smol::fs::write`, which
+/// completes on a blocking thread outside the deterministic scheduler, so
+/// these tests allow parking and let real time pass.
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+    use remote::RemoteClient;
+    use remote_server::{HeadlessAppState, HeadlessProject};
+    use util::{path, rel_path::rel_path};
+
+    fn pdf_with_body(body: &str) -> Vec<u8> {
+        format!("%PDF-1.7\n{body}\nstartxref\n1234\n%%EOF\n").into_bytes()
+    }
+
+    async fn remote_project(
+        server_fs: &Arc<FakeFs>,
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) -> (Entity<Project>, Entity<HeadlessProject>) {
+        cx.executor().allow_parking();
+        cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+
+        let (opts, server_session, _) = RemoteClient::fake_server(cx, server_cx);
+        server_cx.update(HeadlessProject::init);
+        let headless = server_cx.new(|cx| {
+            HeadlessProject::new(
+                HeadlessAppState {
+                    session: server_session,
+                    fs: server_fs.clone(),
+                    http_client: Arc::new(http_client::BlockedHttpClient),
+                    node_runtime: node_runtime::NodeRuntime::unavailable(),
+                    languages: Arc::new(language::LanguageRegistry::new(
+                        cx.background_executor().clone(),
+                    )),
+                    extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                    startup_time: std::time::Instant::now(),
+                },
+                false,
+                cx,
+            )
+        });
+
+        let remote_client = RemoteClient::connect_mock(opts, cx).await;
+        cx.update(|cx| {
+            if !cx.has_global::<settings::SettingsStore>() {
+                let settings_store = settings::SettingsStore::test(cx);
+                cx.set_global(settings_store);
+            }
+        });
+        let client = cx.update(|cx| {
+            client::Client::new(
+                Arc::new(clock::FakeSystemClock::new()),
+                http_client::FakeHttpClient::with_404_response(),
+                cx,
+            )
+        });
+        let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
+        let languages = Arc::new(language::LanguageRegistry::test(cx.executor()));
+        let client_fs = FakeFs::new(cx.executor());
+        cx.update(|cx| Project::init(&client, cx));
+        let project = cx.update(|cx| {
+            Project::remote(
+                remote_client,
+                client,
+                node_runtime::NodeRuntime::unavailable(),
+                user_store,
+                languages,
+                client_fs,
+                false,
+                cx,
+            )
+        });
+        (project, headless)
+    }
+
+    async fn open_remote_worktree(
+        project: &Entity<Project>,
+        cx: &mut TestAppContext,
+    ) -> project::WorktreeId {
+        let (worktree, _) = project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(path!("/code/project"), true, cx)
+            })
+            .await
+            .expect("remote worktree should open");
+        cx.run_until_parked();
+        worktree.read_with(cx, |worktree, _| worktree.id())
+    }
+
+    fn open_pdf(
+        project: &Entity<Project>,
+        project_path: &ProjectPath,
+        cx: &mut TestAppContext,
+    ) -> Task<Result<Entity<PdfItem>>> {
+        cx.update(|cx| PdfItem::try_open(project, project_path, cx))
+            .expect("a .pdf path must be claimed by the PDF item")
+    }
+
+    fn scratch_copies() -> Vec<PathBuf> {
+        std::fs::read_dir(remote_pdf_scratch_dir())
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .map(|entry| entry.path())
+                    .filter(|path| {
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .is_some_and(|name| name.starts_with(&std::process::id().to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[gpui::test]
+    async fn a_remote_pdf_is_downloaded_and_opened(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let server_fs = FakeFs::new(server_cx.executor());
+        server_fs
+            .insert_tree(path!("/code/project"), serde_json::json!({ "docs": {} }))
+            .await;
+        server_fs
+            .insert_file(path!("/code/project/docs/report.pdf"), pdf_with_body("v1"))
+            .await;
+
+        let (project, _headless) = remote_project(&server_fs, cx, server_cx).await;
+        let worktree_id = open_remote_worktree(&project, cx).await;
+        let project_path = ProjectPath {
+            worktree_id,
+            path: rel_path("docs/report.pdf").into(),
+        };
+
+        let item = open_pdf(&project, &project_path, cx)
+            .await
+            .expect("remote PDF should open");
+        cx.run_until_parked();
+
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.pdf_bytes().as_ref(), pdf_with_body("v1").as_slice());
+            assert_eq!(item.file_name(), "report.pdf");
+        });
+        assert!(
+            scratch_copies().is_empty(),
+            "the downloaded copy must be removed once the bytes are in memory: {:?}",
+            scratch_copies()
+        );
+    }
+
+    /// The recompile flow over SSH: the host rewrites the PDF, the remote
+    /// worktree reports the change, and the item fetches the new bytes.
+    #[gpui::test]
+    async fn a_remote_pdf_reloads_when_the_host_rewrites_it(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let server_fs = FakeFs::new(server_cx.executor());
+        server_fs
+            .insert_tree(path!("/code/project"), serde_json::json!({ "docs": {} }))
+            .await;
+        server_fs
+            .insert_file(path!("/code/project/docs/report.pdf"), pdf_with_body("v1"))
+            .await;
+
+        let (project, _headless) = remote_project(&server_fs, cx, server_cx).await;
+        let worktree_id = open_remote_worktree(&project, cx).await;
+        let project_path = ProjectPath {
+            worktree_id,
+            path: rel_path("docs/report.pdf").into(),
+        };
+        let item = open_pdf(&project, &project_path, cx)
+            .await
+            .expect("remote PDF should open");
+        cx.run_until_parked();
+
+        let reloads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        cx.update({
+            let reloads = reloads.clone();
+            |cx| {
+                cx.subscribe(&item, move |_, event: &PdfItemEvent, _| {
+                    let PdfItemEvent::Reloaded = event;
+                    reloads.fetch_add(1, Ordering::SeqCst);
+                })
+                .detach();
+            }
+        });
+
+        server_fs
+            .insert_file(path!("/code/project/docs/report.pdf"), pdf_with_body("v2"))
+            .await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(40);
+        // Awaiting a timer parks the scheduler, which is what lets real time
+        // (and with it the blocking file write) pass under `allow_parking`.
+        while reloads.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            cx.executor()
+                .timer(std::time::Duration::from_millis(50))
+                .await;
+        }
+
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.pdf_bytes().as_ref(), pdf_with_body("v2").as_slice());
+        });
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+        assert!(scratch_copies().is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_missing_remote_pdf_fails_instead_of_hanging(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        let server_fs = FakeFs::new(server_cx.executor());
+        server_fs
+            .insert_tree(path!("/code/project"), serde_json::json!({ "docs": {} }))
+            .await;
+
+        let (project, _headless) = remote_project(&server_fs, cx, server_cx).await;
+        let worktree_id = open_remote_worktree(&project, cx).await;
+        let project_path = ProjectPath {
+            worktree_id,
+            path: rel_path("docs/missing.pdf").into(),
+        };
+
+        let error = open_pdf(&project, &project_path, cx)
+            .await
+            .expect_err("a file the host does not have cannot open");
+        assert!(
+            format!("{error:#}").contains("missing.pdf"),
+            "the error should name the file: {error:#}"
+        );
+        assert!(scratch_copies().is_empty());
     }
 }
