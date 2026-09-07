@@ -27,6 +27,7 @@ The fork's own changes are small and additive:
 | PDF viewer (adopted from zed#51040) | `crates/pdf_viewer/` |
 | Live Typst/LaTeX preview | `crates/typeset_preview/` |
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs` |
+| Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
 | Markdown attachments: drag-and-drop and clipboard paste | `crates/editor/src/items.rs` |
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |

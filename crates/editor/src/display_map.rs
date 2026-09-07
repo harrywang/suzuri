@@ -192,6 +192,7 @@ pub enum HighlightKey {
     VimExchange,
 }
 
+// SUZURI: Native line typography must share row geometry with editor input and painting.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LineStyle {
     pub font_scale: f32,
@@ -237,6 +238,7 @@ pub struct DisplayMap {
     block_map: BlockMap,
     /// Regions of text that should be highlighted.
     text_highlights: TextHighlights,
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
     line_styles: LineStyles,
     /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
@@ -415,6 +417,7 @@ impl DisplayMap {
             fold_placeholder,
             diagnostics_max_severity,
             text_highlights: Default::default(),
+            // SUZURI: Native line typography must share row geometry with editor input and painting.
             line_styles: Default::default(),
             inlay_highlights: Default::default(),
             semantic_token_highlights: Default::default(),
@@ -662,6 +665,7 @@ impl DisplayMap {
                 .update(cx, |dm, cx| Arc::new(dm.snapshot_simple(cx)))
                 .ok()
         });
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let line_style_map = Arc::new(LineStyleMap::new(&block_snapshot, &self.line_styles));
         let visual_row_map = Arc::new(VisualRowMap::new(&block_snapshot, &line_style_map));
 
@@ -690,6 +694,7 @@ impl DisplayMap {
             .block_map
             .read(wrap_snapshot, wrap_edits, None)
             .snapshot;
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let line_style_map = Arc::new(LineStyleMap::new(&block_snapshot, &self.line_styles));
         let visual_row_map = Arc::new(VisualRowMap::new(&block_snapshot, &line_style_map));
 
@@ -1221,6 +1226,7 @@ impl DisplayMap {
         }
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
     pub fn style_lines(
         &mut self,
         key: HighlightKey,
@@ -1296,6 +1302,7 @@ impl DisplayMap {
         self.text_highlights.iter()
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
     pub fn line_styles(
         &self,
     ) -> impl Iterator<Item = (&HighlightKey, &Arc<(LineStyle, Vec<Range<Anchor>>)>)> {
@@ -1317,6 +1324,7 @@ impl DisplayMap {
         let mut cleared = Arc::make_mut(&mut self.text_highlights)
             .remove(&key)
             .is_some();
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
         cleared |= Arc::make_mut(&mut self.line_styles).remove(&key).is_some();
         cleared |= self.inlay_highlights.remove(&key).is_some();
         cleared
@@ -1566,7 +1574,7 @@ impl<'a> HighlightedChunk<'a> {
                 return Some(HighlightedChunk {
                     text: invisible_text,
                     style: Some(invisible_style),
-
+                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     is_tab: false,
                     is_inlay,
                     replacement: match replacement(ch) {
@@ -1589,6 +1597,7 @@ impl<'a> HighlightedChunk<'a> {
         })
     }
 }
+// SUZURI: Native line typography must share row geometry with editor input and painting.
 #[derive(Clone, Copy, Debug)]
 struct VisualLineStyle {
     start_row: DisplayRow,
@@ -1745,6 +1754,7 @@ pub struct DisplaySnapshot {
     pub companion_display_snapshot: Option<Arc<DisplaySnapshot>>,
     pub crease_snapshot: CreaseSnapshot,
     block_snapshot: BlockSnapshot,
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
     visual_row_map: Arc<VisualRowMap>,
     line_style_map: Arc<LineStyleMap>,
     text_highlights: TextHighlights,
@@ -1766,6 +1776,24 @@ impl DisplaySnapshot {
 
     pub fn row_for_visual_y(&self, y: f64) -> f64 {
         self.visual_row_map.row_for_visual_y(y)
+    }
+
+    // SUZURI: Keep row extents and scrolling in the same variable-height coordinate space.
+    pub fn visual_line_height(&self, row: DisplayRow, line_height: Pixels) -> Pixels {
+        line_height
+            * (self.visual_y_for_row(row.next_row().as_f64()) - self.visual_y_for_row(row.as_f64()))
+                as f32
+    }
+
+    pub fn row_after_visual_offset(&self, row: f64, offset: f64) -> f64 {
+        self.row_for_visual_y(self.visual_y_for_row(row) + offset)
+    }
+
+    pub fn max_scroll_row(&self, visible_rows: f64, margin: f64) -> f64 {
+        self.row_for_visual_y(
+            self.visual_y_for_row(self.max_point().row().next_row().as_f64()) - visible_rows
+                + margin,
+        )
     }
 
     pub fn line_style_for_row(&self, row: DisplayRow) -> Option<LineStyle> {
@@ -3434,6 +3462,7 @@ pub mod tests {
         );
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
     #[gpui::test]
     fn test_fractional_line_style_visual_height_contract(cx: &mut gpui::App) {
         init_test(cx, &|_| {});

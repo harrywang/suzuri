@@ -3812,6 +3812,12 @@ async fn test_line_style_row_geometry_contract(cx: &mut TestAppContext) {
         assert!((display.visual_y_for_row(2.0) - 2.5).abs() <= 0.0001);
         assert!((display.row_for_visual_y(0.75) - 0.5).abs() <= 0.0001);
         assert!((display.row_for_visual_y(1.5) - 1.0).abs() <= 0.0001);
+        assert_eq!(
+            display.visual_line_height(editor::display_map::DisplayRow(0), gpui::px(20.0)),
+            gpui::px(30.0)
+        );
+        assert!((display.row_after_visual_offset(0.5, 0.75) - 1.0).abs() <= 0.0001);
+        assert!((display.max_scroll_row(1.0, 0.0) - 1.0).abs() <= 0.0001);
     });
 }
 
