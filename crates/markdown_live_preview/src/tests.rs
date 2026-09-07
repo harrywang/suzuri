@@ -3898,6 +3898,32 @@ async fn test_invalid_line_style_preserves_valid_geometry_contract(cx: &mut Test
     });
 }
 
+#[gpui::test]
+async fn test_line_style_scroll_distance_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(&format!("ˇheading\n{}", "body\n".repeat(100)));
+    cx.update_editor(|editor, _, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        editor.style_lines(
+            HighlightKey::MarkdownLivePreview(usize::MAX),
+            vec![buffer.anchor_before(Point::new(0, 0))..buffer.anchor_after(Point::new(0, 7))],
+            editor::display_map::LineStyle {
+                font_scale: 1.5,
+                line_height: 2.0,
+            },
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.set_scroll_position(gpui::point(0.0, 0.0), window, cx);
+        editor.scroll_screen(&editor::scroll::ScrollAmount::Line(1.0), window, cx);
+        assert!((editor.scroll_position(cx).y - 0.5).abs() < 0.001);
+        editor.scroll_screen(&editor::scroll::ScrollAmount::Line(-1.0), window, cx);
+        assert!(editor.scroll_position(cx).y.abs() < 0.001);
+    });
+}
+
 /// Live preview's text decorations all hang off `HighlightKey::MarkdownLivePreview`,
 /// keyed per decoration kind. Highlights written under one key must not be
 /// disturbed when another key is cleared, or disabling one decoration would
