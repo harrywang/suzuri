@@ -146,11 +146,16 @@ impl FoldPoint {
         let mut offset = start.1.output.len;
         if !overshoot.is_zero() {
             let transform = item.expect("display point out of range");
-            assert!(transform.placeholder.is_none());
-            let end_inlay_offset = snapshot
-                .inlay_snapshot
-                .to_offset(InlayPoint(start.1.input.lines + overshoot));
-            offset += end_inlay_offset.0 - start.1.input.len;
+            // SUZURI: Wrapping can end inside a fold label; its displayed bytes
+            // have no corresponding offset in the hidden source text.
+            if transform.placeholder.is_some() {
+                offset += overshoot.column as usize;
+            } else {
+                let end_inlay_offset = snapshot
+                    .inlay_snapshot
+                    .to_offset(InlayPoint(start.1.input.lines + overshoot));
+                offset += end_inlay_offset.0 - start.1.input.len;
+            }
         }
         FoldOffset(offset)
     }
@@ -1955,6 +1960,30 @@ mod tests {
     use text::Patch;
     use util::RandomCharIter;
     use util::test::sample_text;
+
+    // SUZURI: Wrapping restored folds can request offsets inside their displayed placeholder.
+    #[gpui::test]
+    fn test_offset_inside_fold_placeholder(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_simple("before hidden after", cx);
+        let (_, inlay_snapshot) = InlayMap::new(buffer.read(cx).snapshot(cx));
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![(
+            Point::new(0, 7)..Point::new(0, 13),
+            FoldPlaceholder {
+                collapsed_text: Some("aébc".into()),
+                ..FoldPlaceholder::test()
+            },
+        )]);
+        assert_eq!(snapshot.text(), "before aébc after");
+        for column in [7, 8, 10, 11, 12, 13] {
+            let point = FoldPoint::new(0, column);
+            let offset = point.to_offset(&snapshot);
+            assert_eq!(offset.0, MultiBufferOffset(column as usize));
+            assert_eq!(offset.to_point(&snapshot), point);
+        }
+    }
 
     #[gpui::test]
     fn test_basic_folds(cx: &mut gpui::App) {
