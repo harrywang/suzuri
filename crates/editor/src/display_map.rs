@@ -1234,6 +1234,15 @@ impl DisplayMap {
         style: LineStyle,
         cx: &mut Context<Self>,
     ) {
+        // SUZURI: Reject invalid metrics before wrapping, shaping, and hit testing can diverge.
+        if !style.font_scale.is_finite()
+            || style.font_scale <= 0.0
+            || !style.line_height.is_finite()
+            || style.line_height <= 0.0
+        {
+            log::error!("Ignoring invalid line style: {style:?}");
+            return;
+        }
         let snapshot = self.buffer.read(cx).snapshot(cx);
         ranges.sort_by(|a, b| a.start.cmp(&b.start, &snapshot));
         Arc::make_mut(&mut self.line_styles).insert(key, Arc::new((style, ranges)));
