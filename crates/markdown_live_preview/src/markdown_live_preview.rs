@@ -40,7 +40,7 @@ use multi_buffer::{
 use project::{PathChange, Project, ProjectPath};
 use settings::{RegisterSetting, Settings};
 use text::Point;
-use ui::{Checkbox, ToggleState, prelude::*};
+use ui::{Checkbox, ContextMenu, ContextMenuEntry, ToggleState, prelude::*};
 use util::ResultExt as _;
 
 actions!(
@@ -4062,6 +4062,10 @@ fn render_image_block(
         let drag_range = range.clone();
         let move_editor = editor.clone();
         let move_drag_range = range.clone();
+        let menu_editor = editor.clone();
+        let menu_range = range.clone();
+        let menu_destination = destination.clone();
+        let menu_base_directory = base_directory.clone();
 
         // A direct image element lets the selection border hug the image
         // exactly; reference-style images (no inline destination) fall back
@@ -4226,6 +4230,28 @@ fn render_image_block(
                         if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
                             addon.selected_image = Some(select_range.clone());
                         }
+                        cx.notify();
+                    })
+                    .log_err();
+            })
+            // The editor's own right-click menu acts on the markdown buffer,
+            // so its "Reveal in Finder" would open the note's folder, not the
+            // image's. Stopping propagation here keeps that menu from
+            // deploying and replaces it with one that targets the image file.
+            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                let image_path = menu_destination.as_deref().and_then(|destination| {
+                    local_image_path(destination, menu_base_directory.as_deref())
+                });
+                let range = menu_range.clone();
+                menu_editor
+                    .update(cx, |editor, cx| {
+                        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                            addon.selected_image = Some(range);
+                        }
+                        let menu =
+                            image_context_menu(image_path, editor.project().cloned(), window, cx);
+                        editor.deploy_mouse_context_menu(event.position, menu, window, cx);
                         cx.notify();
                     })
                     .log_err();
@@ -5808,23 +5834,7 @@ fn resolve_image_source(
             destination.to_string(),
         ))));
     }
-    // Markdown links percent-encode spaces; the filesystem stores them raw.
-    let decoded = urlencoding::decode(destination)
-        .map(|decoded| decoded.into_owned())
-        .unwrap_or_else(|_| destination.to_string());
-    let path = std::path::Path::new(&decoded);
-    let path = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base_directory?.join(path)
-    };
-    // Canonicalizing proves the file exists *and* collapses `..` and symlinks,
-    // so a note that spells its image `../images/x.png` keys the cache by the
-    // same path the worktree reports when that file changes. Without it the two
-    // spellings hash differently and the eviction below silently matches
-    // nothing — which is the common case, since a shared `images/` folder
-    // beside the notes is an ordinary vault layout.
-    let path = std::fs::canonicalize(&path).ok()?;
+    let path = local_image_path(destination, base_directory)?;
     // Deliberately not `ImageSource::Resource`: that reads through gpui's
     // app-level asset cache, which has no eviction, so a file rewritten in
     // place would keep serving its first-decoded bitmap. Routing every local
@@ -5837,6 +5847,62 @@ fn resolve_image_source(
             image_cache.load(&resource, window, cx)
         })
     })))
+}
+
+/// The on-disk file an image link points at, or `None` for remote and
+/// data-URI images and for links whose file does not exist.
+fn local_image_path(destination: &str, base_directory: Option<&Path>) -> Option<PathBuf> {
+    if destination.starts_with("data:")
+        || destination.starts_with("http://")
+        || destination.starts_with("https://")
+    {
+        return None;
+    }
+    // Markdown links percent-encode spaces; the filesystem stores them raw.
+    let decoded = urlencoding::decode(destination)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| destination.to_string());
+    let path = Path::new(&decoded);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_directory?.join(path)
+    };
+    // Canonicalizing proves the file exists *and* collapses `..` and symlinks,
+    // so a note that spells its image `../images/x.png` keys the cache by the
+    // same path the worktree reports when that file changes. Without it the two
+    // spellings hash differently and the eviction in `register_editor` silently
+    // matches nothing — which is the common case, since a shared `images/`
+    // folder beside the notes is an ordinary vault layout.
+    std::fs::canonicalize(&path).ok()
+}
+
+/// The right-click menu for an image widget. Its reveal entry targets the
+/// image file, where the editor's default menu would target the note.
+fn image_context_menu(
+    image_path: Option<PathBuf>,
+    project: Option<Entity<Project>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, |menu, _, _| {
+        let reveal_path = image_path.clone();
+        menu.item(
+            ContextMenuEntry::new(ui::utils::reveal_in_file_manager_label(false))
+                .disabled(image_path.is_none())
+                .handler(move |_, cx| {
+                    let Some(path) = reveal_path.as_deref() else {
+                        return;
+                    };
+                    match project.as_ref() {
+                        Some(project) => {
+                            project.update(cx, |project, cx| project.reveal_path(path, cx))
+                        }
+                        None => cx.reveal_path(path),
+                    }
+                }),
+        )
+    })
 }
 
 fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
