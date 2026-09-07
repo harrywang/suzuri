@@ -3775,6 +3775,37 @@ async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) 
 // behavior of its own. They exist so an upstream merge that changes those
 // semantics fails here, loudly, instead of silently degrading live preview.
 
+#[gpui::test]
+async fn test_concealed_source_selection_with_unrelated_fold_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇabove\n**text**\nfold start\nfold end");
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        editor.set_concealments(
+            std::any::TypeId::of::<EditorTestContext>(),
+            vec![editor::display_map::Concealment {
+                range: buffer.anchor_before(Point::new(1, 0))
+                    ..buffer.anchor_after(Point::new(1, 2)),
+                placeholder: editor::display_map::FoldPlaceholder {
+                    collapsed_text: Some("".into()),
+                    ..Default::default()
+                },
+                content_key: 0,
+            }],
+            cx,
+        );
+        editor.fold_ranges(vec![Point::new(2, 0)..Point::new(3, 8)], false, window, cx);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(1, 0)..Point::new(1, 8)]);
+        });
+        let snapshot = editor.display_snapshot(cx);
+        let selection = editor.selections.newest::<Point>(&snapshot);
+        assert_eq!(selection.start, Point::new(1, 0));
+        assert_eq!(selection.end, Point::new(1, 8));
+    });
+}
+
 /// Live preview's text decorations all hang off `HighlightKey::MarkdownLivePreview`,
 /// keyed per decoration kind. Highlights written under one key must not be
 /// disturbed when another key is cleared, or disabling one decoration would
