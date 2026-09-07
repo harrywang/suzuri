@@ -1338,6 +1338,17 @@ pub struct MarkdownHeadingStylesSettingsContent {
     pub h6: Option<MarkdownHeadingStyleSettingsContent>,
 }
 
+// SUZURI: Reuse existing theme roles for quote borders without requiring theme authors to add tokens.
+#[derive(Clone, Copy, Default, PartialEq, Debug, JsonSchema, MergeFrom, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownQuoteBorderColor {
+    Accent,
+    #[default]
+    Text,
+    MutedText,
+    LineNumber,
+}
+
 /// The settings for markdown live preview in the editor.
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
@@ -1351,6 +1362,16 @@ pub struct MarkdownLivePreviewSettingsContent {
     // SUZURI: Keep the native heading settings during upstream schema updates.
     /// Typography overrides for rendered heading levels.
     pub heading_styles: Option<MarkdownHeadingStylesSettingsContent>,
+    // SUZURI: Optional live-preview quote styling without requiring theme changes.
+    /// Theme color role for plain block quote borders. Follows the active theme.
+    /// Default: "text". Other choices: "accent", "muted_text", "line_number".
+    pub block_quote_border_color: Option<MarkdownQuoteBorderColor>,
+    /// Plain block quote border width in logical pixels. Zero hides the border.
+    /// Default: null (use the renderer’s existing width). Must be non-negative.
+    pub block_quote_border_width: Option<f32>,
+    /// Gap between a plain block quote border and its text, in logical pixels.
+    /// Default: null (use the renderer’s existing spacing). Must be non-negative.
+    pub block_quote_gap: Option<f32>,
     /// Folder for attachments dropped onto a markdown buffer, relative to
     /// the note's folder. An empty string stores attachments directly in
     /// the note's folder.

@@ -5108,6 +5108,79 @@ async fn test_link_label_wider_than_the_wrap_width_does_not_panic(cx: &mut TestA
 }
 
 #[gpui::test]
+async fn test_block_quote_adjacent_paragraph_audit(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    for before in ["\n", "\n\n"] {
+        for after in ["\n", "\n\n"] {
+            cx.set_state(&format!("ˇPreceding paragraph.{before}> Quoted paragraph.\n>\n> — Attribution, [source](https://example.com){after}Following paragraph."));
+            cx.executor().run_until_parked();
+            let sources = cx.update_editor(|editor, _, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                extract_markers(editor, cx)
+                    .unwrap()
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        snapshot
+                            .text_for_range(
+                                block.range.start.to_offset(&snapshot)
+                                    ..block.range.end.to_offset(&snapshot),
+                            )
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                sources.len(),
+                1,
+                "before={before:?}, after={after:?}: {sources:?}"
+            );
+            assert!(sources[0].starts_with("> Quoted paragraph."), "{sources:?}");
+            assert_eq!(
+                applied_block_count(&mut cx),
+                1,
+                "before={before:?}, after={after:?}"
+            );
+            cx.set_state(&format!("Preceding paragraph.{before}> Quoted paragraph.\n>\n> — Attribution, [source](https://example.com){after}ˇFollowing paragraph."));
+            cx.executor().run_until_parked();
+            assert_eq!(
+                applied_block_count(&mut cx),
+                usize::from(after == "\n\n"),
+                "following paragraph cursor: before={before:?}, after={after:?}"
+            );
+        }
+    }
+}
+
+#[gpui::test]
+async fn test_block_prose_uses_editor_typography(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.cx.update(|window, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.theme.ui_font_size = Some(12.0.into());
+                content.theme.buffer_font_size = Some(21.0.into());
+                content.theme.buffer_font_weight = Some(settings::FontWeightContent::SEMIBOLD);
+                content.theme.buffer_line_height = Some(settings::BufferLineHeight::Custom(1.4));
+            });
+        });
+        let style = block_markdown_style(window, cx);
+        assert_eq!(style.base_text_style.font_size, gpui::px(21.0).into());
+        assert_eq!(style.base_text_style.font_weight, FontWeight::SEMIBOLD);
+        assert_eq!(style.base_text_style.line_height, gpui::relative(1.4));
+        assert_eq!(style.paragraph_line_height, gpui::relative(1.4));
+        assert_eq!(
+            style.container_style.text.font_size,
+            Some(gpui::px(21.0).into())
+        );
+        assert_eq!(
+            style.container_style.text.line_height,
+            Some(gpui::relative(1.4))
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_link_label_over_128_bytes_does_not_panic(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     // The tab map tracks a chunk's characters in a `u128` bitmap, so a
@@ -5159,4 +5232,282 @@ async fn test_soft_wrapped_line_of_links_before_a_heading_does_not_panic(cx: &mu
     cx.update_editor(|editor, window, cx| {
         editor.snapshot(window, cx);
     });
+}
+
+#[gpui::test]
+async fn test_quote_waits_for_parse_and_reuses_renderer(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("Before\n> ˇfirst\n>\n> last\n\nAfter");
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(4, 0)..Point::new(4, 0)]);
+        });
+        apply_decorations(editor, cx);
+        let addon = editor.addon::<LivePreviewAddon>().unwrap();
+        assert!(
+            addon.applied_blocks.is_empty(),
+            "source must remain visible while parsing"
+        );
+        assert_eq!(addon.markdown_blocks.len(), 1);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    cx.update_editor(|editor, window, cx| {
+        let renderer = editor
+            .addon::<LivePreviewAddon>()
+            .unwrap()
+            .markdown_blocks
+            .values()
+            .next()
+            .unwrap()
+            .1
+            .entity_id();
+        for row in [3, 4] {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
+            });
+            apply_decorations(editor, cx);
+            let addon = editor.addon::<LivePreviewAddon>().unwrap();
+            let markdown = &addon.markdown_blocks.values().next().unwrap().1;
+            assert_eq!(markdown.entity_id(), renderer);
+            assert!(!markdown.read(cx).is_parsing());
+            assert_eq!(addon.applied_blocks.len(), usize::from(row == 4));
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_quote_arrow_navigation_uses_source_rows(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("Before\n\n> text\n>\n>\n>\n> line\nˇ\nAfter");
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    cx.dispatch_action(zed_actions::editor::MoveUp);
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest_anchor()
+                .head()
+                .to_point(&snapshot)
+                .row,
+            6
+        );
+    });
+    cx.executor().run_until_parked();
+    cx.set_state("Before\nˇ\n> text\n>\n> line\n\nAfter");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(zed_actions::editor::MoveDown);
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest_anchor()
+                .head()
+                .to_point(&snapshot)
+                .row,
+            2
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_commonmark_quote_structure_and_reveal(cx: &mut TestAppContext) {
+    use markdown::parser::{MarkdownEvent, MarkdownTag};
+
+    let mut cx = markdown_test_context(cx).await;
+    // CommonMark 0.31.2, examples 239–244 and 250: blank quoted lines
+    // separate paragraphs, while unquoted blank lines separate quote blocks.
+    for (source, widgets, paragraphs, quotes) in [
+        (">", 1, 0, 1),
+        (">\n>\n>", 1, 0, 1),
+        ("> text\n>", 1, 1, 1),
+        ("> text\n> line", 1, 1, 1),
+        ("> text\n>\n> line", 1, 2, 1),
+        ("> text\n> \n> line", 1, 2, 1),
+        ("> text\n>\n>\n>\n> line", 1, 2, 1),
+        ("> text\n\n> line", 2, 2, 2),
+        ("> text\n>> nested", 1, 2, 2),
+        ("> text\n>>", 1, 1, 2),
+        ("> text\n\n>", 2, 1, 2),
+        (">\n>text", 1, 1, 1),
+    ] {
+        cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
+        cx.executor().run_until_parked();
+        assert_eq!(applied_block_count(&mut cx), widgets, "{source:?}");
+        cx.update_editor(|editor, _, cx| {
+            let addon = editor.addon::<LivePreviewAddon>().unwrap();
+            let mut paragraph_count = 0;
+            let mut quote_count = 0;
+            for (_, markdown, _) in addon.markdown_blocks.values() {
+                for (_, event) in markdown.read(cx).parsed_markdown().events.iter() {
+                    match event {
+                        MarkdownEvent::Start(MarkdownTag::Paragraph) => paragraph_count += 1,
+                        MarkdownEvent::Start(MarkdownTag::BlockQuote(_)) => quote_count += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(paragraph_count, paragraphs, "{source:?}");
+            assert_eq!(quote_count, quotes, "{source:?}");
+        });
+        cx.set_state(&format!("Before\n\nˇ{source}\n\nAfter"));
+        cx.executor().run_until_parked();
+        assert_eq!(
+            applied_block_count(&mut cx),
+            widgets - 1,
+            "reveal {source:?}"
+        );
+        cx.set_state(&format!("Before\n\n{source}\n\nˇAfter"));
+        cx.executor().run_until_parked();
+        assert_eq!(applied_block_count(&mut cx), widgets, "leave {source:?}");
+    }
+}
+
+#[gpui::test]
+async fn test_quote_border_color_theme_roles(cx: &mut TestAppContext) {
+    use settings::MarkdownQuoteBorderColor::*;
+    let mut cx = markdown_test_context(cx).await;
+    for role in [
+        None,
+        Some(Text),
+        Some(MutedText),
+        Some(LineNumber),
+        Some(Accent),
+        None,
+    ] {
+        cx.cx.update(|window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .markdown_live_preview
+                        .get_or_insert_default()
+                        .block_quote_border_color = role;
+                });
+            });
+            let colors = cx.theme().colors();
+            let expected = match role {
+                None | Some(Text) => colors.editor_foreground,
+                Some(MutedText) => colors.text_muted,
+                Some(LineNumber) => colors.editor_line_number,
+                Some(Accent) => colors.text_accent,
+            };
+            assert_eq!(
+                block_markdown_style(window, cx).block_quote_border_color,
+                expected
+            );
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_quote_geometry_settings(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    for (value, expected) in [
+        (None, None),
+        (Some(2.5), Some(2.5)),
+        (Some(0.0), Some(0.0)),
+        (Some(-1.0), None),
+        (None, None),
+    ] {
+        cx.cx.update(|window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    let quote = content.markdown_live_preview.get_or_insert_default();
+                    quote.block_quote_border_width = value;
+                    quote.block_quote_gap = value;
+                });
+            });
+            let style = block_markdown_style(window, cx);
+            assert_eq!(style.block_quote_border_width, expected.map(gpui::px));
+            assert_eq!(style.block_quote_gap, expected.map(gpui::px));
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_quote_wraps_with_wide_source_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+    });
+    let prose = "Ordinary quoted words should wrap within the visible editor. ".repeat(12);
+    cx.set_state(&format!(
+        "ˇ{}\n\n> {prose}\n>\n> Attribution\n\nAfter",
+        "wide ".repeat(500)
+    ));
+    cx.executor().run_until_parked();
+    let bounds = cx
+        .cx
+        .debug_bounds("mdlp-prose-block")
+        .expect("quote is rendered");
+    let editor_bounds = cx.update_editor(|editor, _, _| *editor.last_bounds().unwrap());
+    assert!(
+        bounds.right() <= editor_bounds.right(),
+        "quote exceeds viewport: {bounds:?}, {editor_bounds:?}"
+    );
+    assert!(
+        bounds.size.height > gpui::px(100.),
+        "long quote must wrap over multiple lines: {bounds:?}"
+    );
+    let mut previous_height = bounds.size.height;
+    for width in [900., 450.] {
+        cx.cx
+            .simulate_resize(gpui::size(gpui::px(width), gpui::px(1080.)));
+        cx.executor().run_until_parked();
+        let bounds = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
+        assert!(
+            bounds.right() <= gpui::px(width),
+            "quote overflows after resize: {bounds:?}"
+        );
+        assert!(
+            bounds.size.height > previous_height,
+            "narrower quote should wrap to more lines: {bounds:?}"
+        );
+        previous_height = bounds.size.height;
+    }
+}
+
+#[gpui::test]
+async fn test_quote_has_no_trailing_renderer_margin(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    for source in [
+        "> first",
+        "> first\n>\n> second",
+        "> first\n>\n> second\n>\n> third",
+    ] {
+        cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
+        cx.executor().run_until_parked();
+        let quote = cx.cx.debug_bounds("markdown-quote").unwrap();
+        let block = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
+        assert_eq!(
+            quote.bottom(),
+            block.bottom(),
+            "trailing margin for {source:?}"
+        );
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let id = editor.addon::<LivePreviewAddon>().unwrap().applied_blocks[0].block_id;
+            let rows = snapshot
+                .block_for_id(editor::display_map::BlockId::Custom(id))
+                .unwrap()
+                .height();
+            let line_height = editor
+                .style(cx)
+                .text
+                .line_height_in_pixels(window.rem_size())
+                .round();
+            let reserved = line_height * rows as f32;
+            assert!(reserved >= quote.size.height);
+            assert!(
+                reserved - quote.size.height < line_height,
+                "more than rounding slack: {source:?}"
+            );
+        });
+    }
 }

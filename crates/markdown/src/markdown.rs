@@ -115,6 +115,9 @@ pub struct MarkdownStyle {
     pub link_callback: Option<LinkStyleCallback>,
     pub rule_color: Hsla,
     pub block_quote_border_color: Hsla,
+    // SUZURI: Live preview can override plain quote geometry without changing other Markdown views.
+    pub block_quote_border_width: Option<Pixels>,
+    pub block_quote_gap: Option<Pixels>,
     pub block_quote_kind_colors: BlockQuoteKindColors,
     pub syntax: Arc<SyntaxTheme>,
     pub selection_background_color: Hsla,
@@ -146,6 +149,8 @@ impl Default for MarkdownStyle {
             link_callback: None,
             rule_color: Default::default(),
             block_quote_border_color: Default::default(),
+            block_quote_border_width: None,
+            block_quote_gap: None,
             block_quote_kind_colors: Default::default(),
             syntax: Arc::new(SyntaxTheme::default()),
             selection_background_color: Default::default(),
@@ -2090,9 +2095,18 @@ impl MarkdownElement {
         });
 
         let block_div = div()
+            .debug_selector(|| "markdown-quote".into())
             .pl_4()
             .mb(self.style.paragraph_spacing)
             .border_l_4()
+            // SUZURI: Preserve callout geometry and the existing defaults when overrides are unset.
+            .when(kind.is_none(), |block| {
+                block
+                    .when_some(self.style.block_quote_border_width, |block, width| {
+                        block.border_l(width)
+                    })
+                    .when_some(self.style.block_quote_gap, |block, gap| block.pl(gap))
+            })
             .border_color(border_color);
         let block_div = match header {
             Some(header) => block_div.child(header),
