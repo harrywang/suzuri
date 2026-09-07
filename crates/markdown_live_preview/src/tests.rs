@@ -158,9 +158,7 @@ async fn test_native_heading_wraps_with_scaled_font_metrics(cx: &mut TestAppCont
 async fn test_all_heading_levels_edit_in_the_main_editor(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     let source = "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\nbody";
-    cx.set_state(&format!(
-        "# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\nˇbody"
-    ));
+    cx.set_state("# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\nˇbody");
     cx.executor().run_until_parked();
     assert_eq!(cx.buffer_text(), source);
     assert_eq!(cx.display_text(), "One\nTwo\nThree\nFour\nFive\nSix\nbody");
