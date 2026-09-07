@@ -6229,7 +6229,7 @@ fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     let buffer_font = theme_settings::ThemeSettings::get_global(cx)
         .buffer_font
         .clone();
-    let font_family = buffer_font.family.clone();
+    let font_family = buffer_font.family;
     style.base_text_style.font_family = font_family.clone();
     style.container_style.text.font_family = Some(font_family.clone());
     style.heading.text.font_family = Some(font_family.clone());
