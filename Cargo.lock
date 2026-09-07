@@ -20420,6 +20420,7 @@ dependencies = [
  "language",
  "log",
  "lsp",
+ "markdown_live_preview",
  "markdown_preview",
  "menu",
  "multi_buffer",
