@@ -126,3 +126,20 @@ git branch -d merge-upstream-<date>
 
 Offer a release tag (`suzuri-vX.Y.Z`) only if the user wants the merge shipped — tagging
 triggers the full signed-and-notarized build, which takes hours on hosted runners.
+
+## 7. Sweep stale build artifacts
+
+A merge bumps dependency versions, and Cargo never deletes the artifacts of the old
+ones — `target/debug` once reached 272G this way. Sweep every target dir that still
+exists, keeping anything touched in the last 30 days so the hot cache survives:
+
+```sh
+for d in . .claude/worktrees/* ../suzuri-headings ../suzuri-upstream; do
+  [ -d "$d/target" ] && cargo sweep --time 30 "$d"
+done
+df -h / | tail -1
+```
+
+`cargo-sweep` is installed via `cargo install cargo-sweep`. Dependencies rebuild from
+the shared `sccache` cache (`rustc-wrapper` in `~/.cargo/config.toml`), so a sweep
+that removes too much costs minutes, not the near-full rebuild a `rm -rf` does.
