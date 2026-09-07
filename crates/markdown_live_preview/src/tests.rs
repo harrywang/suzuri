@@ -3861,6 +3861,43 @@ async fn test_line_style_text_and_pixel_geometry_contract(cx: &mut TestAppContex
     });
 }
 
+#[gpui::test]
+async fn test_invalid_line_style_preserves_valid_geometry_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇheading\nbody");
+    cx.update_editor(|editor, _, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        let ranges =
+            vec![buffer.anchor_before(Point::new(0, 0))..buffer.anchor_after(Point::new(0, 7))];
+        let key = HighlightKey::MarkdownLivePreview(usize::MAX);
+        let valid = editor::display_map::LineStyle {
+            font_scale: 1.5,
+            line_height: 2.0,
+        };
+        editor.style_lines(key, ranges.clone(), valid, cx);
+        for value in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            for style in [
+                editor::display_map::LineStyle {
+                    font_scale: value,
+                    ..valid
+                },
+                editor::display_map::LineStyle {
+                    line_height: value,
+                    ..valid
+                },
+            ] {
+                editor.style_lines(key, ranges.clone(), style, cx);
+                let display = editor.display_snapshot(cx);
+                assert_eq!(
+                    display.line_style_for_row(editor::display_map::DisplayRow(0)),
+                    Some(valid)
+                );
+                assert_eq!(display.visual_y_for_row(1.0), 2.0);
+            }
+        }
+    });
+}
+
 /// Live preview's text decorations all hang off `HighlightKey::MarkdownLivePreview`,
 /// keyed per decoration kind. Highlights written under one key must not be
 /// disturbed when another key is cleared, or disabling one decoration would
