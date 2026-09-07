@@ -1261,7 +1261,7 @@ where
     // Transforms `Anchor -> DisplayPoint -> Point -> DisplayPoint -> D`
     // todo(lw): We should be able to short circuit the `Anchor -> DisplayPoint -> Point` to `Anchor -> Point`
     // SUZURI: A real fold elsewhere must not make a concealment swallow source selection endpoints.
-    let points = selections.into_iter().flat_map(|source| {
+    let points = selections.into_iter().flat_map(move |source| {
         resolve_selections_display(Some(source), map).map(move |display| {
             let start = if map.fold_snapshot().is_offset_concealed(source.start) {
                 source.start.to_point(map.buffer_snapshot())
