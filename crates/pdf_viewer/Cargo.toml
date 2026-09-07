@@ -22,6 +22,7 @@ file_icons.workspace = true
 gpui.workspace = true
 image = { workspace = true }
 log.workspace = true
+paths.workspace = true
 project.workspace = true
 serde.workspace = true
 settings.workspace = true
@@ -33,3 +34,21 @@ util.workspace = true
 workspace.workspace = true
 hayro = { version = "0.5", default-features = false, features = ["embed-fonts"] }
 kurbo = "0.13"
+
+[dev-dependencies]
+client = { workspace = true, features = ["test-support"] }
+clock = { workspace = true, features = ["test-support"] }
+extension.workspace = true
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+node_runtime = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+release_channel.workspace = true
+remote = { workspace = true, features = ["test-support"] }
+remote_server = { workspace = true, features = ["test-support"] }
+semver.workspace = true
+serde_json.workspace = true
+settings = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
