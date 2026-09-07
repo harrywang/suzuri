@@ -1936,18 +1936,26 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
             Arc::new(move |fold_id, _, _| {
                 let editor = editor.clone();
                 let marker_range = marker_range.clone();
-                Checkbox::new(
-                    fold_id,
-                    if checked {
-                        ToggleState::Selected
-                    } else {
-                        ToggleState::Unselected
-                    },
-                )
-                .on_click(move |_, _, cx| {
-                    toggle_task_marker(&editor, &marker_range, checked, cx);
-                })
-                .into_any_element()
+                // Toggling is the checkbox's job, so it claims the press
+                // instead of letting the editor place the cursor on the
+                // marker: that would reveal the source, drop this element,
+                // and lose the click before it could fire.
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .child(
+                        Checkbox::new(
+                            fold_id,
+                            if checked {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .on_click(move |_, _, cx| {
+                            toggle_task_marker(&editor, &marker_range, checked, cx);
+                        }),
+                    )
+                    .into_any_element()
             })
         }
         InlineKind::Link { destination, label } => {
