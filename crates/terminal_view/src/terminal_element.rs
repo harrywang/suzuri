@@ -1687,6 +1687,7 @@ impl Element for TerminalElement {
                                 0.15 * layout.dimensions.line_height
                             } else {
                                 Pixels::ZERO
+                                // SUZURI: Terminal highlights use the editor's per-row highlight geometry.
                             };
                             let hr = HighlightedRange {
                                 start_y,
@@ -1975,6 +1976,7 @@ fn to_highlighted_range_lines(
         }
 
         highlighted_range_lines.push(HighlightedRangeLine {
+            // SUZURI: Terminal highlights use the editor's per-row highlight geometry.
             line_height: layout.dimensions.line_height,
             start_x: origin.x + line_start as f32 * layout.dimensions.cell_width,
             end_x: origin.x + line_end as f32 * layout.dimensions.cell_width,

@@ -3363,6 +3363,7 @@ impl Editor {
         self.current_line_highlight = current_line_highlight;
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
     pub fn selection_is_from_search(&self) -> bool {
         self.last_selection_from_search
     }
@@ -9827,6 +9828,7 @@ impl Editor {
         cx.notify();
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
     pub fn style_lines(
         &mut self,
         key: HighlightKey,
@@ -9906,6 +9908,7 @@ impl Editor {
     }
 
     pub fn clear_highlights(&mut self, key: HighlightKey, cx: &mut Context<Self>) {
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let cleared = self.display_map.update(cx, |map, cx| {
             let cleared = map.clear_highlights(key);
             if cleared {
@@ -9923,6 +9926,7 @@ impl Editor {
         f: &mut dyn FnMut(&HighlightKey) -> bool,
         cx: &mut Context<Self>,
     ) {
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let cleared = self.display_map.update(cx, |map, cx| {
             let cleared = map.clear_highlights_with(f);
             if cleared {
