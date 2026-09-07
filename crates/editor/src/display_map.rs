@@ -1796,6 +1796,28 @@ impl DisplaySnapshot {
         )
     }
 
+    // SUZURI: Movement must shape text with exactly the same scale as painting.
+    pub(crate) fn style_for_row<'a>(
+        &self,
+        row: DisplayRow,
+        style: &'a EditorStyle,
+        rem_size: Pixels,
+    ) -> Cow<'a, EditorStyle> {
+        let Some(line_style) = self.line_style_for_row(row) else {
+            return Cow::Borrowed(style);
+        };
+        let mut style = style.clone();
+        let font_size = style.text.font_size.to_pixels(rem_size);
+        let line_height = style.text.line_height_in_pixels(rem_size);
+        style.text.font_size = (font_size * line_style.font_scale).into();
+        style.text.line_height = (line_height * line_style.line_height).into();
+        Cow::Owned(style)
+    }
+
+    pub fn visual_viewport_y(&self, row: f64, scroll_row: f64, line_height: Pixels) -> Pixels {
+        line_height * (self.visual_y_for_row(row) - self.visual_y_for_row(scroll_row)) as f32
+    }
+
     pub fn line_style_for_row(&self, row: DisplayRow) -> Option<LineStyle> {
         self.line_style_map.style_for_row(row)
     }
@@ -2294,6 +2316,8 @@ impl DisplaySnapshot {
             vertical_scroll_margin: _,
         }: &TextLayoutDetails,
     ) -> Arc<LineLayout> {
+        // SUZURI: Horizontal movement uses the same typography as rendered rows.
+        let editor_style = self.style_for_row(display_row, editor_style, *rem_size);
         let mut runs = Vec::new();
         let mut line = String::new();
 
@@ -2304,7 +2328,7 @@ impl DisplaySnapshot {
                 tree_sitter: false,
                 diagnostics: false,
             },
-            editor_style,
+            &editor_style,
         ) {
             line.push_str(chunk.text);
 

@@ -252,9 +252,7 @@ fn display_visual_viewport_y(
     scroll_row: f64,
     line_height: Pixels,
 ) -> Pixels {
-    let row_y = snapshot.visual_y_for_row(row);
-    let scroll_y = snapshot.visual_y_for_row(scroll_row);
-    line_height * (row_y - scroll_y) as f32
+    snapshot.visual_viewport_y(row, scroll_row, line_height)
 }
 
 fn visual_viewport_y(
@@ -8265,8 +8263,12 @@ impl Element for EditorElement {
                             let snapshot = editor.snapshot(window, cx);
                             let line_height =
                                 self.style.text.line_height_in_pixels(window.rem_size());
-                            let scroll_height =
-                                (snapshot.max_point().row().next_row().0 as f32) * line_height;
+                            // SUZURI: Content sizing includes the height of styled rows.
+                            let scroll_height = snapshot.visual_viewport_y(
+                                snapshot.max_point().row().next_row().as_f64(),
+                                0.0,
+                                line_height,
+                            );
                             style.size.height = scroll_height.into();
                         } else {
                             style.size.height = relative(1.).into();
@@ -10693,13 +10695,7 @@ pub fn layout_line(
     cx: &mut App,
 ) -> LineWithInvisibles {
     // SUZURI: Native line typography must share row geometry with editor input and painting.
-    let mut row_style = style.clone();
-    if let Some(line_style) = snapshot.display_snapshot.line_style_for_row(row) {
-        let base_font_size = style.text.font_size.to_pixels(window.rem_size());
-        let base_line_height = style.text.line_height_in_pixels(window.rem_size());
-        row_style.text.font_size = (base_font_size * line_style.font_scale).into();
-        row_style.text.line_height = (base_line_height * line_style.line_height).into();
-    }
+    let row_style = snapshot.style_for_row(row, style, window.rem_size());
     let use_tree_sitter =
         !snapshot.semantic_tokens_enabled || snapshot.use_tree_sitter_for_syntax(row, cx);
     let language_aware = LanguageAwareStyling {
@@ -11161,7 +11157,12 @@ fn compute_auto_height_layout(
         snapshot = editor.snapshot(window, cx);
     }
 
-    let scroll_height = (snapshot.max_point().row().next_row().0 as f32) * line_height;
+    // SUZURI: Auto-height editors must not clip native heading rows.
+    let scroll_height = snapshot.visual_viewport_y(
+        snapshot.max_point().row().next_row().as_f64(),
+        0.0,
+        line_height,
+    );
 
     let min_height = line_height * min_lines as f32;
     let content_height = scroll_height.max(min_height);

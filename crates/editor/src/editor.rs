@@ -5641,6 +5641,16 @@ impl Editor {
     }
 
     pub fn delete_line(&mut self, _: &DeleteLine, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_selected_lines(false, window, cx);
+    }
+
+    // SUZURI: Vim linewise motions include an empty final row; ordinary selections do not.
+    pub fn delete_selected_lines(
+        &mut self,
+        include_end_if_at_line_start: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.read_only(cx) {
             return;
         }
@@ -5651,11 +5661,12 @@ impl Editor {
         let mut edit_ranges = Vec::new();
         let mut selections = selections.iter().peekable();
         while let Some(selection) = selections.next() {
-            let mut rows = selection.spanned_rows(false, &display_map);
+            let mut rows = selection.spanned_rows(include_end_if_at_line_start, &display_map);
 
             // Accumulate contiguous regions of rows that we want to delete.
             while let Some(next_selection) = selections.peek() {
-                let next_rows = next_selection.spanned_rows(false, &display_map);
+                let next_rows =
+                    next_selection.spanned_rows(include_end_if_at_line_start, &display_map);
                 if next_rows.start <= rows.end {
                     rows.end = next_rows.end;
                     selections.next().unwrap();
@@ -7449,9 +7460,13 @@ impl Editor {
         let buffer_max_row = snapshot.buffer_snapshot().max_point().row;
         // The pointer's display row, kept fractional so the half-line test
         // below can tell which side of a row's midline it is on.
-        let pointer_row = ((position.y - position_map.text_hitbox.bounds.origin.y)
-            / position_map.line_height) as f64
-            + position_map.scroll_position.y;
+        // SUZURI: Image-drop boundaries use the same inverse geometry as text hit testing.
+        let pointer_row = snapshot.row_after_visual_offset(
+            position_map.scroll_position.y,
+            f64::from(
+                (position.y - position_map.text_hitbox.bounds.origin.y) / position_map.line_height,
+            ),
+        );
         let max_display_row = snapshot.display_snapshot.max_point().row().0;
         if pointer_row >= max_display_row as f64 + 1. {
             return Some(MultiBufferRow(buffer_max_row + 1));
@@ -11078,15 +11093,21 @@ impl Editor {
             .scroll_position(editor_snapshot)
             .y;
         if !line_height.is_zero() {
-            scroll_top =
-                window.pixel_snap_f64(scroll_top * f64::from(line_height)) / f64::from(line_height);
+            // SUZURI: Snap visual pixels, then return to the anchored logical scroll position.
+            scroll_top = editor_snapshot.row_for_visual_y(
+                window.pixel_snap_f64(
+                    editor_snapshot.visual_y_for_row(scroll_top) * f64::from(line_height),
+                ) / f64::from(line_height),
+            );
         }
 
         if source.row().as_f64() < scroll_top.floor() {
             return None;
         }
         let source_x = editor_snapshot.x_for_display_point(source, &text_layout_details);
-        let source_y = line_height * (source.row().as_f64() - scroll_top) as f32;
+        // SUZURI: Popovers and other pixel-position consumers must track styled row heights.
+        let source_y =
+            editor_snapshot.visual_viewport_y(source.row().as_f64(), scroll_top, line_height);
         Some(gpui::Point::new(source_x, source_y))
     }
 
