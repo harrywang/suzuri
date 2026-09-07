@@ -131,11 +131,11 @@
   // Markdown live preview settings
   "markdown_live_preview": {
     // Whether to render markdown inline in the editor (Obsidian-style live
-    // preview): syntax markers are hidden, and elements like headings,
-    // tables, and images are rendered, except on lines the cursor is on.
+    // preview): syntax markers are hidden until editing. Headings retain
+    // their typography while editing; tables and images use inline widgets.
     "enabled": true,
-    // Heading typography. Font sizes are rem units relative to the editor's
-    // base font size; weights use CSS values from 100 to 900.
+    // Heading typography. Font sizes multiply the editor's base font size;
+    // weights use CSS values from 100 to 900.
     "heading_styles": {
       "h1": { "font_size": 1.6, "font_weight": 900 },
       "h2": { "font_size": 1.4, "font_weight": 800 },
