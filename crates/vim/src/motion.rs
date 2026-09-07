@@ -727,6 +727,18 @@ impl Vim {
         }
 
         let count = Vim::take_count(cx);
+        // SUZURI: Resolve editable replacement widgets before the motion maps its source row to display coordinates.
+        if let Motion::Up { display_lines } | Motion::Down { display_lines } = &motion {
+            let magnitude = i64::try_from(count.unwrap_or(1)).unwrap_or(i64::MAX);
+            let delta = if matches!(motion, Motion::Up { .. }) {
+                -magnitude
+            } else {
+                magnitude
+            };
+            self.update_editor(cx, |vim, editor, cx| {
+                editor.prepare_vertical_navigation(delta, *display_lines, vim.mode.is_visual(), cx);
+            });
+        }
         let forced_motion = Vim::take_forced_motion(cx);
         let active_operator = self.active_operator();
         let mut waiting_operator: Option<Operator> = None;
