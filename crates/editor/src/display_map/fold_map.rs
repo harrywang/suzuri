@@ -1054,6 +1054,21 @@ impl FoldSnapshot {
         })
     }
 
+    // SUZURI: Source selections inside display-only concealments must retain their exact endpoints.
+    pub(crate) fn is_offset_concealed<T: ToOffset>(&self, offset: T) -> bool {
+        let buffer_offset = offset.to_offset(&self.inlay_snapshot.buffer);
+        let inlay_offset = self.inlay_snapshot.to_inlay_offset(buffer_offset);
+        let (_, _, item) = self
+            .transforms
+            .find::<InlayOffset, _>((), &inlay_offset, Bias::Right);
+        item.is_some_and(|transform| {
+            transform
+                .placeholder
+                .as_ref()
+                .is_some_and(|placeholder| placeholder.is_concealment)
+        })
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn is_line_folded(&self, buffer_row: MultiBufferRow) -> bool {
         let mut inlay_point = self
