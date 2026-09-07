@@ -5661,6 +5661,7 @@ impl Editor {
         let mut edit_ranges = Vec::new();
         let mut selections = selections.iter().peekable();
         while let Some(selection) = selections.next() {
+            // SUZURI: Preserve inclusive empty-row semantics for Vim linewise operations.
             let mut rows = selection.spanned_rows(include_end_if_at_line_start, &display_map);
 
             // Accumulate contiguous regions of rows that we want to delete.

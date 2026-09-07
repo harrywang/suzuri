@@ -2337,6 +2337,7 @@ impl DisplaySnapshot {
                 tree_sitter: false,
                 diagnostics: false,
             },
+            // SUZURI: Highlight runs must use the scaled row style too.
             &editor_style,
         ) {
             line.push_str(chunk.text);
