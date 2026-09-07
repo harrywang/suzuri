@@ -262,3 +262,21 @@ async fn test_native_heading_unicode_and_inline_markup(cx: &mut gpui::TestAppCon
     cx.simulate_keystrokes("u");
     assert_eq!(cx.buffer_text(), "above\n## **Κύριε** мир 🌿\nbody");
 }
+
+#[gpui::test]
+async fn test_native_heading_search_visual_yank(cx: &mut gpui::TestAppContext) {
+    let mut cx = markdown_context(cx, "ˇabove\n## Heading\nbody").await;
+    cx.simulate_keystrokes("/ H e a d i n g enter");
+    cx.executor().run_until_parked();
+    cx.simulate_keystrokes("shift-v y p");
+    assert_eq!(cx.buffer_text(), "above\n## Heading\n## Heading\nbody");
+}
+
+#[gpui::test]
+async fn test_native_heading_search_visual_change(cx: &mut gpui::TestAppContext) {
+    let mut cx = markdown_context(cx, "ˇabove\n## Heading\nbody").await;
+    cx.simulate_keystrokes("/ H e a d i n g enter");
+    cx.executor().run_until_parked();
+    cx.simulate_keystrokes("shift-v c n e w escape");
+    assert_eq!(cx.buffer_text(), "above\nnew\nbody");
+}
