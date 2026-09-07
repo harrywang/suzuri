@@ -8,6 +8,10 @@
   - [Uninstall](./uninstall.md)
 - [Troubleshooting](./troubleshooting.md)
 
+# Writing with Suzuri
+
+- [Citations from Zotero](./suzuri-zotero.md)
+
 # Working with Code
 
 - [Windows & Projects](./windows-and-projects.md)

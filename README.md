@@ -48,6 +48,10 @@ Or build from source, the same way Zed builds:
 - [Building for Linux](./docs/src/development/linux.md)
 - [Building for Windows](./docs/src/development/windows.md)
 
+## Citations from Zotero
+
+Keep a Zotero collection exported as a `.bib` file inside your project with Better BibTeX. Suzuri picks up changes and provides `[@key]` completion, reference hover cards, and unresolved-key highlighting. Follow the [Zotero citation setup guide](./docs/src/suzuri-zotero.md) for the steps, a small example, and troubleshooting.
+
 ## Testbed Data
 
 [suzuri-testbed](https://github.com/harrywang/suzuri-testbed) is a companion vault of test data for exercising Suzuri by hand. Each folder targets one rendering surface — markdown live preview (including image reloading), Python REPL and notebook execution, LaTeX and Typst preview, and the PDF viewer — and several fixtures are self-checking notes with a checklist at the top, so you can open them and verify behavior by eye. Clone it and open the folder in Suzuri to smoke-test a build or reproduce a rendering bug against known fixtures.
