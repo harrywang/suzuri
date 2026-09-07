@@ -141,9 +141,11 @@ impl Editor {
         if let Some(last_bounds) = self.expect_bounds_change.take()
             && scroll_position.y != 0.
         {
-            let adjusted_visual_y = display_map.visual_y_for_row(scroll_position.y)
-                + ScrollOffset::from((bounds.top() - last_bounds.top()) / line_height);
-            scroll_position.y = display_map.row_for_visual_y(adjusted_visual_y.max(0.0));
+            // SUZURI: Native line typography must share row geometry with editor input and painting.
+            scroll_position.y = display_map.row_after_visual_offset(
+                scroll_position.y,
+                ScrollOffset::from((bounds.top() - last_bounds.top()) / line_height),
+            );
         }
         if scroll_position.y > max_scroll_top {
             scroll_position.y = max_scroll_top;
@@ -166,6 +168,7 @@ impl Editor {
             self.highlighted_display_row_for_autoscroll(&display_map)
         {
             target_point = DisplayPoint::new(first_highlighted_row, 0);
+            // SUZURI: Native line typography must share row geometry with editor input and painting.
             target_top = display_map.visual_y_for_row(target_point.row().as_f64());
             target_bottom = display_map.visual_y_for_row(target_point.row().next_row().as_f64());
         } else {
@@ -175,6 +178,7 @@ impl Editor {
                 .first::<Point>(&display_map)
                 .head()
                 .to_display_point(&display_map);
+            // SUZURI: Native line typography must share row geometry with editor input and painting.
             target_top = display_map.visual_y_for_row(target_point.row().as_f64());
             target_bottom = display_map.visual_y_for_row(
                 self.selections
@@ -198,6 +202,7 @@ impl Editor {
                     .newest::<Point>(&display_map)
                     .head()
                     .to_display_point(&display_map);
+                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 target_top = display_map.visual_y_for_row(target_point.row().as_f64());
                 target_bottom =
                     display_map.visual_y_for_row(target_point.row().next_row().as_f64());
@@ -226,6 +231,7 @@ impl Editor {
         };
         if let Autoscroll::Strategy(_, Some(anchor)) = autoscroll {
             target_point = anchor.to_display_point(&display_map);
+            // SUZURI: Native line typography must share row geometry with editor input and painting.
             target_top = display_map.visual_y_for_row(target_point.row().as_f64());
             target_bottom = display_map.visual_y_for_row(target_point.row().next_row().as_f64());
         }
@@ -238,6 +244,7 @@ impl Editor {
                 let margin = margin.min(self.scroll_manager.vertical_scroll_margin);
                 let target_top = (target_top - margin - visible_sticky_headers as f64).max(0.0);
                 let target_bottom = target_bottom + margin;
+                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 let start_row = display_map.visual_y_for_row(scroll_position.y);
                 let end_row = start_row + visible_lines;
 
@@ -257,6 +264,7 @@ impl Editor {
                 }
             }
             AutoscrollStrategy::Center => {
+                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 scroll_position.y = display_map.row_for_visual_y((target_top - margin).max(0.0));
                 self.set_scroll_position_internal(scroll_position, local, true, window, cx)
             }
