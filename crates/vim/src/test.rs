@@ -1,3 +1,5 @@
+// SUZURI: Catch source/display boundary regressions with native Markdown headings.
+mod native_markdown;
 mod neovim_backed_test_context;
 mod neovim_connection;
 mod vim_test_context;
