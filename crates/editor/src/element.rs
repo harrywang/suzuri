@@ -4883,9 +4883,9 @@ impl EditorElement {
         let hovered_diff_hunk_row = editor.read(cx).hovered_diff_hunk_row;
         let sticky_top = text_hitbox.bounds.top() + sticky_header_height;
         // SUZURI: Native line typography must share row geometry with editor input and painting.
-        let scroll_row = snapshot.row_for_visual_y(f64::from(
+        let scroll_row = snapshot.row_for_visual_y(
             scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
-        ));
+        );
 
         let mut controls = vec![];
         let mut control_bounds = vec![];
