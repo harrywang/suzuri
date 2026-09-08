@@ -65,12 +65,37 @@ jobs:
         target: [aarch64-apple-darwin, x86_64-apple-darwin]
     runs-on: macos-15
     timeout-minutes: 180
+    env:
+      # Shrink the target dir to fit hosted-runner disks, as the Linux and
+      # Windows jobs already do. Nothing consumes the debug info: Suzuri does
+      # not upload symbols to Sentry, and bundle-mac's dsymutil step tolerates
+      # a binary without them (it warns and writes an empty .dwarf).
+      CARGO_PROFILE_RELEASE_DEBUG: "false"
     steps:
       - uses: actions/checkout@v5
 
       - uses: actions/setup-node@v5
         with:
           node-version: 20
+
+      # Hosted macOS images leave roughly 40G free, and the 0.4.6 build ran
+      # out at the final link. The unused Xcode versions and simulator
+      # runtimes are the cheapest space to reclaim.
+      - name: Free disk space
+        run: |
+          df -h /
+          selected="$(cd "$(xcode-select -p)/../.." && pwd -P)"
+          [ -n "$selected" ] || { echo "could not resolve the selected Xcode"; exit 1; }
+          echo "keeping $selected"
+          for xcode in /Applications/Xcode*.app; do
+            if [ "$(cd "$xcode" && pwd -P)" != "$selected" ]; then
+              sudo rm -rf "$xcode"
+            fi
+          done
+          sudo xcrun simctl runtime delete all || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches \
+            ~/Library/Android /usr/local/share/dotnet || true
+          df -h /
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -90,6 +115,12 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: ./script/bundle-mac ${{ matrix.target }}
+
+      # Runs even when the build fails so the next disk-space failure shows
+      # how far over the limit it was, not just where it started.
+      - name: Report disk space after build
+        if: always()
+        run: df -h /
 
       - name: Rename artifact
         run: |
