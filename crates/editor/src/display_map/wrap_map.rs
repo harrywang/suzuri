@@ -128,6 +128,16 @@ impl LineFragmentBuilder {
         }
     }
 
+    /// Shaped width of `text` in the wrap font, summed per character.
+    fn text_width(&self, text: &str) -> Pixels {
+        text.chars()
+            .map(|ch| {
+                self.text_system
+                    .layout_width(self.font_id, self.font_size, ch)
+            })
+            .sum()
+    }
+
     fn replacement_width(&mut self, ch: char) -> Option<Pixels> {
         let replacement_char = replacement(ch)?;
         let width = *self
@@ -635,9 +645,17 @@ impl WrapSnapshot {
                             });
                             break;
                         } else {
-                            if let Some(width) =
-                                chunk.renderer.as_ref().and_then(|r| r.measured_width)
-                            {
+                            if let Some(renderer) = chunk.renderer.as_ref() {
+                                // SUZURI: a rendered chunk is drawn as one element, so it
+                                // must never be split across wrap rows even before its first
+                                // layout has measured it. Wrapping its text as plain
+                                // characters lets an overlong placeholder (a link label with
+                                // no spaces) be broken mid-word, and a wrap row that starts
+                                // inside a fold placeholder trips `FoldPoint::to_offset`.
+                                // Until measured, estimate the width from the text.
+                                let width = renderer
+                                    .measured_width
+                                    .unwrap_or_else(|| fragment_builder.text_width(chunk.text));
                                 line_fragments
                                     .push(gpui::LineFragment::element(width, chunk.text.len()));
                             } else {
