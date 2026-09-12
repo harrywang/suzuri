@@ -4603,3 +4603,81 @@ async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) 
         "the grid should have scrolled left: {first_cell:?} vs {container:?}"
     );
 }
+
+#[gpui::test]
+async fn test_link_label_wider_than_the_wrap_width_does_not_panic(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    // A link's label stands in for its source as the placeholder's display
+    // text, so a bare-URL label wider than the wrap width gives the wrapper
+    // no word boundary to break at. It must break before the placeholder,
+    // never inside it: a wrap row starting mid-placeholder trips the fold
+    // map's offset assertion and takes the whole app down. Bounded wrapping
+    // uses the 80-column preferred line length, which this label exceeds.
+    cx.update_editor(|editor, _, cx| {
+        editor.set_soft_wrap_mode(language::language_settings::SoftWrap::Bounded, cx)
+    });
+    let url =
+        "https://www.example.com/students/support/policies/academic-integrity/and/conduct/overview";
+    assert!(url.len() > 80 && url.len() < 128);
+    cx.set_state(&format!(
+        "ˇ\n\nPlease review [{url}]({url}) before class.\n"
+    ));
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.snapshot(window, cx);
+    });
+}
+
+#[gpui::test]
+async fn test_link_label_over_128_bytes_does_not_panic(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    // The tab map tracks a chunk's characters in a `u128` bitmap, so a
+    // placeholder whose display text exceeds 128 bytes overflows its byte
+    // range arithmetic. The label must be cut down before it becomes the
+    // placeholder's text.
+    cx.update_editor(|editor, _, cx| {
+        editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx)
+    });
+    let url = format!(
+        "https://www.example.com/{}",
+        "students/support/policies/academic-integrity/".repeat(12)
+    );
+    cx.set_state(&format!(
+        "ˇ\n\nPlease review [{url}]({url}) before class.\n"
+    ));
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.snapshot(window, cx);
+    });
+}
+
+#[gpui::test]
+async fn test_soft_wrapped_line_of_links_before_a_heading_does_not_panic(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    // Regression test for harrywang/suzuri#56: the reporter's file, verbatim.
+    // Before a link placeholder has been measured, its label was wrapped as
+    // plain characters, so a label containing spaces could be broken at one of
+    // them. The heading's replace block then summarised the wrapped text at a
+    // row boundary inside the placeholder, and the fold map's offset assertion
+    // took the app down before a window was usable.
+    cx.update_editor(|editor, _, cx| {
+        editor.set_soft_wrap_mode(language::language_settings::SoftWrap::Bounded, cx)
+    });
+    cx.set_state(concat!(
+        "- One-year house outlooks that are often mistaken for CMAs: ",
+        "[Allianz Global Investors](https://www.allianzgi.com/en/insights/outlook-and-commentary/outlook-2026), ",
+        "[Pictet](https://am.pictet.com/us/en/investment-views/multi-asset/2025/annual-outlook-for-2026), ",
+        "[Nordea](https://www.nordea.com/en/news/setting-the-plan-for-your-financial-year-2026-get-insights-from-our-local-experts), ",
+        "[Columbia Threadneedle](https://www.columbiathreadneedle.com/en/gb/intermediary/global-outlooks-2026/), ",
+        "[Goldman Sachs AM](https://am.gs.com/en-us/advisors/insights/article/investment-outlook/public-markets-2026), ",
+        "[Wellington](https://www.wellington.com/en/insights/2026-macro-outlook). ",
+        "These carry views, not full return-volatility-correlation grids.\n",
+        "\n",
+        "### Access mode per publisher\n",
+        "ˇ",
+    ));
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.snapshot(window, cx);
+    });
+}

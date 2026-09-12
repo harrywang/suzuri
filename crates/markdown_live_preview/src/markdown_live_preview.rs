@@ -1902,6 +1902,23 @@ fn request_math_render(key: MathKey, text_color: Hsla, cx: &mut App) {
     .detach();
 }
 
+/// Chunks carry their character positions in a `u128` bitmap, so the tab map
+/// assumes no chunk exceeds 128 bytes. A placeholder is emitted as a single
+/// chunk, so a label longer than that must be cut down (at a character
+/// boundary) before it becomes display text; the rendered element still
+/// shows the full label, and the measured width replaces this text's width
+/// after the first layout.
+fn placeholder_display_text(label: &SharedString) -> SharedString {
+    const MAX_CHUNK_BYTES: usize = 128;
+    if label.len() <= MAX_CHUNK_BYTES {
+        label.clone()
+    } else {
+        label[..label.floor_char_boundary(MAX_CHUNK_BYTES)]
+            .to_string()
+            .into()
+    }
+}
+
 fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPlaceholder {
     // Pure hides collapse to zero-width text; bullets and checkboxes keep the
     // default placeholder text, whose visual is replaced by the rendered
@@ -1910,7 +1927,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         InlineKind::Hide { .. } => Some(SharedString::new_static("")),
         // The label stands in for the link in the display text, so soft
         // wrapping and the cursor's column math see the width that is drawn.
-        InlineKind::Link { label, .. } => Some(label.clone()),
+        InlineKind::Link { label, .. } => Some(placeholder_display_text(label)),
         InlineKind::Bullet
         | InlineKind::Checkbox { .. }
         | InlineKind::Footnote { .. }
