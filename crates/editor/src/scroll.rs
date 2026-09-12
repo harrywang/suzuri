@@ -330,18 +330,15 @@ impl ScrollManager {
             ScrollBeyondLastLine::OnePage => scroll_top,
             ScrollBeyondLastLine::Off => {
                 if let Some(height_in_lines) = self.visible_line_count {
-                    let max_row = map.max_point().row().as_f64();
-                    scroll_top.min(max_row - height_in_lines + 1.).max(0.)
+                    // SUZURI: Native line typography must share row geometry with editor input and painting.
+                    scroll_top.min(map.max_scroll_row(height_in_lines, 0.0))
                 } else {
                     scroll_top
                 }
             }
             ScrollBeyondLastLine::VerticalScrollMargin => {
                 if let Some(height_in_lines) = self.visible_line_count {
-                    let max_row = map.max_point().row().as_f64();
-                    scroll_top
-                        .min(max_row - height_in_lines + 1. + self.vertical_scroll_margin)
-                        .max(0.)
+                    scroll_top.min(map.max_scroll_row(height_in_lines, self.vertical_scroll_margin))
                 } else {
                     scroll_top
                 }
@@ -653,7 +650,10 @@ impl Editor {
             delta.y = 0.0;
         }
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
-        let position = self.scroll_manager.scroll_position(&display_map, cx) + delta.map(f64::from);
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
+        let mut position = self.scroll_manager.scroll_position(&display_map, cx);
+        position.x += f64::from(delta.x);
+        position.y = display_map.row_after_visual_offset(position.y, f64::from(delta.y));
         self.set_scroll_position_taking_display_map(position, true, false, display_map, window, cx);
     }
 
@@ -853,11 +853,12 @@ impl Editor {
             current_position.x +=
                 f64::from(self.gutter_dimensions.margin / last_position_map.em_advance);
         }
-        let new_position = current_position
-            + point(
-                amount.columns(visible_column_count),
-                amount.lines(visible_line_count),
-            );
+        // SUZURI: Page and line scrolling measure visual height, not logical row count.
+        let snapshot = self.display_snapshot(cx);
+        let new_position = point(
+            current_position.x + amount.columns(visible_column_count),
+            snapshot.row_after_visual_offset(current_position.y, amount.lines(visible_line_count)),
+        );
         self.set_scroll_position(new_position, window, cx);
     }
 
@@ -880,17 +881,28 @@ impl Editor {
             (self.vertical_scroll_margin() as u32).min(visible_line_count as u32 / 2);
 
         let max_point = display_snapshot.max_point();
+        // SUZURI: Cursor margins must stay inside the visual viewport around tall rows.
+        let top_visual = display_snapshot.visual_y_for_row(top.row().as_f64());
         let min_row = if top.row().0 == 0 {
             DisplayRow(0)
         } else {
-            DisplayRow(top.row().0 + vertical_scroll_margin)
+            DisplayRow(
+                display_snapshot
+                    .row_for_visual_y(top_visual + vertical_scroll_margin as f64)
+                    .ceil() as u32,
+            )
         };
-        let max_row = if top.row().0 + visible_line_count as u32 >= max_point.row().0 {
+        let max_row = if top_visual + visible_line_count
+            >= display_snapshot.visual_y_for_row(max_point.row().as_f64())
+        {
             max_point.row()
         } else {
             DisplayRow(
-                (top.row().0 + visible_line_count as u32)
-                    .saturating_sub(1 + vertical_scroll_margin),
+                display_snapshot
+                    .row_for_visual_y(
+                        top_visual + visible_line_count - 1.0 - vertical_scroll_margin as f64,
+                    )
+                    .floor() as u32,
             )
         };
 
@@ -937,7 +949,9 @@ impl Editor {
 
         if let (Some(visible_lines), Some(visible_columns)) =
             (self.visible_line_count(), self.visible_column_count())
-            && newest_head.row() <= DisplayRow(screen_top.row().0 + visible_lines as u32)
+            // SUZURI: Visibility is bounded by painted height, not by the number of display rows.
+            && snapshot.visual_y_for_row(newest_head.row().as_f64())
+                <= snapshot.visual_y_for_row(screen_top.row().as_f64()) + visible_lines
         {
             let text_layout_details = self.text_layout_details(window, cx);
             let font_id = text_layout_details

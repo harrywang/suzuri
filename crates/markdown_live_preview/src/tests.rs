@@ -3775,6 +3775,186 @@ async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) 
 // behavior of its own. They exist so an upstream merge that changes those
 // semantics fails here, loudly, instead of silently degrading live preview.
 
+/// Live preview relies on editor line styles changing vertical geometry without
+/// changing logical row identity. If those coordinate transforms diverge, headings
+/// render at the right size while cursors, hit-testing, and scrolling use the wrong row.
+#[gpui::test]
+async fn test_line_style_row_geometry_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇheading\nbody");
+    cx.executor().run_until_parked();
+
+    let style = editor::display_map::LineStyle {
+        font_scale: 1.25,
+        line_height: 1.5,
+    };
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor.style_lines(
+            HighlightKey::MarkdownLivePreview(usize::MAX),
+            vec![
+                snapshot.anchor_before(MultiBufferOffset(0))
+                    ..snapshot.anchor_after(MultiBufferOffset("heading".len())),
+            ],
+            style,
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+
+    cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        assert_eq!(
+            display.line_style_for_row(editor::display_map::DisplayRow(0)),
+            Some(style)
+        );
+        assert!((display.visual_y_for_row(1.0) - 1.5).abs() <= 0.0001);
+        assert!((display.visual_y_for_row(2.0) - 2.5).abs() <= 0.0001);
+        assert!((display.row_for_visual_y(0.75) - 0.5).abs() <= 0.0001);
+        assert!((display.row_for_visual_y(1.5) - 1.0).abs() <= 0.0001);
+        assert_eq!(
+            display.visual_line_height(editor::display_map::DisplayRow(0), gpui::px(20.0)),
+            gpui::px(30.0)
+        );
+        assert!((display.row_after_visual_offset(0.5, 0.75) - 1.0).abs() <= 0.0001);
+        assert!((display.max_scroll_row(1.0, 0.0) - 1.0).abs() <= 0.0001);
+    });
+}
+
+#[gpui::test]
+async fn test_line_style_text_and_pixel_geometry_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇheading\nheading");
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        editor.style_lines(
+            HighlightKey::MarkdownLivePreview(usize::MAX),
+            vec![buffer.anchor_before(Point::new(0, 0))..buffer.anchor_after(Point::new(0, 7))],
+            editor::display_map::LineStyle {
+                font_scale: 1.5,
+                line_height: 2.0,
+            },
+            cx,
+        );
+        let snapshot = editor.snapshot(window, cx);
+        let details = editor.text_layout_details(window, cx);
+        let base_height = editor
+            .style(cx)
+            .text
+            .line_height_in_pixels(window.rem_size());
+        let point =
+            |row, column| editor::DisplayPoint::new(editor::display_map::DisplayRow(row), column);
+        let plain_x = snapshot.x_for_display_point(point(1, 7), &details);
+        let scaled_x = snapshot.x_for_display_point(point(0, 7), &details);
+        assert!(
+            (scaled_x - plain_x * 1.5).abs() < gpui::px(0.1),
+            "scaled text has unscaled movement geometry"
+        );
+        let pixels = editor
+            .display_to_pixel_point(point(1, 0), &snapshot, window, cx)
+            .unwrap();
+        assert!(
+            (pixels.y - base_height * 2.0).abs() < gpui::px(0.1),
+            "pixel lookup ignores the preceding styled row"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_invalid_line_style_preserves_valid_geometry_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇheading\nbody");
+    cx.update_editor(|editor, _, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        let ranges =
+            vec![buffer.anchor_before(Point::new(0, 0))..buffer.anchor_after(Point::new(0, 7))];
+        let key = HighlightKey::MarkdownLivePreview(usize::MAX);
+        let valid = editor::display_map::LineStyle {
+            font_scale: 1.5,
+            line_height: 2.0,
+        };
+        editor.style_lines(key, ranges.clone(), valid, cx);
+        for value in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            for style in [
+                editor::display_map::LineStyle {
+                    font_scale: value,
+                    ..valid
+                },
+                editor::display_map::LineStyle {
+                    line_height: value,
+                    ..valid
+                },
+            ] {
+                editor.style_lines(key, ranges.clone(), style, cx);
+                let display = editor.display_snapshot(cx);
+                assert_eq!(
+                    display.line_style_for_row(editor::display_map::DisplayRow(0)),
+                    Some(valid)
+                );
+                assert_eq!(display.visual_y_for_row(1.0), 2.0);
+            }
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_line_style_scroll_distance_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(&format!("ˇheading\n{}", "body\n".repeat(100)));
+    cx.update_editor(|editor, _, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        editor.style_lines(
+            HighlightKey::MarkdownLivePreview(usize::MAX),
+            vec![buffer.anchor_before(Point::new(0, 0))..buffer.anchor_after(Point::new(0, 7))],
+            editor::display_map::LineStyle {
+                font_scale: 1.5,
+                line_height: 2.0,
+            },
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.set_scroll_position(gpui::point(0.0, 0.0), window, cx);
+        editor.scroll_screen(&editor::scroll::ScrollAmount::Line(1.0), window, cx);
+        assert!((editor.scroll_position(cx).y - 0.5).abs() < 0.001);
+        editor.scroll_screen(&editor::scroll::ScrollAmount::Line(-1.0), window, cx);
+        assert!(editor.scroll_position(cx).y.abs() < 0.001);
+    });
+}
+
+#[gpui::test]
+async fn test_concealed_source_selection_with_unrelated_fold_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇabove\n**text**\nfold start\nfold end");
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        editor.set_concealments(
+            std::any::TypeId::of::<EditorTestContext>(),
+            vec![editor::display_map::Concealment {
+                range: buffer.anchor_before(Point::new(1, 0))
+                    ..buffer.anchor_after(Point::new(1, 2)),
+                placeholder: editor::display_map::FoldPlaceholder {
+                    collapsed_text: Some("".into()),
+                    ..Default::default()
+                },
+                content_key: 0,
+            }],
+            cx,
+        );
+        editor.fold_ranges(vec![Point::new(2, 0)..Point::new(3, 8)], false, window, cx);
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(1, 0)..Point::new(1, 8)]);
+        });
+        let snapshot = editor.display_snapshot(cx);
+        let selection = editor.selections.newest::<Point>(&snapshot);
+        assert_eq!(selection.start, Point::new(1, 0));
+        assert_eq!(selection.end, Point::new(1, 8));
+    });
+}
+
 /// Live preview's text decorations all hang off `HighlightKey::MarkdownLivePreview`,
 /// keyed per decoration kind. Highlights written under one key must not be
 /// disturbed when another key is cleared, or disabling one decoration would

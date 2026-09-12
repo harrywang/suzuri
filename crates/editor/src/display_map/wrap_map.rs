@@ -48,6 +48,8 @@ pub struct WrapMap {
     wrap_width: Option<Pixels>,
     background_task: Option<Task<()>>,
     font_with_size: (Font, Pixels),
+    // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+    line_font_scales: Arc<HashMap<u32, f32>>,
 }
 
 #[derive(Clone)]
@@ -198,6 +200,8 @@ impl WrapMap {
         let handle = cx.new(|cx| {
             let mut this = Self {
                 font_with_size: (font, font_size),
+                // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+                line_font_scales: Arc::default(),
                 wrap_width: None,
                 pending_edits: Default::default(),
                 interpolated_edits: Default::default(),
@@ -243,6 +247,10 @@ impl WrapMap {
         );
         (self.snapshot.clone(), mem::take(&mut self.edits_since_sync))
     }
+    // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+    pub fn tab_snapshot(&self) -> &TabSnapshot {
+        &self.snapshot.tab_snapshot
+    }
 
     #[ztracing::instrument(skip_all)]
     pub fn set_font_with_size(
@@ -273,6 +281,20 @@ impl WrapMap {
         true
     }
 
+    // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+    pub fn set_line_font_scales(
+        &mut self,
+        scales: HashMap<u32, f32>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.line_font_scales.as_ref() == &scales {
+            return false;
+        }
+        self.line_font_scales = Arc::new(scales);
+        self.rewrap(cx);
+        true
+    }
+
     #[ztracing::instrument(skip_all)]
     fn rewrap(&mut self, cx: &mut Context<Self>) {
         self.background_task.take();
@@ -287,6 +309,8 @@ impl WrapMap {
             let mut fragment_builder =
                 LineFragmentBuilder::new(text_system.clone(), &font, font_size);
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
+            // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+            let line_font_scales = self.line_font_scales.clone();
             let tab_snapshot = new_snapshot.tab_snapshot.clone();
             let total_rows = tab_snapshot.max_point().row() as usize + 1;
             let range = TabPoint::zero()..tab_snapshot.max_point();
@@ -300,6 +324,8 @@ impl WrapMap {
                     tab_snapshot,
                     &tab_edits,
                     wrap_width,
+                    // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+                    &line_font_scales,
                     &mut line_wrapper,
                     &mut fragment_builder,
                 ));
@@ -312,6 +338,8 @@ impl WrapMap {
                             tab_snapshot,
                             &tab_edits,
                             wrap_width,
+                            // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+                            &line_font_scales,
                             &mut line_wrapper,
                             &mut fragment_builder,
                         )
@@ -391,6 +419,8 @@ impl WrapMap {
             let mut fragment_builder =
                 LineFragmentBuilder::new(text_system.clone(), &font, font_size);
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
+            // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+            let line_font_scales = self.line_font_scales.clone();
 
             let update_passes = pending_edits.len();
             let total_new_rows = pending_edits
@@ -405,6 +435,8 @@ impl WrapMap {
                         tab_snapshot,
                         &tab_edits,
                         wrap_width,
+                        // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+                        &line_font_scales,
                         &mut line_wrapper,
                         &mut fragment_builder,
                     ));
@@ -421,6 +453,8 @@ impl WrapMap {
                                 tab_snapshot,
                                 &tab_edits,
                                 wrap_width,
+                                // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+                                &line_font_scales,
                                 &mut line_wrapper,
                                 &mut fragment_builder,
                             )
@@ -568,6 +602,8 @@ impl WrapSnapshot {
         new_tab_snapshot: TabSnapshot,
         tab_edits: &[TabEdit],
         wrap_width: Pixels,
+        // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+        line_font_scales: &HashMap<u32, f32>,
         line_wrapper: &mut LineWrapper,
         fragment_builder: &mut LineFragmentBuilder,
     ) -> WrapPatch {
@@ -670,7 +706,11 @@ impl WrapSnapshot {
                     }
 
                     let mut prev_boundary_ix = 0;
-                    for boundary in line_wrapper.wrap_line(&line_fragments, wrap_width) {
+                    // SUZURI: Native line typography must keep wrapping aligned with scaled text.
+                    let row = edit.new_rows.start + i as u32;
+                    let scale = line_font_scales.get(&row).copied().unwrap_or(1.0);
+                    let effective_wrap_width = wrap_width / scale.max(0.01);
+                    for boundary in line_wrapper.wrap_line(&line_fragments, effective_wrap_width) {
                         let wrapped = &line[prev_boundary_ix..boundary.ix];
                         push_isomorphic(&mut edit_transforms, TextSummary::from(wrapped));
                         edit_transforms.push(Transform::wrap(boundary.next_indent));

@@ -192,11 +192,19 @@ pub enum HighlightKey {
     VimExchange,
 }
 
+// SUZURI: Native line typography must share row geometry with editor input and painting.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineStyle {
+    pub font_scale: f32,
+    pub line_height: f32,
+}
+
 pub trait ToDisplayPoint {
     fn to_display_point(&self, map: &DisplaySnapshot) -> DisplayPoint;
 }
 
 type TextHighlights = Arc<HashMap<HighlightKey, Arc<(HighlightStyle, Vec<Range<Anchor>>)>>>;
+type LineStyles = Arc<HashMap<HighlightKey, Arc<(LineStyle, Vec<Range<Anchor>>)>>>;
 type SemanticTokensHighlights =
     Arc<HashMap<BufferId, (Arc<[SemanticTokenHighlight]>, Arc<HighlightStyleInterner>)>>;
 type InlayHighlights = TreeMap<HighlightKey, TreeMap<InlayId, (HighlightStyle, InlayHighlight)>>;
@@ -230,6 +238,8 @@ pub struct DisplayMap {
     block_map: BlockMap,
     /// Regions of text that should be highlighted.
     text_highlights: TextHighlights,
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    line_styles: LineStyles,
     /// Regions of inlays that should be highlighted.
     inlay_highlights: InlayHighlights,
     /// The semantic tokens from the language server.
@@ -407,6 +417,8 @@ impl DisplayMap {
             fold_placeholder,
             diagnostics_max_severity,
             text_highlights: Default::default(),
+            // SUZURI: Native line typography must share row geometry with editor input and painting.
+            line_styles: Default::default(),
             inlay_highlights: Default::default(),
             semantic_token_highlights: Default::default(),
             clip_at_line_ends: false,
@@ -653,11 +665,16 @@ impl DisplayMap {
                 .update(cx, |dm, cx| Arc::new(dm.snapshot_simple(cx)))
                 .ok()
         });
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
+        let line_style_map = Arc::new(LineStyleMap::new(&block_snapshot, &self.line_styles));
+        let visual_row_map = Arc::new(VisualRowMap::new(&block_snapshot, &line_style_map));
 
         DisplaySnapshot {
             display_map_id: self.entity_id,
             companion_display_snapshot,
             block_snapshot,
+            visual_row_map,
+            line_style_map,
             diagnostics_max_severity: self.diagnostics_max_severity,
             crease_snapshot: self.crease_map.snapshot(),
             text_highlights: self.text_highlights.clone(),
@@ -677,11 +694,16 @@ impl DisplayMap {
             .block_map
             .read(wrap_snapshot, wrap_edits, None)
             .snapshot;
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
+        let line_style_map = Arc::new(LineStyleMap::new(&block_snapshot, &self.line_styles));
+        let visual_row_map = Arc::new(VisualRowMap::new(&block_snapshot, &line_style_map));
 
         DisplaySnapshot {
             display_map_id: self.entity_id,
             companion_display_snapshot: None,
             block_snapshot,
+            visual_row_map,
+            line_style_map,
             diagnostics_max_severity: self.diagnostics_max_severity,
             crease_snapshot: self.crease_map.snapshot(),
             text_highlights: self.text_highlights.clone(),
@@ -1204,6 +1226,59 @@ impl DisplayMap {
         }
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    pub fn style_lines(
+        &mut self,
+        key: HighlightKey,
+        mut ranges: Vec<Range<Anchor>>,
+        style: LineStyle,
+        cx: &mut Context<Self>,
+    ) {
+        // SUZURI: Reject invalid metrics before wrapping, shaping, and hit testing can diverge.
+        if !style.font_scale.is_finite()
+            || style.font_scale <= 0.0
+            || !style.line_height.is_finite()
+            || style.line_height <= 0.0
+        {
+            log::error!("Ignoring invalid line style: {style:?}");
+            return;
+        }
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        ranges.sort_by(|a, b| a.start.cmp(&b.start, &snapshot));
+        Arc::make_mut(&mut self.line_styles).insert(key, Arc::new((style, ranges)));
+        let _ = self.sync_through_wrap(cx);
+        self.refresh_wrap_line_font_scales(cx);
+    }
+
+    pub fn refresh_wrap_line_font_scales(&mut self, cx: &mut Context<Self>) {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let tab_snapshot = self.wrap_map.read(cx).tab_snapshot().clone();
+        let mut scales = HashMap::default();
+        let mut entries = self.line_styles.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| **key);
+        for (_, entry) in entries {
+            let (style, ranges) = entry.as_ref();
+            for range in ranges {
+                let to_tab_row = |anchor: Anchor, bias| {
+                    let point = anchor.to_point(&snapshot);
+                    let inlay_point = tab_snapshot
+                        .fold_snapshot
+                        .inlay_snapshot
+                        .to_inlay_point(point);
+                    let fold_point = tab_snapshot.fold_snapshot.to_fold_point(inlay_point, bias);
+                    tab_snapshot.fold_point_to_tab_point(fold_point).row()
+                };
+                let start = to_tab_row(range.start, Bias::Left);
+                let end = to_tab_row(range.end, Bias::Right);
+                for row in start..=end {
+                    scales.entry(row).or_insert(style.font_scale);
+                }
+            }
+        }
+        self.wrap_map
+            .update(cx, |map, cx| map.set_line_font_scales(scales, cx));
+    }
+
     #[instrument(skip_all)]
     pub(crate) fn highlight_inlays(
         &mut self,
@@ -1236,6 +1311,13 @@ impl DisplayMap {
         self.text_highlights.iter()
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    pub fn line_styles(
+        &self,
+    ) -> impl Iterator<Item = (&HighlightKey, &Arc<(LineStyle, Vec<Range<Anchor>>)>)> {
+        self.line_styles.iter()
+    }
+
     pub fn all_semantic_token_highlights(
         &self,
     ) -> impl Iterator<
@@ -1251,6 +1333,8 @@ impl DisplayMap {
         let mut cleared = Arc::make_mut(&mut self.text_highlights)
             .remove(&key)
             .is_some();
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
+        cleared |= Arc::make_mut(&mut self.line_styles).remove(&key).is_some();
         cleared |= self.inlay_highlights.remove(&key).is_some();
         cleared
     }
@@ -1499,6 +1583,7 @@ impl<'a> HighlightedChunk<'a> {
                 return Some(HighlightedChunk {
                     text: invisible_text,
                     style: Some(invisible_style),
+                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     is_tab: false,
                     is_inlay,
                     replacement: match replacement(ch) {
@@ -1521,6 +1606,156 @@ impl<'a> HighlightedChunk<'a> {
         })
     }
 }
+// SUZURI: Native line typography must share row geometry with editor input and painting.
+#[derive(Clone, Copy, Debug)]
+struct VisualLineStyle {
+    start_row: DisplayRow,
+    end_row: DisplayRow,
+    style: LineStyle,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LineStyleMap {
+    spans: Vec<VisualLineStyle>,
+}
+
+impl LineStyleMap {
+    fn new(snapshot: &block_map::BlockSnapshot, styles: &LineStyles) -> Self {
+        let buffer_snapshot = snapshot.buffer_snapshot();
+        let mut entries = styles.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|(key, _)| **key);
+        let mut rows = HashMap::default();
+        for (_, entry) in entries {
+            let (style, ranges) = entry.as_ref();
+            for range in ranges {
+                let start = range.start.to_point(buffer_snapshot);
+                let end = range.end.to_point(buffer_snapshot);
+                let start_wrap = snapshot.wrap_snapshot.make_wrap_point(start, Bias::Left);
+                let end_wrap = snapshot.wrap_snapshot.make_wrap_point(end, Bias::Right);
+                let start_row = snapshot.to_block_point(start_wrap).row().0;
+                let end_row = snapshot.to_block_point(end_wrap).row().0 + 1;
+                for row in start_row..end_row {
+                    rows.entry(DisplayRow(row)).or_insert(*style);
+                }
+            }
+        }
+
+        let mut rows = rows.into_iter().collect::<Vec<_>>();
+        rows.sort_by_key(|(row, _)| *row);
+        let mut spans: Vec<VisualLineStyle> = Vec::new();
+        for (row, style) in rows {
+            if let Some(previous) = spans.last_mut()
+                && previous.end_row == row
+                && previous.style == style
+            {
+                previous.end_row = row.next_row();
+            } else {
+                spans.push(VisualLineStyle {
+                    start_row: row,
+                    end_row: row.next_row(),
+                    style,
+                });
+            }
+        }
+        Self { spans }
+    }
+
+    fn style_for_row(&self, row: DisplayRow) -> Option<LineStyle> {
+        let index = self
+            .spans
+            .partition_point(|span| span.start_row <= row)
+            .checked_sub(1)?;
+        let span = self.spans.get(index)?;
+        (row < span.end_row).then_some(span.style)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct VisualRowMap {
+    blocks: Vec<VisualBlock>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VisualBlock {
+    start_row: f64,
+    end_row: f64,
+    start_y: f64,
+    end_y: f64,
+    cumulative_delta_after: f64,
+}
+
+impl VisualRowMap {
+    fn new(_snapshot: &block_map::BlockSnapshot, line_styles: &LineStyleMap) -> Self {
+        let mut extents: Vec<(f64, f64, f64)> = Vec::new();
+        for span in &line_styles.spans {
+            let visual_rows = span.style.line_height as f64;
+            if !visual_rows.is_finite() || visual_rows <= 0.0 || visual_rows == 1.0 {
+                continue;
+            }
+            extents.extend(
+                (span.start_row.0..span.end_row.0).map(|row| (row as f64, 1.0, visual_rows)),
+            );
+        }
+        extents.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+        let mut cumulative_delta = 0.0;
+        let mut previous_end = 0.0;
+        let mut blocks = Vec::with_capacity(extents.len());
+        for (start_row, logical_rows, visual_rows) in extents {
+            if start_row < previous_end {
+                continue;
+            }
+            let end_row = start_row + logical_rows;
+            let start_y = start_row + cumulative_delta;
+            let end_y = start_y + visual_rows;
+            cumulative_delta += visual_rows - logical_rows;
+            blocks.push(VisualBlock {
+                start_row,
+                end_row,
+                start_y,
+                end_y,
+                cumulative_delta_after: cumulative_delta,
+            });
+            previous_end = end_row;
+        }
+        Self { blocks }
+    }
+
+    fn visual_y_for_row(&self, row: f64) -> f64 {
+        let block_index = self.blocks.partition_point(|block| block.start_row < row);
+        let Some(block) = block_index
+            .checked_sub(1)
+            .and_then(|index| self.blocks.get(index))
+        else {
+            return row;
+        };
+        if row < block.end_row {
+            let progress = (row - block.start_row) / (block.end_row - block.start_row);
+            block.start_y + progress * (block.end_y - block.start_y)
+        } else {
+            row + block.cumulative_delta_after
+        }
+    }
+
+    fn row_for_visual_y(&self, target_y: f64) -> f64 {
+        let target_y = target_y.max(0.0);
+        let block_index = self
+            .blocks
+            .partition_point(|block| block.start_y < target_y);
+        let Some(block) = block_index
+            .checked_sub(1)
+            .and_then(|index| self.blocks.get(index))
+        else {
+            return target_y;
+        };
+        if target_y < block.end_y {
+            let progress = (target_y - block.start_y) / (block.end_y - block.start_y);
+            block.start_row + progress * (block.end_row - block.start_row)
+        } else {
+            target_y - block.cumulative_delta_after
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct DisplaySnapshot {
@@ -1528,6 +1763,9 @@ pub struct DisplaySnapshot {
     pub companion_display_snapshot: Option<Arc<DisplaySnapshot>>,
     pub crease_snapshot: CreaseSnapshot,
     block_snapshot: BlockSnapshot,
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    visual_row_map: Arc<VisualRowMap>,
+    line_style_map: Arc<LineStyleMap>,
     text_highlights: TextHighlights,
     inlay_highlights: InlayHighlights,
     semantic_token_highlights: SemanticTokensHighlights,
@@ -1541,6 +1779,57 @@ pub struct DisplaySnapshot {
 }
 
 impl DisplaySnapshot {
+    pub fn visual_y_for_row(&self, row: f64) -> f64 {
+        self.visual_row_map.visual_y_for_row(row)
+    }
+
+    pub fn row_for_visual_y(&self, y: f64) -> f64 {
+        self.visual_row_map.row_for_visual_y(y)
+    }
+
+    // SUZURI: Keep row extents and scrolling in the same variable-height coordinate space.
+    pub fn visual_line_height(&self, row: DisplayRow, line_height: Pixels) -> Pixels {
+        line_height
+            * (self.visual_y_for_row(row.next_row().as_f64()) - self.visual_y_for_row(row.as_f64()))
+                as f32
+    }
+
+    pub fn row_after_visual_offset(&self, row: f64, offset: f64) -> f64 {
+        self.row_for_visual_y(self.visual_y_for_row(row) + offset)
+    }
+
+    pub fn max_scroll_row(&self, visible_rows: f64, margin: f64) -> f64 {
+        self.row_for_visual_y(
+            self.visual_y_for_row(self.max_point().row().next_row().as_f64()) - visible_rows
+                + margin,
+        )
+    }
+
+    // SUZURI: Movement must shape text with exactly the same scale as painting.
+    pub(crate) fn style_for_row<'a>(
+        &self,
+        row: DisplayRow,
+        style: &'a EditorStyle,
+        rem_size: Pixels,
+    ) -> Cow<'a, EditorStyle> {
+        let Some(line_style) = self.line_style_for_row(row) else {
+            return Cow::Borrowed(style);
+        };
+        let mut style = style.clone();
+        let font_size = style.text.font_size.to_pixels(rem_size);
+        let line_height = style.text.line_height_in_pixels(rem_size);
+        style.text.font_size = (font_size * line_style.font_scale).into();
+        style.text.line_height = (line_height * line_style.line_height).into();
+        Cow::Owned(style)
+    }
+
+    pub fn visual_viewport_y(&self, row: f64, scroll_row: f64, line_height: Pixels) -> Pixels {
+        line_height * (self.visual_y_for_row(row) - self.visual_y_for_row(scroll_row)) as f32
+    }
+
+    pub fn line_style_for_row(&self, row: DisplayRow) -> Option<LineStyle> {
+        self.line_style_map.style_for_row(row)
+    }
     pub fn companion_snapshot(&self) -> Option<&DisplaySnapshot> {
         self.companion_display_snapshot.as_deref()
     }
@@ -2036,6 +2325,8 @@ impl DisplaySnapshot {
             vertical_scroll_margin: _,
         }: &TextLayoutDetails,
     ) -> Arc<LineLayout> {
+        // SUZURI: Horizontal movement uses the same typography as rendered rows.
+        let editor_style = self.style_for_row(display_row, editor_style, *rem_size);
         let mut runs = Vec::new();
         let mut line = String::new();
 
@@ -2046,7 +2337,8 @@ impl DisplaySnapshot {
                 tree_sitter: false,
                 diagnostics: false,
             },
-            editor_style,
+            // SUZURI: Highlight runs must use the scaled row style too.
+            &editor_style,
         ) {
             line.push_str(chunk.text);
 
@@ -3202,6 +3494,235 @@ pub mod tests {
                 .next(),
             Some("c   ccccc")
         );
+    }
+
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    #[gpui::test]
+    fn test_fractional_line_style_visual_height_contract(cx: &mut gpui::App) {
+        init_test(cx, &|_| {});
+        let buffer = MultiBuffer::build_simple("heading\nbody", cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Helvetica"),
+                px(14.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        map.update(cx, |map, cx| {
+            map.splice_inlays(
+                &[],
+                vec![Inlay::mock_hint(
+                    0,
+                    buffer_snapshot.anchor_after(MultiBufferOffset(4)),
+                    " hint ",
+                )],
+                cx,
+            );
+        });
+        let key = HighlightKey::MarkdownLivePreview(0);
+        map.update(cx, |map, cx| {
+            map.style_lines(
+                key,
+                vec![
+                    buffer_snapshot.anchor_before(Point::new(0, 0))
+                        ..buffer_snapshot.anchor_after(Point::new(0, 7)),
+                ],
+                LineStyle {
+                    font_scale: 1.6,
+                    line_height: 1.35,
+                },
+                cx,
+            );
+        });
+        let lower_priority_key = HighlightKey::MarkdownLivePreview(1);
+        map.update(cx, |map, cx| {
+            map.style_lines(
+                lower_priority_key,
+                vec![
+                    buffer_snapshot.anchor_before(Point::new(0, 0))
+                        ..buffer_snapshot.anchor_after(Point::new(0, 7)),
+                ],
+                LineStyle {
+                    font_scale: 2.0,
+                    line_height: 2.0,
+                },
+                cx,
+            );
+        });
+
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        let close = |left: f64, right: f64| (left - right).abs() < 0.0001;
+        assert_eq!(
+            snapshot.line_style_for_row(DisplayRow(0)),
+            Some(LineStyle {
+                font_scale: 1.6,
+                line_height: 1.35,
+            })
+        );
+        assert!(close(snapshot.visual_y_for_row(0.0), 0.0));
+        assert!(close(snapshot.visual_y_for_row(1.0), 1.35));
+        assert!(close(snapshot.visual_y_for_row(2.0), 2.35));
+        assert!(close(snapshot.row_for_visual_y(0.675), 0.5));
+        assert!(close(snapshot.row_for_visual_y(1.35), 1.0));
+
+        map.update(cx, |map, _| {
+            map.clear_highlights(key);
+        });
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        assert_eq!(
+            snapshot.line_style_for_row(DisplayRow(0)),
+            Some(LineStyle {
+                font_scale: 2.0,
+                line_height: 2.0,
+            })
+        );
+        assert!(close(snapshot.visual_y_for_row(1.0), 2.0));
+
+        map.update(cx, |map, _| {
+            map.clear_highlights(lower_priority_key);
+        });
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        assert!(close(snapshot.visual_y_for_row(1.0), 1.0));
+        assert_eq!(snapshot.line_style_for_row(DisplayRow(0)), None);
+    }
+
+    #[gpui::test]
+    fn test_thousand_styled_rows_stress(cx: &mut gpui::App) {
+        init_test(cx, &|_| {});
+        let text = (0..1000)
+            .map(|row| format!("heading {row}\n"))
+            .collect::<String>();
+        let buffer = MultiBuffer::build_simple(&text, cx);
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let ranges = (0..1000)
+            .map(|row| {
+                let end_column = buffer_snapshot.line_len(MultiBufferRow(row));
+                buffer_snapshot.anchor_before(Point::new(row, 0))
+                    ..buffer_snapshot.anchor_after(Point::new(row, end_column))
+            })
+            .collect::<Vec<_>>();
+        let map = cx.new(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Helvetica"),
+                px(14.0),
+                None,
+                1,
+                1,
+                FoldPlaceholder::test(),
+                DiagnosticSeverity::Warning,
+                cx,
+            )
+        });
+        map.update(cx, |map, cx| {
+            map.style_lines(
+                HighlightKey::MarkdownLivePreview(0),
+                ranges,
+                LineStyle {
+                    font_scale: 1.4,
+                    line_height: 1.35,
+                },
+                cx,
+            );
+        });
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        let started = std::time::Instant::now();
+        let mut checksum = 0.0;
+        for step in 0..200_000 {
+            let row = (step % 10_000) as f64 / 10.0;
+            let visual_y = snapshot.visual_y_for_row(row);
+            checksum += snapshot.row_for_visual_y(visual_y);
+        }
+        eprintln!(
+            "200000 visual-row round trips across 1000 styled rows: {:?}",
+            started.elapsed()
+        );
+        assert!(checksum.is_finite());
+        assert!((snapshot.visual_y_for_row(1000.0) - 1350.0).abs() <= 0.0001);
+    }
+
+    #[test]
+    fn test_visual_row_map_multiple_blocks_and_boundaries() {
+        let map = VisualRowMap {
+            blocks: vec![
+                VisualBlock {
+                    start_row: 0.0,
+                    end_row: 1.0,
+                    start_y: 0.0,
+                    end_y: 1.25,
+                    cumulative_delta_after: 0.25,
+                },
+                VisualBlock {
+                    start_row: 9.0,
+                    end_row: 10.0,
+                    start_y: 9.25,
+                    end_y: 10.0,
+                    cumulative_delta_after: 0.0,
+                },
+            ],
+        };
+        let close = |left: f64, right: f64| (left - right).abs() < 0.0001;
+
+        assert!(close(map.visual_y_for_row(0.0), 0.0));
+        assert!(close(map.visual_y_for_row(0.5), 0.625));
+        assert!(close(map.visual_y_for_row(1.0), 1.25));
+        assert!(close(map.visual_y_for_row(9.0), 9.25));
+        assert!(close(map.visual_y_for_row(9.5), 9.625));
+        assert!(close(map.visual_y_for_row(10.0), 10.0));
+        assert!(close(map.row_for_visual_y(0.625), 0.5));
+        assert!(close(map.row_for_visual_y(1.25), 1.0));
+        assert!(close(map.row_for_visual_y(9.25), 9.0));
+        assert!(close(map.row_for_visual_y(9.625), 9.5));
+        assert!(close(map.row_for_visual_y(10.0), 10.0));
+        assert!(close(map.row_for_visual_y(-1.0), 0.0));
+
+        for step in 0..=80 {
+            let row = step as f64 / 8.0;
+            assert!(
+                close(map.row_for_visual_y(map.visual_y_for_row(row)), row),
+                "coordinate round trip failed at row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_visual_row_map_thousand_block_stress() {
+        let mut cumulative_delta = 0.0;
+        let blocks = (0..1000)
+            .map(|row| {
+                let start_row = row as f64;
+                let visual_rows = if row % 2 == 0 { 1.25 } else { 0.75 };
+                let start_y = start_row + cumulative_delta;
+                let end_y = start_y + visual_rows;
+                cumulative_delta += visual_rows - 1.0;
+                VisualBlock {
+                    start_row,
+                    end_row: start_row + 1.0,
+                    start_y,
+                    end_y,
+                    cumulative_delta_after: cumulative_delta,
+                }
+            })
+            .collect();
+        let map = VisualRowMap { blocks };
+        let started = std::time::Instant::now();
+        let mut checksum = 0.0;
+        for step in 0..200_000 {
+            let row = (step % 10_000) as f64 / 10.0;
+            let visual_y = map.visual_y_for_row(row);
+            checksum += map.row_for_visual_y(visual_y);
+        }
+        let elapsed = started.elapsed();
+        eprintln!("200000 visual-row round trips across 1000 blocks: {elapsed:?}");
+        assert!(checksum.is_finite());
+        assert!((map.visual_y_for_row(1000.0) - 1000.0).abs() < 0.0001);
     }
 
     #[gpui::test]

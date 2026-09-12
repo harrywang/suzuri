@@ -1260,15 +1260,32 @@ where
 {
     // Transforms `Anchor -> DisplayPoint -> Point -> DisplayPoint -> D`
     // todo(lw): We should be able to short circuit the `Anchor -> DisplayPoint -> Point` to `Anchor -> Point`
-    let (to_convert, selections) = resolve_selections_display(selections, map).tee();
-    let mut converted_endpoints =
-        map.buffer_snapshot()
-            .dimensions_from_points::<D>(to_convert.flat_map(|s| {
-                let start = map.display_point_to_point(s.start, Bias::Left);
-                let end = map.display_point_to_point(s.end, Bias::Right);
-                assert!(start <= end, "start: {:?}, end: {:?}", start, end);
-                [start, end]
-            }));
+    // SUZURI: A real fold elsewhere must not make a concealment swallow source selection endpoints.
+    let points = selections.into_iter().flat_map(move |source| {
+        resolve_selections_display(Some(source), map).map(move |display| {
+            let start = if map.fold_snapshot().is_offset_concealed(source.start) {
+                source.start.to_point(map.buffer_snapshot())
+            } else {
+                map.display_point_to_point(display.start, Bias::Left)
+            };
+            let end = if map.fold_snapshot().is_offset_concealed(source.end) {
+                source.end.to_point(map.buffer_snapshot())
+            } else {
+                map.display_point_to_point(display.end, Bias::Right)
+            };
+            Selection {
+                id: display.id,
+                start,
+                end,
+                reversed: display.reversed,
+                goal: display.goal,
+            }
+        })
+    });
+    let (to_convert, selections) = coalesce_selections(points).tee();
+    let mut converted_endpoints = map.buffer_snapshot().dimensions_from_points::<D>(
+        to_convert.flat_map(|selection| [selection.start, selection.end]),
+    );
     selections.map(move |s| {
         let start = converted_endpoints.next().unwrap();
         let end = converted_endpoints.next().unwrap();
