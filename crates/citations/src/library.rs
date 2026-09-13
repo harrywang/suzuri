@@ -78,7 +78,10 @@ pub async fn append_entry(
                     .await
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
-            fs.atomic_write(path.to_path_buf(), text)
+            // Not `atomic_write`: that goes through a private temp file and
+            // leaves the library at mode 0600, which surprises anything else
+            // that shares the vault.
+            fs.write(path, text.as_bytes())
                 .await
                 .with_context(|| format!("writing {}", path.display()))?;
             Ok(true)

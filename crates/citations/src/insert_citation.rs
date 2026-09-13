@@ -249,8 +249,13 @@ impl Candidate {
                 parts.push(format!("in vault as @{}", entry.key));
             }
             Self::Zotero(item) => {
+                // A preprint can list eighty authors; the first few identify it.
                 if !item.creators.is_empty() {
-                    parts.push(item.creators.join(", "));
+                    let mut authors = item.creators.iter().take(3).cloned().collect::<Vec<_>>();
+                    if item.creators.len() > 3 {
+                        authors.push("et al.".to_string());
+                    }
+                    parts.push(authors.join(", "));
                 }
                 parts.extend(item.year());
                 parts.push("Zotero".to_string());
@@ -630,7 +635,7 @@ impl PickerDelegate for CitationPickerDelegate {
                             Label::new(found.candidate.detail())
                                 .size(LabelSize::Small)
                                 .color(Color::Muted)
-                                .truncate_start(),
+                                .truncate(),
                         ),
                 ),
         )
