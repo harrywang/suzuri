@@ -38,6 +38,9 @@ pub fn merge_entry(existing: &str, entry_source: &str, key: &str) -> Result<Merg
         .next()
         .context("the fetched BibLaTeX contains no entry")?;
     entry.key = key.to_string();
+    // Zotero's export names the attachment by its absolute path on this
+    // machine; the vault keeps its own copy as `refs/<key>.pdf` instead.
+    entry.fields.remove("file");
 
     let mut text = existing.trim_end().to_string();
     if !text.is_empty() {
@@ -87,7 +90,7 @@ pub async fn append_entry(
 mod tests {
     use super::*;
 
-    const FETCHED: &str = "@article{zoteroKey_2017,\n  title = {Attention Is All You Need},\n  author = {Vaswani, Ashish},\n  date = {2017-06-12},\n}\n";
+    const FETCHED: &str = "@article{zoteroKey_2017,\n  title = {Attention Is All You Need},\n  author = {Vaswani, Ashish},\n  date = {2017-06-12},\n  file = {PDF:/Users/someone/Zotero/storage/AB12/paper.pdf:application/pdf},\n}\n";
 
     #[test]
     fn appends_under_the_minted_key_and_leaves_existing_text_alone() {
@@ -102,6 +105,10 @@ mod tests {
         );
         assert!(text.contains("@article{vaswani2017attention,"));
         assert!(!text.contains("zoteroKey_2017"));
+        assert!(
+            !text.contains("file ="),
+            "the machine-local attachment path is dropped:\n{text}"
+        );
         assert!(text.ends_with('\n'));
         let parsed = biblatex::Bibliography::parse(&text).unwrap();
         assert_eq!(parsed.len(), 2);
