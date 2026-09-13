@@ -148,6 +148,17 @@
     // note's folder. An empty string stores attachments in the note's folder.
     "attachments_folder": "attachments",
   },
+  // Citation settings
+  "citations": {
+    // The BibLaTeX file every inserted citation is recorded in, relative to
+    // the project root. Pandoc, LaTeX, Typst and the editor's own index all
+    // read it directly.
+    "library": "refs/refs.bib",
+    // Where Zotero's local API listens. Zotero must be running with
+    // Settings > Advanced > "Allow other applications on this computer to
+    // communicate with Zotero" ticked.
+    "zotero_url": "http://127.0.0.1:23119",
+  },
   // Live Typst and LaTeX preview settings
   "typeset_preview": {
     // Which engine compiles .tex files.

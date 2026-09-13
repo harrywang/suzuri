@@ -244,6 +244,9 @@ pub struct SettingsContent {
     /// The settings for markdown live preview in the editor.
     pub markdown_live_preview: Option<MarkdownLivePreviewSettingsContent>,
 
+    /// The settings for inserting citations from Zotero into the vault library.
+    pub citations: Option<CitationsSettingsContent>,
+
     /// The settings for live Typst and LaTeX preview.
     pub typeset_preview: Option<TypesetPreviewSettingsContent>,
 
@@ -409,7 +412,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         // SUZURI: the fork's own settings sections must be listed here too.
-        markdown_live_preview, typeset_preview,
+        markdown_live_preview, typeset_preview, citations,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
@@ -1357,6 +1360,22 @@ pub struct MarkdownLivePreviewSettingsContent {
     ///
     /// Default: "attachments"
     pub attachments_folder: Option<String>,
+}
+
+/// The settings for inserting citations from Zotero into the vault library.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct CitationsSettingsContent {
+    /// The BibLaTeX file every inserted citation is recorded in, relative to
+    /// the project root. Pandoc, LaTeX, Typst and the editor's own index all
+    /// read it directly.
+    ///
+    /// Default: "refs/refs.bib"
+    pub library: Option<String>,
+    /// Where Zotero's local API listens.
+    ///
+    /// Default: "http://127.0.0.1:23119"
+    pub zotero_url: Option<String>,
 }
 
 /// The settings for live Typst and LaTeX preview.

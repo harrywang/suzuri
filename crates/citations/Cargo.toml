@@ -24,14 +24,28 @@ gpui.workspace = true
 http_client.workspace = true
 language.workspace = true
 log.workspace = true
+picker.workspace = true
 project.workspace = true
 reqwest.workspace = true
 reqwest_client.workspace = true
 serde_json.workspace = true
+settings.workspace = true
 text.workspace = true
+theme.workspace = true
+ui.workspace = true
 urlencoding.workspace = true
 util.workspace = true
+workspace.workspace = true
 
 [dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 http_client = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+theme = { workspace = true, features = ["test-support"] }
+theme_settings.workspace = true
+util = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
