@@ -12,6 +12,7 @@ mod bibliography;
 mod insert_citation;
 mod keys;
 mod library;
+mod render;
 mod zotero;
 
 pub use bibliography::{
@@ -21,6 +22,10 @@ pub use bibliography::{
 pub use insert_citation::{CitationFormat, CitationPicker, InsertCitation, choose_key};
 pub use keys::{disambiguate, is_portable_key, mint_key};
 pub use library::{DEFAULT_LIBRARY_PATH, Merge, append_entry, merge_entry};
+pub use render::{
+    CslStyle, DEFAULT_STYLE, RenderedReference, document_style, render_bibliography,
+    render_reference, style_named,
+};
 pub use zotero::{DEFAULT_BASE_URL, ZoteroClient, ZoteroError, ZoteroItem, ZoteroStatus};
 
 pub(crate) const MARKDOWN: &str = "Markdown";
