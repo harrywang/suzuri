@@ -1193,7 +1193,6 @@ impl EditorElement {
                     }
 
                     let x = cursor_character_x - scroll_pixel_position.x.into();
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     let y = visual_viewport_y(
                         snapshot,
                         cursor_position.row().as_f64(),
@@ -1223,7 +1222,6 @@ impl EditorElement {
                                 .into();
 
                             let bottom = text_hitbox.origin.y
-                                // SUZURI: Native line typography must share row geometry with editor input and painting.
                                 + visual_viewport_y(
                                     snapshot,
                                     cursor_position
@@ -1251,7 +1249,6 @@ impl EditorElement {
                         color: player_color.cursor,
                         block_width,
                         origin: point(x, y),
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         line_height: cursor_line_height,
                         shape: selection.cursor_shape,
                         block_text,
@@ -1718,7 +1715,6 @@ impl EditorElement {
                 let display_row = DisplayRow(start_row.0 + ix as u32);
                 let position = point(
                     gutter_dimensions.width - gutter_dimensions.right_padding,
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     visual_viewport_y(
                         snapshot,
                         display_row.as_f64(),
@@ -1781,7 +1777,6 @@ impl EditorElement {
                 } else {
                     4. * em_width
                 };
-                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 let display_row = DisplayRow(start_row.0 + ix as u32);
                 let position = point(
                     Pixels::from(scroll_pixel_position.x) + line.width + padding,
@@ -1945,7 +1940,6 @@ impl EditorElement {
                 continue;
             };
 
-            // SUZURI: Native line typography must share row geometry with editor input and painting.
             let pos_y = content_origin.y
                 + visual_viewport_y(snapshot, row.as_f64(), scroll_position.y, line_height);
 
@@ -2222,7 +2216,6 @@ impl EditorElement {
 
         let mut element = render_inline_blame_entry(entry.clone(), &self.style, cx)?;
 
-        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let start_y = content_origin.y
             + visual_viewport_y(
                 snapshot,
@@ -2425,7 +2418,6 @@ impl EditorElement {
                     cx,
                 )?;
 
-                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 let display_row = DisplayRow(start_row.0 + ix as u32);
                 let start_y = visual_viewport_y(
                     snapshot,
@@ -2599,7 +2591,6 @@ impl EditorElement {
             row_range = DisplayRow(row_range.start.0.saturating_sub(block_offset))..row_range.end;
         }
 
-        // SUZURI: Native line typography must share row geometry with editor input and painting.
         // Stop before an excerpt header at the range end.
         let mut visual_end_row = if row_range.end == cons_line {
             DisplayRow(cons_line.0 + 1)
@@ -2896,7 +2887,6 @@ impl EditorElement {
                     ))
                     .into_any_element();
 
-                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 let display_row = DisplayRow(start_row.0 + ix as u32);
                 let position = point(
                     git_gutter_width + px(1.),
@@ -3011,7 +3001,6 @@ impl EditorElement {
 
                 let segment = LineNumberSegment {
                     shaped_line,
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     line_height: row_line_height,
                     hitbox,
                 };
@@ -3300,44 +3289,28 @@ impl EditorElement {
                 })
                 .collect()
         } else {
-            let base_font_size = style.text.font_size.to_pixels(window.rem_size());
-            let base_line_height = style.text.line_height_in_pixels(window.rem_size());
-            let mut layouts = Vec::with_capacity(rows.len());
-            for (index, row) in (rows.start.0..rows.end.0).enumerate() {
-                let row = DisplayRow(row);
-                let mut row_style = style.clone();
-                if let Some(line_style) = snapshot.display_snapshot.line_style_for_row(row) {
-                    row_style.text.font_size = (base_font_size * line_style.font_scale).into();
-                    row_style.text.line_height = (base_line_height * line_style.line_height).into();
-                }
-                let use_tree_sitter = !snapshot.semantic_tokens_enabled
-                    || snapshot.use_tree_sitter_for_syntax(row, cx);
-                let language_aware = LanguageAwareStyling {
-                    tree_sitter: use_tree_sitter,
-                    diagnostics: true,
-                };
-                let chunks = snapshot.highlighted_chunks(
-                    row..row + DisplayRow(1),
-                    language_aware,
-                    &row_style,
-                );
-                layouts.extend(LineWithInvisibles::from_chunks(
-                    chunks,
-                    &row_style,
-                    MAX_LINE_LEN,
-                    1,
-                    &snapshot.mode,
-                    editor_width,
-                    |_| is_row_soft_wrapped(index),
-                    bg_segments_per_row
-                        .get(index)
-                        .map(std::slice::from_ref)
-                        .unwrap_or(&[]),
-                    window,
-                    cx,
-                ));
-            }
-            layouts
+            let use_tree_sitter = !snapshot.semantic_tokens_enabled
+                || snapshot.use_tree_sitter_for_syntax(rows.start, cx);
+            let language_aware = LanguageAwareStyling {
+                tree_sitter: use_tree_sitter,
+                diagnostics: true,
+            };
+            let chunks = snapshot.highlighted_chunks(rows.clone(), language_aware, style);
+            let rem_size = window.rem_size();
+            LineWithInvisibles::from_chunks(
+                chunks,
+                |index| {
+                    snapshot.style_for_row(rows.start + DisplayRow(index as u32), style, rem_size)
+                },
+                MAX_LINE_LEN,
+                rows.len(),
+                &snapshot.mode,
+                editor_width,
+                is_row_soft_wrapped,
+                bg_segments_per_row,
+                window,
+                cx,
+            )
         }
     }
 
@@ -3958,7 +3931,6 @@ impl EditorElement {
                 hitbox.origin
                     + point(
                         block.x_offset,
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         visual_viewport_y(snapshot, row.as_f64(), scroll_position.y, line_height),
                     )
             } else {
@@ -4065,11 +4037,12 @@ impl EditorElement {
                 ),
                 y: cmp::max(
                     px(0.),
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     visual_viewport_y(
                         snapshot,
                         cursor.row().next_row().as_f64(),
-                        scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
+                        snapshot.row_for_visual_y(
+                            scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
+                        ),
                         line_height,
                     ),
                 ),
@@ -4242,11 +4215,12 @@ impl EditorElement {
         let target_position = content_origin
             + gpui::Point {
                 x: -gutter_overshoot,
-                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 y: visual_viewport_y(
                     snapshot,
                     gutter_row.next_row().as_f64(),
-                    scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
+                    snapshot.row_for_visual_y(
+                        scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
+                    ),
                     line_height,
                 ),
             };
@@ -4596,7 +4570,8 @@ impl EditorElement {
         let y = visual_viewport_y(
             snapshot,
             popover_position.row().as_f64(),
-            scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
+            snapshot
+                .row_for_visual_y(scroll_pixel_position.y / ScrollPixelOffset::from(line_height)),
             line_height,
         );
         let hovered_point = content_origin + point(x, y);
@@ -4882,10 +4857,8 @@ impl EditorElement {
         let diff_hunk_renderer = editor.read(cx).diff_hunk_renderer();
         let hovered_diff_hunk_row = editor.read(cx).hovered_diff_hunk_row;
         let sticky_top = text_hitbox.bounds.top() + sticky_header_height;
-        // SUZURI: Native line typography must share row geometry with editor input and painting.
-        let scroll_row = snapshot.row_for_visual_y(
-            scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
-        );
+        let scroll_row = snapshot
+            .row_for_visual_y(scroll_pixel_position.y / ScrollPixelOffset::from(line_height));
 
         let mut controls = vec![];
         let mut control_bounds = vec![];
@@ -4938,7 +4911,6 @@ impl EditorElement {
                     .iter()
                     .any(|row| row.is_some_and(|row| display_row_range.contains(&row)))
                 {
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     let hunk_start_y = text_hitbox.bounds.top()
                         + visual_viewport_y(
                             snapshot,
@@ -5048,11 +5020,11 @@ impl EditorElement {
 
         let target_x = cursor_row_layout.x_for_index(newest_selection_head.column() as usize)
             - Pixels::from(scroll_pixel_position.x);
-        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let target_y = visual_viewport_y(
             snapshot,
             selection_row.as_f64(),
-            scroll_pixel_position.y / ScrollPixelOffset::from(line_height),
+            snapshot
+                .row_for_visual_y(scroll_pixel_position.y / ScrollPixelOffset::from(line_height)),
             line_height,
         );
         let target_point = content_origin + point(target_x, target_y);
@@ -5137,7 +5109,6 @@ impl EditorElement {
 
         window.defer_draw(element, final_origin, 2, None);
     }
-    // SUZURI: Native line typography must share row geometry with editor input and painting.
 
     fn paint_background(&self, layout: &EditorLayout, window: &mut Window, cx: &mut App) {
         window.paint_layer(layout.hitbox.bounds, |window| {
@@ -5218,7 +5189,6 @@ impl EditorElement {
                         width -= layout.gutter_hitbox.size.width;
                     }
 
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     let start_y = layout
                         .position_map
                         .viewport_y_for_row(highlight_row_start.as_f64());
@@ -5406,7 +5376,6 @@ impl EditorElement {
                     let line = self.shape_line_number(shaped_line.text.clone(), color, window);
                     line.paint(
                         hitbox.origin,
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         *line_height,
                         TextAlign::Left,
                         None,
@@ -5418,7 +5387,6 @@ impl EditorElement {
                     shaped_line
                         .paint(
                             hitbox.origin,
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             *line_height,
                             TextAlign::Left,
                             None,
@@ -5604,7 +5572,6 @@ impl EditorElement {
                 if status.is_deleted() && display_row_range.is_empty() {
                     let row = display_row_range.start;
 
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     let offset = line_height / 2.;
                     let start_y =
                         visual_viewport_y(snapshot, row.as_f64(), scroll_position.y, line_height)
@@ -5641,7 +5608,6 @@ impl EditorElement {
                         })
                         .unwrap_or(end_row);
 
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     let start_y = visual_viewport_y(
                         snapshot,
                         start_row.as_f64(),
@@ -6150,7 +6116,6 @@ impl EditorElement {
                         if (hitbox.origin.along(axis)..hitbox.bottom_right().along(axis))
                             .contains(&old_position)
                         {
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             let delta =
                                 ScrollOffset::from((new_position - old_position) / *text_unit_size);
                             let position = editor.scroll_position(cx).apply_along(axis, |p| {
@@ -6210,7 +6175,6 @@ impl EditorElement {
         } else {
             window.on_mouse_event({
                 let editor = self.editor.clone();
-                // SUZURI: Native line typography must share row geometry with editor input and painting.
                 let snapshot = layout.position_map.snapshot.display_snapshot.clone();
 
                 move |event: &MouseDownEvent, phase, window, cx| {
@@ -6244,7 +6208,6 @@ impl EditorElement {
                         if event_position < thumb_bounds.origin.along(axis)
                             || thumb_bounds.bottom_right().along(axis) < event_position
                         {
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             let center_position = f64::from(
                                 (event_position - hitbox.origin.along(axis)) / *text_unit_size,
                             );
@@ -6409,7 +6372,6 @@ impl EditorElement {
                                             color,
                                         }
                                     });
-                                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                                     marker_quads.extend(scrollbar_layout.marker_quads_for_ranges(
                                         marker_row_ranges,
                                         Some(1),
@@ -6475,7 +6437,6 @@ impl EditorElement {
                                         color,
                                     }
                                 });
-                                // SUZURI: Native line typography must share row geometry with editor input and painting.
                                 marker_quads.extend(scrollbar_layout.marker_quads_for_ranges(
                                     marker_row_ranges,
                                     Some(2),
@@ -6535,7 +6496,6 @@ impl EditorElement {
                         let alignment_offset =
                             line_layout.alignment_offset(layout.text_align, layout.content_width);
                         HighlightedRangeLine {
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             line_height: layout
                                 .position_map
                                 .snapshot
@@ -7372,9 +7332,9 @@ impl fmt::Debug for LineFragment {
 }
 
 impl LineWithInvisibles {
-    fn from_chunks<'a>(
+    fn from_chunks<'a, 'style>(
         chunks: impl Iterator<Item = HighlightedChunk<'a>>,
-        editor_style: &EditorStyle,
+        style_for_row: impl Fn(usize) -> Cow<'style, EditorStyle>,
         max_line_len: usize,
         max_line_count: usize,
         editor_mode: &EditorMode,
@@ -7384,7 +7344,8 @@ impl LineWithInvisibles {
         window: &mut Window,
         cx: &mut App,
     ) -> Vec<Self> {
-        let text_style = &editor_style.text;
+        let mut row_style = style_for_row(0);
+        let mut text_style = &row_style.text;
         let mut layouts = Vec::with_capacity(max_line_count);
         let mut fragments: SmallVec<[LineFragment; 1]> = SmallVec::new();
         let mut line = String::new();
@@ -7399,9 +7360,9 @@ impl LineWithInvisibles {
         let mut non_whitespace_added = false;
         let mut row = 0;
         let mut line_exceeded_max_len = false;
-        let font_size = text_style.font_size.to_pixels(window.rem_size());
+        let mut font_size = text_style.font_size.to_pixels(window.rem_size());
         // SUZURI: Native line typography must share row geometry with editor input and painting.
-        let line_height = text_style.line_height_in_pixels(window.rem_size());
+        let mut line_height = text_style.line_height_in_pixels(window.rem_size());
         let min_contrast = EditorSettings::get_global(cx).minimum_contrast_for_highlights;
 
         let ellipsis = SharedString::from("⋯");
@@ -7534,7 +7495,6 @@ impl LineWithInvisibles {
                             fragments: mem::take(&mut fragments),
                             invisibles: std::mem::take(&mut invisibles),
                             font_size,
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             line_height,
                         });
 
@@ -7547,6 +7507,10 @@ impl LineWithInvisibles {
                         if row == max_line_count {
                             return layouts;
                         }
+                        row_style = style_for_row(row);
+                        text_style = &row_style.text;
+                        font_size = text_style.font_size.to_pixels(window.rem_size());
+                        line_height = text_style.line_height_in_pixels(window.rem_size());
                     }
 
                     if !line_chunk.is_empty() && !line_exceeded_max_len {
@@ -7712,7 +7676,6 @@ impl LineWithInvisibles {
         window: &mut Window,
         cx: &mut App,
     ) {
-        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let line_y = visual_viewport_y(snapshot, row.as_f64(), scroll_position.y, base_line_height);
         self.prepaint_with_custom_offset(
             line_height,
@@ -8432,7 +8395,6 @@ impl Element for EditorElement {
                     let visible_bottom = bounds.bottom().min(visible_bounds.bottom());
                     let clipped_top = (visible_top - bounds.top()).max(px(0.));
                     let visible_height = (visible_bottom - visible_top).max(px(0.));
-                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                     let clipped_top_in_visual_rows = f64::from(clipped_top / line_height);
                     let visible_height_in_visual_rows = f64::from(visible_height / line_height);
 
@@ -8484,7 +8446,6 @@ impl Element for EditorElement {
 
                     let mut scroll_position = snapshot.scroll_position();
                     if !line_height.is_zero() {
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         let snapped_visual_y = window.pixel_snap_f64(
                             snapshot.visual_y_for_row(scroll_position.y) * f64::from(line_height),
                         ) / f64::from(line_height);
@@ -8839,7 +8800,6 @@ impl Element for EditorElement {
                         window.with_element_namespace("expand_toggles", |window| {
                             self.layout_expand_toggles(
                                 &gutter_hitbox,
-                                // SUZURI: Native line typography must share row geometry with editor input and painting.
                                 &snapshot,
                                 gutter_dimensions,
                                 em_width,
@@ -8993,9 +8953,8 @@ impl Element for EditorElement {
                         glyph_grid_cell,
                         size(
                             longest_line_width,
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             Pixels::from(
-                                snapshot.visual_y_for_row(max_row.as_f64() + 1.0)
+                                snapshot.visual_y_for_row(max_row.as_f64())
                                     * f64::from(line_height),
                             ),
                         ),
@@ -9021,7 +8980,6 @@ impl Element for EditorElement {
 
                     let preliminary_scroll_pixel_position = point(
                         scroll_position.x * f64::from(em_layout_width),
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         snapshot.visual_y_for_row(scroll_position.y) * f64::from(line_height),
                     );
                     let indent_guides = self.layout_indent_guides(
@@ -9152,7 +9110,6 @@ impl Element for EditorElement {
 
                     let scroll_pixel_position = point(
                         scroll_position.x * f64::from(em_layout_width),
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         snapshot.visual_y_for_row(scroll_position.y) * f64::from(line_height),
                     );
                     let sticky_headers = if !is_minimap
@@ -9199,7 +9156,6 @@ impl Element for EditorElement {
                             self.prepaint_crease_trailers(
                                 crease_trailers,
                                 &line_layouts,
-                                // SUZURI: Native line typography must share row geometry with editor input and painting.
                                 &snapshot,
                                 line_height,
                                 content_origin,
@@ -9222,7 +9178,6 @@ impl Element for EditorElement {
                                 &snapshot,
                                 start_row..end_row,
                                 scroll_position.y,
-                                // SUZURI: Native line typography must share row geometry with editor input and painting.
                                 snapshot.row_after_visual_offset(
                                     scroll_position.y,
                                     height_in_visual_rows,
@@ -9244,7 +9199,6 @@ impl Element for EditorElement {
                         &line_layouts,
                         &crease_trailers,
                         &row_block_types,
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         &snapshot,
                         content_origin,
                         scroll_position,
@@ -9288,7 +9242,6 @@ impl Element for EditorElement {
                                     display_row,
                                     row_info,
                                     line_layout,
-                                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                                     &snapshot,
                                     crease_trailer_layout,
                                     em_width,
@@ -9319,7 +9272,6 @@ impl Element for EditorElement {
 
                     let blamed_display_rows = self.layout_blame_entries(
                         &row_infos,
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         &snapshot,
                         em_width,
                         scroll_position,
@@ -9333,7 +9285,6 @@ impl Element for EditorElement {
 
                     let line_elements = self.prepaint_lines(
                         start_row,
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         &snapshot,
                         &mut line_layouts,
                         line_height,
@@ -9349,7 +9300,6 @@ impl Element for EditorElement {
                             &mut blocks,
                             &hitbox,
                             &gutter_hitbox,
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             &snapshot,
                             line_height,
                             scroll_position,
@@ -9362,7 +9312,6 @@ impl Element for EditorElement {
                             &mut spacer_blocks,
                             &hitbox,
                             &gutter_hitbox,
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             &snapshot,
                             line_height,
                             scroll_position,
@@ -9467,7 +9416,6 @@ impl Element for EditorElement {
                                     style,
                                     window,
                                     cx,
-                                    // SUZURI: Native line typography must share row geometry with editor input and painting.
                                     &snapshot,
                                 )
                             } else {
@@ -9483,7 +9431,6 @@ impl Element for EditorElement {
                         content_origin,
                         right_margin,
                         scroll_pixel_position,
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         &snapshot,
                         gutter_dimensions.width - gutter_dimensions.left_padding,
                         window,
@@ -9603,7 +9550,6 @@ impl Element for EditorElement {
                         newest_selection_head,
                         start_row,
                         &line_layouts,
-                        // SUZURI: Native line typography must share row geometry with editor input and painting.
                         &snapshot,
                         line_height,
                         em_width,
@@ -9641,7 +9587,6 @@ impl Element for EditorElement {
                     window.with_element_namespace("crease_toggles", |window| {
                         self.prepaint_crease_toggles(
                             &mut crease_toggles,
-                            // SUZURI: Native line typography must share row geometry with editor input and painting.
                             &snapshot,
                             line_height,
                             &gutter_dimensions,
@@ -9738,7 +9683,6 @@ impl Element for EditorElement {
                         let offset = match display_row {
                             Some(display_row) => {
                                 let max_row = display_row.0.saturating_sub(FILE_HEADER_HEIGHT);
-                                // SUZURI: Native line typography must share row geometry with editor input and painting.
                                 let offset = (snapshot.visual_y_for_row(scroll_position.y)
                                     - snapshot.visual_y_for_row(max_row as f64))
                                 .max(0.0);
@@ -9762,7 +9706,6 @@ impl Element for EditorElement {
                             self.layout_diff_hunk_controls(
                                 start_row..end_row,
                                 &row_infos,
-                                // SUZURI: Native line typography must share row geometry with editor input and painting.
                                 &snapshot,
                                 &text_hitbox,
                                 current_selection_head,
@@ -10426,7 +10369,6 @@ impl ScrollbarLayout {
             )
         };
 
-        // SUZURI: Native line typography must share row geometry with editor input and painting.
         let row_to_y =
             |row: DisplayRow| snapshot.visual_y_for_row(row.as_f64()) as f32 * self.text_unit_size;
         let mut pixel_ranges = row_ranges
@@ -10718,7 +10660,7 @@ pub fn layout_line(
     let chunks = snapshot.highlighted_chunks(row..row + DisplayRow(1), language_aware, &row_style);
     LineWithInvisibles::from_chunks(
         chunks,
-        &row_style,
+        |_| Cow::Borrowed(&row_style),
         MAX_LINE_LEN,
         1,
         &snapshot.mode,
@@ -10936,7 +10878,6 @@ pub struct HighlightedRange {
 
 #[derive(Debug)]
 pub struct HighlightedRangeLine {
-    // SUZURI: Native line typography must share row geometry with editor input and painting.
     pub line_height: Pixels,
     pub start_x: Pixels,
     pub end_x: Pixels,
@@ -11047,7 +10988,6 @@ impl HighlightedRange {
                     builder.curve_to(bottom_left - curve_height, bottom_left);
                 }
             }
-            // SUZURI: Native line typography must share row geometry with editor input and painting.
             current_y = bottom_right.y;
         }
 
@@ -12374,6 +12314,64 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_streaming_layout_preserves_mixed_row_metrics(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let buffer = MultiBuffer::build_simple("same\nsame\nsame", cx);
+            Editor::new(EditorMode::full(), buffer, None, window, cx)
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        window
+            .update(cx, |editor, window, cx| {
+                let buffer = editor.buffer().read(cx).snapshot(cx);
+                editor.style_lines(
+                    crate::HighlightKey::MarkdownLivePreview(usize::MAX),
+                    vec![
+                        buffer.anchor_before(Point::new(1, 0))
+                            ..buffer.anchor_after(Point::new(1, 4)),
+                    ],
+                    crate::display_map::LineStyle {
+                        font_scale: 1.5,
+                        line_height: 2.0,
+                    },
+                    cx,
+                );
+                let snapshot = editor.snapshot(window, cx);
+                let style = editor.style(cx).clone();
+                let layouts = EditorElement::layout_lines(
+                    DisplayRow(0)..DisplayRow(3),
+                    &snapshot,
+                    &style,
+                    px(500.),
+                    |_| false,
+                    &[],
+                    window,
+                    cx,
+                );
+                assert_eq!(layouts.len(), 3);
+                assert_eq!(layouts[0].font_size, layouts[2].font_size);
+                assert_eq!(layouts[0].line_height, layouts[2].line_height);
+                assert_eq!(layouts[1].font_size, layouts[0].font_size * 1.5);
+                assert_eq!(layouts[1].line_height, layouts[0].line_height * 2.0);
+                assert!((layouts[1].width - layouts[0].width * 1.5).abs() < px(0.1));
+                for (index, streamed) in layouts.iter().enumerate() {
+                    let single = layout_line(
+                        DisplayRow(index as u32),
+                        &snapshot,
+                        &style,
+                        px(500.),
+                        |_| false,
+                        window,
+                        cx,
+                    );
+                    assert_eq!(streamed.width, single.width);
+                    assert_eq!(streamed.line_height, single.line_height);
+                }
+            })
+            .unwrap();
+    }
+
+    #[gpui::test]
     fn test_replacement_chunks_are_clipped_to_max_line_len(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
 
@@ -12416,7 +12414,7 @@ mod tests {
 
                 let layouts = LineWithInvisibles::from_chunks(
                     chunks,
-                    &style,
+                    |_| Cow::Borrowed(&style),
                     max_line_len,
                     1,
                     &editor_mode,
