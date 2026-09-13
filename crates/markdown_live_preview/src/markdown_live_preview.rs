@@ -58,8 +58,7 @@ struct LivePreviewFoldTag;
 const MARKDOWN: &str = "Markdown";
 const MARKDOWN_INLINE: &str = "Markdown-Inline";
 
-mod bibliography;
-pub use bibliography::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
+pub use citations::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MarkdownHeadingStyle {
