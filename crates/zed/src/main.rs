@@ -783,6 +783,7 @@ fn main() {
         feedback::init(cx);
         markdown_preview::init(cx);
         markdown_live_preview::init(cx);
+        citations::init(cx);
         suzuri_recovery::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
