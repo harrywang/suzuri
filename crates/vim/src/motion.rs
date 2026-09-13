@@ -739,6 +739,12 @@ impl Vim {
                 editor.prepare_vertical_navigation(delta, *display_lines, vim.mode.is_visual(), cx);
             });
         }
+        if matches!(motion, Motion::CurrentLine) {
+            let rows = u32::try_from(count.unwrap_or(1)).unwrap_or(u32::MAX);
+            self.update_editor(cx, |_, editor, cx| {
+                editor.prepare_linewise_edit(rows, cx);
+            });
+        }
         let forced_motion = Vim::take_forced_motion(cx);
         let active_operator = self.active_operator();
         let mut waiting_operator: Option<Operator> = None;

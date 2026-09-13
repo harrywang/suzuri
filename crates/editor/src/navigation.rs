@@ -93,6 +93,46 @@ impl Editor {
         }
     }
 
+    // SUZURI: Linewise edits must resolve replacement-widget boundaries in source coordinates.
+    pub fn prepare_linewise_edit(&mut self, rows: u32, cx: &mut Context<Self>) {
+        let candidates = self
+            .addons
+            .values()
+            .flat_map(|addon| addon.editable_replacement_blocks())
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        let snapshot = self.display_snapshot(cx);
+        let ranges = self
+            .selections
+            .all::<Point>(&snapshot)
+            .into_iter()
+            .map(|selection| {
+                let end_row = if !selection.is_empty() && selection.end.column == 0 {
+                    selection.end.row.saturating_sub(1)
+                } else {
+                    selection.end.row
+                };
+                selection.start.row..=end_row.saturating_add(rows)
+            })
+            .collect::<Vec<_>>();
+        let reveal = candidates
+            .into_iter()
+            .filter_map(|(range, id)| {
+                let start = range.start.to_point(&snapshot).row;
+                let end = range.end.to_point(&snapshot).row;
+                ranges
+                    .iter()
+                    .any(|range| start <= *range.end() && end >= *range.start())
+                    .then_some(id)
+            })
+            .collect::<HashSet<_>>();
+        if !reveal.is_empty() {
+            self.remove_blocks(reveal, None, cx);
+        }
+    }
+
     pub fn move_left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
