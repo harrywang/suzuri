@@ -4071,8 +4071,7 @@ async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) 
     ];
     for (text, expected) in cases {
         let buffer = cx.new(|cx| language::Buffer::local(*text, cx));
-        let start =
-            cx.update(|cx| crate::bibliography::citation_key_start(buffer.read(cx), text.len()));
+        let start = cx.update(|cx| citations::citation_key_start(buffer.read(cx), text.len()));
         assert_eq!(start, *expected, "context detection for {text:?}");
     }
 }

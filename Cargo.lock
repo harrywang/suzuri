@@ -3045,6 +3045,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "14c638459986b83c2b885179bd4ea6a2cbb05697b001501a56adb3a3d230803b"
 
 [[package]]
+name = "citations"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "biblatex",
+ "clock",
+ "collections",
+ "editor",
+ "fs",
+ "futures 0.3.34",
+ "fuzzy",
+ "gpui",
+ "http_client",
+ "language",
+ "log",
+ "project",
+ "reqwest_client",
+ "serde_json",
+ "text",
+ "urlencoding",
+ "util",
+ "zed-reqwest",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10887,7 +10912,7 @@ name = "markdown_live_preview"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "biblatex",
+ "citations",
  "clock",
  "collections",
  "editor",

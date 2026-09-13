@@ -266,7 +266,7 @@ fn collapse_whitespace(text: &str) -> String {
 
 /// First run of four consecutive digits, so both `2024` and `2024-03-01`
 /// (BibLaTeX `date`) yield a year.
-fn first_year(value: &str) -> Option<String> {
+pub(crate) fn first_year(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut run_start = None;
     for (index, byte) in bytes.iter().enumerate() {
@@ -322,7 +322,7 @@ fn citation_boundary(before_at: Option<char>) -> bool {
     }
 }
 
-pub(crate) fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize> {
+pub fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize> {
     let mut walked = 0;
     let mut characters = buffer.reversed_chars_at(offset);
     loop {
@@ -341,7 +341,7 @@ pub(crate) fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize
 /// The citation key containing `offset`, if any: its full range including
 /// the `@`, plus the key text without it. Bracketed and bare citations look
 /// identical from here — an `@` after a boundary followed by key characters.
-pub(crate) fn citation_key_at(
+pub fn citation_key_at(
     buffer: &Buffer,
     offset: usize,
 ) -> Option<(std::ops::Range<usize>, SharedString)> {
