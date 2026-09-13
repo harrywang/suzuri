@@ -166,14 +166,12 @@ fn heading_metrics(level: Option<u8>, cx: &App) -> HeadingMetrics {
         || (base_font_size * theme.line_height()).round(),
         |_| {
             let text_system = cx.text_system();
-            let font_id = text_system.resolve_font(&theme.buffer_font);
+            let mut font = theme.buffer_font.clone();
+            font.weight = text.font_weight;
+            let font_id = text_system.resolve_font(&font);
             let glyph_height = text_system.ascent(font_id, font_size)
                 + text_system.descent(font_id, font_size).abs();
-            gpui::px(
-                (f32::from(font_size) * HEADING_LINE_HEIGHT_MULTIPLIER)
-                    .max(f32::from(glyph_height)),
-            )
-            .ceil()
+            glyph_height * HEADING_LINE_HEIGHT_MULTIPLIER
         },
     );
     HeadingMetrics {
@@ -186,7 +184,7 @@ fn heading_metrics(level: Option<u8>, cx: &App) -> HeadingMetrics {
 fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
     let base = heading_metrics(None, cx).content_line_height;
     let heading = heading_metrics(level, cx).content_line_height;
-    (heading / base).max(0.01)
+    (heading / base).max(1.0)
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, RegisterSetting)]
 
