@@ -727,6 +727,17 @@ impl FoldMap {
                             .collapsed_text
                             .clone()
                             .unwrap_or_else(|| ELLIPSIS.into());
+                        // SUZURI: Zed's display-to-buffer mapping assumes a fold occupies at
+                        // least one display column. A zero-width concealment makes the points
+                        // before and after the hidden text the same display point, and bias
+                        // then resolves past the concealed source: Vim's linewise `dd`, `yy`,
+                        // and `cc` lost a heading's hidden prefix. Keep concealments visually
+                        // empty (the renderer draws nothing) but never zero-width.
+                        let placeholder_text = if is_concealment && placeholder_text.is_empty() {
+                            SharedString::new_static("\u{200b}")
+                        } else {
+                            placeholder_text
+                        };
                         let chars_bitmap = placeholder_text
                             .char_indices()
                             .fold(0u128, |bitmap, (idx, _)| {

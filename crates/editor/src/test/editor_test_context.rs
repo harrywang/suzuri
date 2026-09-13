@@ -214,7 +214,10 @@ impl EditorTestContext {
     }
 
     pub fn display_text(&mut self) -> String {
+        // SUZURI: Concealments occupy one zero-width display column (see fold_map.rs);
+        // tests compare visible text, so drop the U+200B placeholders.
         self.update_editor(|editor, _, cx| editor.display_text(cx))
+            .replace('\u{200b}', "")
     }
 
     pub fn buffer<F, T>(&mut self, read: F) -> T
