@@ -27,6 +27,7 @@ math_render.workspace = true
 multi_buffer.workspace = true
 project.workspace = true
 settings.workspace = true
+suzuri_recovery.workspace = true
 text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true

@@ -79,6 +79,7 @@ serde_json.workspace = true
 settings.workspace = true
 smallvec.workspace = true
 snippet.workspace = true
+suzuri_recovery.workspace = true
 sum_tree.workspace = true
 task.workspace = true
 telemetry.workspace = true

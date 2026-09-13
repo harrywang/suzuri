@@ -33,6 +33,7 @@ The fork's own changes are small and additive:
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | Update notifications | `crates/suzuri_update/`, `crates/zed/src/zed/app_menus.rs` (the Check for Updates entry) |
+| Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
 | Remote server provisioning on the dev channel (SSH/Docker/WSL remotes; see "Cutting a release") | `crates/auto_update/src/auto_update.rs` (`get_release_asset`), `crates/remote/src/transport/ssh.rs`, `docker.rs`, `wsl.rs` (`ensure_server_binary`) |
 | Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
 | Branding, CLI name, release infrastructure | `crates/zed/Cargo.toml` (bundle metadata), `crates/zed/resources/app-icon-suzuri*`, `crates/zed/resources/windows/app-icon-suzuri.ico`, `assets/images/suzuri_logo.svg`, `crates/install_cli/src/install_cli_binary.rs`, `script/bundle-mac`, `script/bundle-windows.ps1`, `script/bundle-linux`, `.github/workflows/suzuri-release.yml` |
@@ -304,3 +305,20 @@ debug build, which compiles the server from source instead.
 is not wired up, and adopting it would need, at minimum, its hardcoded `Zed` DMG
 mount path in `install_release_macos` reconciled with `bundle-mac`'s `-volname Suzuri`,
 plus signing secrets present on every release build.
+
+## Crash recovery
+
+The dev channel installs no crash handler (`should_install_crash_handler` is false), so
+upstream's fallback prints a panic to stderr and exits. A Dock launch has no stderr, and
+session restore then reopens whatever caused the panic, which is how one bad file turned
+into an app that quit a fraction of a second after every launch (#56). `suzuri_recovery`
+replaces that fallback: the panic and backtrace go into `Zed.log`, and a small
+`suzuri-recovery.json` in the data dir records the file most recently activated in any
+pane. A panic within 30 seconds of that activation blames the file. On the next launch a
+blamed file opens with live preview off (strike one); after two consecutive crashing
+launches it is left out of session restore (strike two). A launch that ends without a panic
+clears all strikes. The suspect is recorded from a `Pane` observer, which subscribes ahead
+of the workspace's own pane handler; that order is load-bearing, because the status bar
+reads the newly active editor's display map inside that handler, which is exactly where
+a layout panic fires. To reproduce a Dock-style crash and see the log line, run a
+source build with `ZED_RELEASE_CHANNEL=nightly` beside the installed app.

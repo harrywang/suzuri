@@ -1396,6 +1396,14 @@ impl SerializableItem for Editor {
                 mtime,
                 ..
             } => {
+                // SUZURI: a file blamed for two consecutive crashes on launch is
+                // left out of the restored session; see `suzuri_recovery`.
+                if suzuri_recovery::should_skip_restore(&abs_path, cx) {
+                    return Task::ready(Err(anyhow!(
+                        "not restoring {}: Suzuri crashed twice right after opening it",
+                        abs_path.display()
+                    )));
+                }
                 let opened_buffer = project.update(cx, |project, cx| {
                     let (worktree, path) = project.find_worktree(&abs_path, cx)?;
                     let project_path = ProjectPath {

@@ -416,7 +416,9 @@ fn main() {
             )),
         )
     } else {
-        crashes::force_backtrace();
+        // SUZURI: the dev channel has no crash handler, so log the panic and
+        // remember the file it followed; see `suzuri_recovery`.
+        suzuri_recovery::install_panic_hook();
         None
     };
 
@@ -782,6 +784,7 @@ fn main() {
         feedback::init(cx);
         markdown_preview::init(cx);
         markdown_live_preview::init(cx);
+        suzuri_recovery::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);

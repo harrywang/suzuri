@@ -5652,6 +5652,7 @@ dependencies = [
  "smallvec",
  "snippet",
  "sum_tree",
+ "suzuri_recovery",
  "task",
  "telemetry",
  "text",
@@ -10807,6 +10808,7 @@ dependencies = [
  "pretty_assertions",
  "project",
  "settings",
+ "suzuri_recovery",
  "tempfile",
  "text",
  "theme",
@@ -17982,6 +17984,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "suzuri_recovery"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "gpui",
+ "log",
+ "paths",
+ "serde",
+ "serde_json",
+ "util",
+ "workspace",
+ "zlog",
+]
+
+[[package]]
 name = "suzuri_update"
 version = "0.1.0"
 dependencies = [
@@ -23399,6 +23416,7 @@ dependencies = [
  "snippet_provider",
  "snippets_ui",
  "spin 0.10.0",
+ "suzuri_recovery",
  "suzuri_update",
  "svg_preview",
  "sysinfo 0.39.6",

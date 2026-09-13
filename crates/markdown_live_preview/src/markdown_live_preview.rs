@@ -87,6 +87,19 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         return;
     }
 
+    // A file blamed for the previous launch's panic opens with live preview
+    // off, since this crate's rendering is the likeliest home of a
+    // file-specific panic; `ToggleLivePreview` turns it back on for a retry.
+    let quarantined = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buffer| {
+            let file = buffer.read(cx).file()?;
+            Some(language::LocalFile::abs_path(file.as_local()?, cx))
+        })
+        .is_some_and(|path| suzuri_recovery::should_disable_live_preview(&path, cx));
+
     let mut subscriptions = Vec::new();
     subscriptions.push(
         cx.subscribe_self(|editor, event: &EditorEvent, cx| match event {
@@ -304,7 +317,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     }
 
     editor.register_addon(LivePreviewAddon {
-        enabled_override: None,
+        enabled_override: quarantined.then_some(false),
         image_cache,
         markers: None,
         applied_blocks: Vec::new(),
