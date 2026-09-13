@@ -28,7 +28,7 @@ The fork's own changes are small and additive:
 | Live Typst/LaTeX preview | `crates/typeset_preview/` |
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs`, `crates/editor/src/selections_collection.rs` |
 | Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
-| Native heading Vim integration regressions | `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
+| Native heading search reveal and Vim integration regressions | `crates/editor/src/editor.rs` (`selection_is_from_search`), `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
 | Markdown attachments: drag-and-drop and clipboard paste | `crates/editor/src/items.rs` |
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |

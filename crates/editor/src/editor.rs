@@ -3363,6 +3363,11 @@ impl Editor {
         self.current_line_highlight = current_line_highlight;
     }
 
+    // SUZURI: Search navigation must not reveal Markdown heading syntax as if it were an edit.
+    pub fn selection_is_from_search(&self) -> bool {
+        self.last_selection_from_search
+    }
+
     pub fn set_collapse_matches(&mut self, collapse_matches: bool) {
         self.collapse_matches = collapse_matches;
     }

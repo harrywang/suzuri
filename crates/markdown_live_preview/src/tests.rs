@@ -108,6 +108,37 @@ async fn test_native_heading_line_typography_contract(cx: &mut TestAppContext) {
     assert_eq!(cx.display_text(), "# Heading\nbody");
 }
 #[gpui::test]
+async fn test_heading_height_uses_font_metrics_and_respects_base_row(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    for leading in [1.0, 1.7, 3.0] {
+        cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.theme.buffer_line_height =
+                        Some(settings::BufferLineHeight::Custom(leading));
+                });
+            });
+        });
+        cx.executor().run_until_parked();
+        cx.update(|_, cx| {
+            let theme = theme_settings::ThemeSettings::get_global(cx);
+            let metrics = heading_metrics(Some(1), cx);
+            let mut font = theme.buffer_font.clone();
+            font.weight = metrics.text.font_weight;
+            let font_id = cx.text_system().resolve_font(&font);
+            let expected_height = (cx.text_system().ascent(font_id, metrics.font_size)
+                + cx.text_system().descent(font_id, metrics.font_size).abs())
+                * 1.25;
+            assert!((metrics.content_line_height - expected_height).abs() < gpui::px(0.001));
+            let base = heading_metrics(None, cx).content_line_height;
+            let rows = heading_visual_rows(Some(1), cx);
+            assert!((rows - (expected_height / base).max(1.0)).abs() < 0.001);
+            assert!(rows >= 1.0);
+        });
+    }
+}
+
+#[gpui::test]
 async fn test_every_heading_level_has_distinct_content_line_height(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     let heights = cx.update(|_window, cx| {
