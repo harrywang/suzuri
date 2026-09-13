@@ -1461,53 +1461,56 @@ impl<'a> HighlightedChunk<'a> {
             if text.is_empty() {
                 return None;
             }
-            for (offset, ch) in text.char_indices() {
-                if !is_invisible(ch) {
-                    continue;
-                }
-                let ch_end = offset + ch.len_utf8();
-                if !is_standalone_grapheme(text, offset, ch_end) {
-                    continue;
-                }
-                if offset > 0 {
-                    let (prefix, suffix) = text.split_at(offset);
+            // Renderer text is a display-mapping placeholder, not source text to expose.
+            if !matches!(renderer, Some(ChunkReplacement::Renderer(_))) {
+                for (offset, ch) in text.char_indices() {
+                    if !is_invisible(ch) {
+                        continue;
+                    }
+                    let ch_end = offset + ch.len_utf8();
+                    if !is_standalone_grapheme(text, offset, ch_end) {
+                        continue;
+                    }
+                    if offset > 0 {
+                        let (prefix, suffix) = text.split_at(offset);
+                        text = suffix;
+                        return Some(HighlightedChunk {
+                            text: prefix,
+                            style,
+                            is_tab,
+                            is_inlay,
+                            replacement: renderer.clone(),
+                        });
+                    }
+                    let (invisible_text, suffix) = text.split_at(ch_end);
                     text = suffix;
+                    let invisible_highlight = HighlightStyle {
+                        background_color: Some(editor_style.status.hint_background),
+                        underline: Some(UnderlineStyle {
+                            color: Some(editor_style.status.hint),
+                            thickness: px(1.),
+                            wavy: false,
+                        }),
+                        ..Default::default()
+                    };
+                    let invisible_style = if let Some(style) = style {
+                        style.highlight(invisible_highlight)
+                    } else {
+                        invisible_highlight
+                    };
                     return Some(HighlightedChunk {
-                        text: prefix,
-                        style,
-                        is_tab,
+                        text: invisible_text,
+                        style: Some(invisible_style),
+                        is_tab: false,
                         is_inlay,
-                        replacement: renderer.clone(),
+                        replacement: match replacement(ch) {
+                            Some(replacement) => {
+                                Some(ChunkReplacement::Str(SharedString::from(replacement)))
+                            }
+                            None => renderer.clone(),
+                        },
                     });
                 }
-                let (invisible_text, suffix) = text.split_at(ch_end);
-                text = suffix;
-                let invisible_highlight = HighlightStyle {
-                    background_color: Some(editor_style.status.hint_background),
-                    underline: Some(UnderlineStyle {
-                        color: Some(editor_style.status.hint),
-                        thickness: px(1.),
-                        wavy: false,
-                    }),
-                    ..Default::default()
-                };
-                let invisible_style = if let Some(style) = style {
-                    style.highlight(invisible_highlight)
-                } else {
-                    invisible_highlight
-                };
-                return Some(HighlightedChunk {
-                    text: invisible_text,
-                    style: Some(invisible_style),
-                    is_tab: false,
-                    is_inlay,
-                    replacement: match replacement(ch) {
-                        Some(replacement) => {
-                            Some(ChunkReplacement::Str(SharedString::from(replacement)))
-                        }
-                        None => renderer.clone(),
-                    },
-                });
             }
             let remainder = text;
             text = "";
@@ -4492,6 +4495,53 @@ pub mod tests {
             ),
             None,
         );
+    }
+
+    #[test]
+    fn test_highlight_invisibles_preserves_renderer_placeholders() {
+        use gpui::IntoElement;
+
+        let editor_style = EditorStyle::default();
+        let renderer = ChunkRenderer {
+            id: ChunkRendererId::Fold(FoldId(0)),
+            render: Arc::new(|_| gpui::Empty.into_any_element()),
+            constrain_width: false,
+            measured_width: Some(px(0.)),
+        };
+        for text in ["\u{200b}", "before\u{200b}after"] {
+            let chunks = HighlightedChunk {
+                text,
+                style: None,
+                is_tab: false,
+                is_inlay: false,
+                replacement: Some(ChunkReplacement::Renderer(renderer.clone())),
+            }
+            .highlight_invisibles(&editor_style)
+            .collect::<Vec<_>>();
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].text, text);
+            assert!(chunks[0].style.is_none());
+            assert!(matches!(
+                chunks[0].replacement,
+                Some(ChunkReplacement::Renderer(_))
+            ));
+        }
+
+        let chunks = HighlightedChunk {
+            text: "\u{200b}",
+            style: None,
+            is_tab: false,
+            is_inlay: false,
+            replacement: None,
+        }
+        .highlight_invisibles(&editor_style)
+        .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].style.is_some());
+        assert!(matches!(
+            chunks[0].replacement,
+            Some(ChunkReplacement::Str(_))
+        ));
     }
 
     #[test]
