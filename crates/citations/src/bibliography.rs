@@ -81,6 +81,11 @@ pub struct Bibliography {
     /// Parsed entries per absolute `.bib` path. A file that fails to parse
     /// holds an empty list, which also serves as its tombstone on deletion.
     files: HashMap<PathBuf, Vec<BibEntry>>,
+    /// The same files parsed by hayagriva, for rendering formatted
+    /// citations. Kept apart from `files` because hayagriva's parser is the
+    /// stricter of the two: an entry it rejects still resolves and completes,
+    /// it just falls back to the plain card.
+    libraries: HashMap<PathBuf, hayagriva::Library>,
     /// Every key across `files`. The highlight pass resolves each citation
     /// in a note on every keystroke, so membership has to be O(1) rather
     /// than a scan over what may be a Zotero-sized library.
@@ -101,6 +106,7 @@ impl Bibliography {
         }
         let bibliography = cx.new(|_| Bibliography {
             files: HashMap::default(),
+            libraries: HashMap::default(),
             keys: HashSet::default(),
             scanned_projects: HashSet::default(),
         });
@@ -118,6 +124,11 @@ impl Bibliography {
 
     pub fn resolve(&self, key: &str) -> Option<&BibEntry> {
         self.entries().find(|entry| entry.key.as_ref() == key)
+    }
+
+    /// The full entry, for rendering in a CSL style.
+    pub fn entry_for_rendering(&self, key: &str) -> Option<&hayagriva::Entry> {
+        self.libraries.values().find_map(|library| library.get(key))
     }
 
     fn rebuild_keys(&mut self) {
@@ -179,15 +190,21 @@ impl Bibliography {
         cx.spawn(async move |cx| {
             let mut results = Vec::with_capacity(paths.len());
             for path in paths {
-                let entries = match fs.load(&path).await {
-                    Ok(source) => cx.background_spawn(async move { parse_bib(&source) }).await,
-                    Err(_) => Vec::new(),
+                let (entries, library) = match fs.load(&path).await {
+                    Ok(source) => {
+                        cx.background_spawn(
+                            async move { (parse_bib(&source), parse_library(&source)) },
+                        )
+                        .await
+                    }
+                    Err(_) => (Vec::new(), hayagriva::Library::new()),
                 };
-                results.push((path, entries));
+                results.push((path, entries, library));
             }
             bibliography.update(cx, |bibliography, cx| {
-                for (path, entries) in results {
-                    bibliography.files.insert(path, entries);
+                for (path, entries, library) in results {
+                    bibliography.files.insert(path.clone(), entries);
+                    bibliography.libraries.insert(path, library);
                 }
                 bibliography.rebuild_keys();
                 cx.notify();
@@ -198,6 +215,7 @@ impl Bibliography {
 
     pub fn remove_path(bibliography: &Entity<Bibliography>, path: &Path, cx: &mut App) {
         bibliography.update(cx, |bibliography, cx| {
+            bibliography.libraries.remove(path);
             if bibliography.files.remove(path).is_some() {
                 bibliography.rebuild_keys();
                 cx.notify();
@@ -256,6 +274,19 @@ fn parse_bib(source: &str) -> Vec<BibEntry> {
             }
         })
         .collect()
+}
+
+/// The same source through hayagriva, for CSL rendering. Its parser rejects
+/// a few things `biblatex` tolerates, in which case the file simply has no
+/// rendered form and hover falls back to the plain card.
+fn parse_library(source: &str) -> hayagriva::Library {
+    match hayagriva::io::from_biblatex_str(source) {
+        Ok(library) => library,
+        Err(errors) => {
+            log::warn!("citations: hayagriva could not read the library: {errors:?}");
+            hayagriva::Library::new()
+        }
+    }
 }
 
 /// `.bib` titles often carry the file's own line wrapping; a completion
@@ -543,6 +574,32 @@ impl CitationSemanticsProvider {
     }
 }
 
+impl CitationSemanticsProvider {
+    /// The reference rendered in the document's CSL style, with its in-text
+    /// form; the plain title/author/year card when the entry cannot be
+    /// rendered.
+    fn hover_markdown(&self, buffer: &Buffer, key: &str, cx: &App) -> Option<String> {
+        let bibliography = self.bibliography.read(cx);
+        let rendered = bibliography.entry_for_rendering(key).and_then(|entry| {
+            let head: String = buffer
+                .text_for_range(0..buffer.len().min(FRONTMATTER_SCAN_BYTES))
+                .collect();
+            let style_name =
+                crate::document_style(&head).unwrap_or_else(|| crate::DEFAULT_STYLE.to_string());
+            let style = crate::style_named(&style_name)?;
+            let rendered = crate::render_reference(entry, &style)?;
+            Some(format!(
+                "{}\n\n**In text:** {}\n\n*{}*",
+                rendered.reference, rendered.citation, style.name
+            ))
+        });
+        rendered.or_else(|| bibliography.resolve(key)?.reference_markdown())
+    }
+}
+
+/// How much of a buffer's head is scanned for a frontmatter `csl:` key.
+const FRONTMATTER_SCAN_BYTES: usize = 4096;
+
 impl SemanticsProvider for CitationSemanticsProvider {
     fn hover(
         &self,
@@ -555,8 +612,7 @@ impl SemanticsProvider for CitationSemanticsProvider {
             if buffer_is_markdown(buffer_ref) {
                 let offset = position.to_offset(buffer_ref);
                 if let Some((range, key)) = citation_key_at(buffer_ref, offset)
-                    && let Some(entry) = self.bibliography.read(cx).resolve(&key)
-                    && let Some(markdown) = entry.reference_markdown()
+                    && let Some(markdown) = self.hover_markdown(buffer_ref, &key, cx)
                 {
                     let range =
                         buffer_ref.anchor_before(range.start)..buffer_ref.anchor_after(range.end);

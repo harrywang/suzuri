@@ -421,13 +421,11 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     if let Some(project) = editor.project().cloned() {
         let bibliography = Bibliography::global(cx);
         Bibliography::ensure_project(&bibliography, &project, cx);
-        // Restyle citations when a `.bib` finishes parsing, so keys resolve
-        // (or stop resolving) without waiting for the next edit.
+        // Recompute when a `.bib` finishes parsing, so keys resolve (or stop
+        // resolving) and the reference list re-renders without waiting for
+        // the next edit.
         subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
-            let markers = editor
-                .addon::<LivePreviewAddon>()
-                .and_then(|addon| addon.markers.clone());
-            apply_emphasis_highlights(editor, markers.as_deref(), cx);
+            recompute(editor, cx);
         }));
         editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
             project.clone(),
@@ -773,6 +771,9 @@ impl Addon for LivePreviewAddon {
 struct MarkerSet {
     inline: Vec<InlineMarker>,
     blocks: Vec<BlockMarker>,
+    /// The heading block that names the reference list, when the note has
+    /// one; `attach_references_block` turns it into the rendered list.
+    references_heading: Option<Range<Anchor>>,
     /// Ranges that get an always-on strikethrough text decoration: themes
     /// color `~~struck~~` spans but do not apply the actual line-through, and
     /// with the delimiters hidden there would otherwise be no visual cue.
@@ -921,6 +922,12 @@ enum BlockRenderKind {
         kind: CalloutKind,
         title: String,
         collapse: Option<bool>,
+    },
+    /// A `References` (or `Bibliography`) heading, rendered together with the
+    /// reference-list entries for every work the note cites, formatted in
+    /// the note's CSL style. Each item is `(key, rendered text)`.
+    References {
+        items: Vec<(SharedString, SharedString)>,
     },
     /// Display math (`$$...$$` alone on its lines), rendered as a centered
     /// typeset formula. Unlike other blocks, revealing its source does not
@@ -1164,7 +1171,10 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
     let enabled = is_enabled(addon, cx);
 
     let markers = if enabled && !editor.read_only(cx) {
-        extract_markers(editor, cx).map(Arc::new)
+        extract_markers(editor, cx).map(|mut markers| {
+            attach_references_block(&mut markers, editor, cx);
+            Arc::new(markers)
+        })
     } else {
         None
     };
@@ -1620,6 +1630,14 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             source.push_str("\n\n");
             source.push_str(&markers.definitions);
         }
+        // The reuse check below compares sources, so the rendered entries
+        // ride along: a newly cited work or a style change re-renders.
+        if let BlockRenderKind::References { items } = &marker.kind {
+            for (_, text) in items {
+                source.push('\n');
+                source.push_str(text);
+            }
+        }
         let embed = match &marker.kind {
             BlockRenderKind::Embed { target, section } => {
                 let state = embed_state(
@@ -1836,6 +1854,13 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             BlockRenderKind::Rule => render_rule_block(
                 weak_editor.clone(),
                 marker.range.clone(),
+                marker.indent_columns,
+            ),
+            BlockRenderKind::References { items } => render_references_block(
+                weak_editor.clone(),
+                marker.range.clone(),
+                plain_heading_text(source.lines().next().unwrap_or_default()),
+                items.clone(),
                 marker.indent_columns,
             ),
             BlockRenderKind::Frontmatter => {
@@ -5174,6 +5199,47 @@ fn move_image_to_row(
     }
 }
 
+fn render_references_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    heading: String,
+    items: Vec<(SharedString, SharedString)>,
+    indent_columns: u32,
+) -> RenderBlock {
+    let heading = SharedString::from(heading);
+    Arc::new(move |block_cx| {
+        let editor = editor.clone();
+        let start = range.start;
+        let text_color = block_cx.app.theme().colors().text;
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .flex()
+            .flex_col()
+            .cursor_pointer()
+            .text_color(text_color)
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
+            .child(
+                div()
+                    .text_xl()
+                    .font_weight(FontWeight::BOLD)
+                    .pb_2()
+                    .child(heading.clone()),
+            )
+            .children(
+                items
+                    .iter()
+                    .map(|(_, text)| div().pl(block_cx.em_width * 2.).pb_1().child(text.clone())),
+            )
+            .into_any_element()
+    })
+}
+
 fn render_rule_block(
     editor: WeakEntity<Editor>,
     range: Range<Anchor>,
@@ -6664,6 +6730,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         prose_regions: Vec::new(),
         code_spans: Vec::new(),
         last_table_end_row: None,
+        references_heading: None,
         inline: Vec::new(),
         blocks: Vec::new(),
         strikethrough: Vec::new(),
@@ -6698,6 +6765,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     let Extraction {
         inline,
         mut blocks,
+        references_heading,
         strikethrough,
         italic,
         bold,
@@ -6740,6 +6808,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     Some(MarkerSet {
         inline,
         blocks,
+        references_heading,
         strikethrough,
         italic,
         bold,
@@ -6767,6 +6836,7 @@ struct Extraction<'a> {
     last_table_end_row: Option<u32>,
     inline: Vec<InlineMarker>,
     blocks: Vec<BlockMarker>,
+    references_heading: Option<Range<Anchor>>,
     strikethrough: Vec<Range<Anchor>>,
     italic: Vec<Range<Anchor>>,
     bold: Vec<Range<Anchor>>,
@@ -6901,6 +6971,23 @@ impl Extraction<'_> {
         (start_row, end_row)
     }
 
+    /// Remembers the heading block just pushed when it names the reference
+    /// list. The last such heading wins, matching where a reference list
+    /// sits in a manuscript.
+    fn note_references_heading(&mut self, node: tree_sitter::Node) {
+        let title = self
+            .text
+            .get(node.byte_range())
+            .and_then(|text| text.lines().next())
+            .map(plain_heading_text)
+            .unwrap_or_default();
+        if is_references_heading(&title)
+            && let Some(block) = self.blocks.last()
+        {
+            self.references_heading = Some(block.range.clone());
+        }
+    }
+
     fn push_block_rows(
         &mut self,
         start_row: u32,
@@ -6935,10 +7022,12 @@ impl Extraction<'_> {
                     let (start_row, end_row) = self.node_rows(node);
                     let level = heading_level(node) as u8;
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
+                    self.note_references_heading(node);
                 }
                 "setext_heading" => {
                     let (start_row, end_row) = self.node_rows(node);
                     self.push_block_rows(start_row, end_row, 2, BlockRenderKind::Markdown);
+                    self.note_references_heading(node);
                 }
                 "thematic_break" => {
                     let (start_row, end_row) = self.node_rows(node);
@@ -7905,6 +7994,83 @@ fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::N
         }
     }
 }
+
+/// A heading line's plain title: `## References ##` → `References`.
+fn plain_heading_text(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('#')
+        .trim_end_matches('#')
+        .trim()
+        .to_string()
+}
+
+fn is_references_heading(title: &str) -> bool {
+    matches!(
+        title.trim().to_ascii_lowercase().as_str(),
+        "references" | "bibliography" | "works cited" | "reference list"
+    )
+}
+
+/// Swaps the reference-list heading for a block that also carries the
+/// rendered entries of every cited work, in the note's CSL style (the
+/// frontmatter `csl:` key, else APA). Nothing changes when the note cites
+/// nothing the library can render.
+fn attach_references_block(markers: &mut MarkerSet, editor: &Editor, cx: &mut App) {
+    let Some(heading) = markers.references_heading.clone() else {
+        return;
+    };
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let head_end = MultiBufferOffset(snapshot.len().0.min(FRONTMATTER_SCAN_BYTES));
+    let head: String = snapshot
+        .text_for_range(MultiBufferOffset(0)..head_end)
+        .collect();
+    let style_name =
+        citations::document_style(&head).unwrap_or_else(|| citations::DEFAULT_STYLE.to_string());
+    let Some(style) = citations::style_named(&style_name) else {
+        return;
+    };
+    let mut cited = markers
+        .citations
+        .iter()
+        .chain(&markers.bare_citations)
+        .map(|range| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let key = text.strip_prefix('@').unwrap_or(&text).to_string();
+            (range.start.to_offset(&snapshot), key)
+        })
+        .collect::<Vec<_>>();
+    cited.sort_by_key(|(offset, _)| *offset);
+    let mut keys: Vec<String> = Vec::new();
+    for (_, key) in cited {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    let bibliography = Bibliography::global(cx);
+    let bibliography = bibliography.read(cx);
+    let entries = keys
+        .iter()
+        .filter_map(|key| bibliography.entry_for_rendering(key))
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return;
+    }
+    let items = citations::render_bibliography(&entries, &style)
+        .into_iter()
+        .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
+        .collect::<Vec<_>>();
+    if let Some(marker) = markers
+        .blocks
+        .iter_mut()
+        .find(|block| block.range == heading)
+    {
+        marker.height_estimate = 2 + items.len() as u32 * 2;
+        marker.kind = BlockRenderKind::References { items };
+    }
+}
+
+/// How much of the buffer's head is scanned for a frontmatter `csl:` key.
+const FRONTMATTER_SCAN_BYTES: usize = 4096;
 
 fn heading_level(node: tree_sitter::Node) -> u32 {
     for index in 0..node.child_count() {

@@ -3546,6 +3546,54 @@ fn highlighted_texts(
 }
 
 #[gpui::test]
+async fn test_references_heading_lists_the_cited_works(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: apa\n---\n\nAs shown in [@vaswani2017attention].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                concat!(
+                    "@article{vaswani2017attention,\n  title = {Attention Is All You Need},\n",
+                    "  author = {Vaswani, Ashish and Shazeer, Noam},\n  date = {2017},\n",
+                    "  journaltitle = {NeurIPS},\n}\n",
+                    "@book{uncited1984,\n  title = {Not Cited},\n  author = {Nobody, Ann},\n",
+                    "  date = {1984},\n}\n"
+                ),
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let items = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { items } => Some(items.clone()),
+                _ => None,
+            })
+        })
+        .expect("the References heading becomes a references block");
+    assert_eq!(items.len(), 1, "only cited works are listed: {items:?}");
+    assert_eq!(items[0].0.as_ref(), "vaswani2017attention");
+    assert!(
+        items[0]
+            .1
+            .starts_with("Vaswani, A., & Shazeer, N. (2017). Attention Is All You Need."),
+        "{}",
+        items[0].1
+    );
+}
+
+#[gpui::test]
 async fn test_cite_keys_resolve_against_the_vault_bibliography(cx: &mut TestAppContext) {
     use project::Fs as _;
 
@@ -3906,9 +3954,12 @@ async fn test_hovering_a_cite_key_shows_the_reference_card(cx: &mut TestAppConte
         .and_then(|hover| hover.contents.first())
         .map(|block| block.text.clone())
         .unwrap_or_default();
+    // The card is the reference rendered in the note's CSL style (APA when
+    // the frontmatter names none), plus its in-text form.
     assert!(
-        text.contains("A Study of Things") && text.contains("Jane Smith") && text.contains("2020"),
-        "hover card should carry the reference, got {text:?}"
+        text.contains("Smith, J. (2020). A Study of Things.")
+            && text.contains("**In text:** (Smith, 2020)"),
+        "hover card should carry the rendered reference, got {text:?}"
     );
 
     // On the email's lookalike key: no card (the request delegates).
