@@ -3363,11 +3363,6 @@ impl Editor {
         self.current_line_highlight = current_line_highlight;
     }
 
-    // SUZURI: Native line typography must share row geometry with editor input and painting.
-    pub fn selection_is_from_search(&self) -> bool {
-        self.last_selection_from_search
-    }
-
     pub fn set_collapse_matches(&mut self, collapse_matches: bool) {
         self.collapse_matches = collapse_matches;
     }
@@ -5693,16 +5688,6 @@ impl Editor {
     }
 
     pub fn delete_line(&mut self, _: &DeleteLine, window: &mut Window, cx: &mut Context<Self>) {
-        self.delete_selected_lines(false, window, cx);
-    }
-
-    // SUZURI: Vim linewise motions include an empty final row; ordinary selections do not.
-    pub fn delete_selected_lines(
-        &mut self,
-        include_end_if_at_line_start: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         if self.read_only(cx) {
             return;
         }
@@ -5713,13 +5698,11 @@ impl Editor {
         let mut edit_ranges = Vec::new();
         let mut selections = selections.iter().peekable();
         while let Some(selection) = selections.next() {
-            // SUZURI: Preserve inclusive empty-row semantics for Vim linewise operations.
-            let mut rows = selection.spanned_rows(include_end_if_at_line_start, &display_map);
+            let mut rows = selection.spanned_rows(false, &display_map);
 
             // Accumulate contiguous regions of rows that we want to delete.
             while let Some(next_selection) = selections.peek() {
-                let next_rows =
-                    next_selection.spanned_rows(include_end_if_at_line_start, &display_map);
+                let next_rows = next_selection.spanned_rows(false, &display_map);
                 if next_rows.start <= rows.end {
                     rows.end = next_rows.end;
                     selections.next().unwrap();
