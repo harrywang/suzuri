@@ -5724,3 +5724,46 @@ fn test_math_svg_rasterizes_to_a_nonempty_alpha_mask(cx: &mut gpui::TestAppConte
         "only {covered}/{total} pixels carry alpha; the formula would paint blank"
     );
 }
+
+/// Concealments carry a zero-width space so the fold keeps a display column
+/// (`fold_map.rs`), and Zed flags such characters as hidden Unicode by
+/// swapping in a visible glyph. That pass must skip placeholder chunks, or
+/// every concealed backtick and asterisk leaves a mark behind.
+#[gpui::test]
+async fn test_concealment_placeholders_are_not_flagged_as_hidden_characters(
+    cx: &mut TestAppContext,
+) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nuse `code` and **bold** here\n");
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("use code and bold here"));
+
+    let flagged = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let style = editor::EditorStyle::default();
+        let rows = editor::display_map::DisplayRow(0)..editor::display_map::DisplayRow(2);
+        snapshot
+            .display_snapshot
+            .highlighted_chunks(
+                rows,
+                language::LanguageAwareStyling {
+                    tree_sitter: true,
+                    diagnostics: false,
+                },
+                &style,
+            )
+            .filter(|chunk| {
+                matches!(
+                    chunk.replacement,
+                    Some(editor::display_map::ChunkReplacement::Str(_))
+                )
+            })
+            .map(|chunk| chunk.text.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        flagged,
+        Vec::<String>::new(),
+        "concealed markers must not surface the hidden-character glyph"
+    );
+}
