@@ -25,6 +25,7 @@ use project::{
     Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource, Project,
     lsp_store::CompletionDocumentation,
 };
+use settings::Settings as _;
 use util::ResultExt as _;
 
 /// One entry parsed out of a `.bib` file, reduced to the fields the citation
@@ -157,6 +158,7 @@ impl Bibliography {
         if !newly_seen {
             return;
         }
+        let library = crate::CitationsSettings::get_global(cx).library.clone();
         let mut paths = Vec::new();
         for worktree in project.read(cx).worktrees(cx) {
             let worktree = worktree.read(cx);
@@ -168,6 +170,13 @@ impl Bibliography {
                 {
                     paths.push(worktree.absolutize(&entry.path));
                 }
+            }
+            // The walk above skips gitignored entries, and a vault that
+            // ignores `refs/` for its PDFs would lose its library with them.
+            // The configured library is loaded by path regardless.
+            let configured = worktree.abs_path().join(&library);
+            if !paths.contains(&configured) {
+                paths.push(configured);
             }
         }
         Self::reload_paths(bibliography, project, paths, cx);
@@ -795,5 +804,44 @@ mod bibliography_tests {
         assert_eq!(first_year("about 1984, maybe"), Some("1984".to_string()));
         assert_eq!(first_year("no digits"), None);
         assert_eq!(first_year("123"), None);
+    }
+}
+
+#[cfg(test)]
+mod ignored_library_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
+
+    #[gpui::test]
+    async fn a_gitignored_library_is_still_indexed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/vault",
+            json!({
+                ".gitignore": "refs/\n",
+                "Note.md": "[@hidden2020]",
+                "refs": {
+                    "refs.bib": "@article{hidden2020,\n  title = {Hidden},\n  date = {2020},\n}\n"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), ["/vault".as_ref()], cx).await;
+        cx.run_until_parked();
+        let bibliography = cx.update(Bibliography::global);
+        cx.update(|cx| Bibliography::ensure_project(&bibliography, &project, cx));
+        cx.run_until_parked();
+        assert!(
+            bibliography.read_with(cx, |bibliography, _| bibliography
+                .contains_key("hidden2020")),
+            "the configured library resolves even when git ignores its folder"
+        );
     }
 }
