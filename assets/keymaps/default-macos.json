@@ -57,6 +57,7 @@
     "use_key_equivalents": true,
     "bindings": {
       "cmd-alt-c": "citations::InsertCitation", // SUZURI
+      "cmd-alt-o": "citations::OpenSource", // SUZURI
       "escape": "editor::Cancel",
       "shift-backspace": "editor::Backspace",
       "ctrl-h": "editor::Backspace",

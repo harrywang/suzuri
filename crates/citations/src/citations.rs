@@ -12,6 +12,7 @@ mod bibliography;
 mod insert_citation;
 mod keys;
 mod library;
+mod open_source;
 mod render;
 mod zotero;
 
@@ -22,6 +23,7 @@ pub use bibliography::{
 pub use insert_citation::{CitationFormat, CitationPicker, InsertCitation, choose_key};
 pub use keys::{disambiguate, is_portable_key, mint_key};
 pub use library::{DEFAULT_LIBRARY_PATH, Merge, append_entry, merge_entry};
+pub use open_source::{OpenSource, source_for_cursor};
 pub use render::{
     CslStyle, DEFAULT_STYLE, RenderedReference, document_style, render_bibliography,
     render_reference, style_named,
@@ -58,4 +60,5 @@ impl settings::Settings for CitationsSettings {
 
 pub fn init(cx: &mut gpui::App) {
     insert_citation::init(cx);
+    open_source::init(cx);
 }
