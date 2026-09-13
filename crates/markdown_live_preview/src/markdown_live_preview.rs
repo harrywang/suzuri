@@ -5213,10 +5213,20 @@ fn render_references_block(
         let text_color = block_cx.app.theme().colors().text;
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
-        // Widths are explicit: text wraps to its own box, and a box sized to
-        // the editor's full width but pushed right by the gutter runs past
-        // the edge.
-        let text_width = block_cx.max_width - gutter_width;
+        // `max_width` includes the editor's horizontal scroll range (see the
+        // table block), so text wrapped to it runs past the viewport. Wrap
+        // to the visible width instead.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width);
+        let text_width = (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
+            .max(gpui::px(200.));
         let hanging_indent = block_cx.em_width * 2.;
         div()
             .pl(gutter_width)
