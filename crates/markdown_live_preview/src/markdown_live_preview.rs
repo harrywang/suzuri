@@ -4903,6 +4903,11 @@ fn render_references_block(
         let text_color = block_cx.app.theme().colors().text;
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        // Widths are explicit: text wraps to its own box, and a box sized to
+        // the editor's full width but pushed right by the gutter runs past
+        // the edge.
+        let text_width = block_cx.max_width - gutter_width;
+        let hanging_indent = block_cx.em_width * 2.;
         div()
             .pl(gutter_width)
             .w(block_cx.max_width)
@@ -4916,16 +4921,19 @@ fn render_references_block(
             )
             .child(
                 div()
+                    .w(text_width)
                     .text_xl()
                     .font_weight(FontWeight::BOLD)
                     .pb_2()
                     .child(heading.clone()),
             )
-            .children(
-                items
-                    .iter()
-                    .map(|(_, text)| div().pl(block_cx.em_width * 2.).pb_1().child(text.clone())),
-            )
+            .children(items.iter().map(|(_, text)| {
+                div()
+                    .ml(hanging_indent)
+                    .w(text_width - hanging_indent)
+                    .pb_1()
+                    .child(text.clone())
+            }))
             .into_any_element()
     })
 }
