@@ -405,3 +405,48 @@ async fn test_commonmark_quote_boundary_editing(cx: &mut gpui::TestAppContext) {
         }
     }
 }
+
+#[gpui::test]
+async fn test_quote_linewise_boundaries_preserve_source(cx: &mut gpui::TestAppContext) {
+    let mut cx = markdown_context(cx, "ˇ").await;
+    for quote in [">", "> first\n>\n> last", "> first\n>> nested"] {
+        let state = format!("Before\nˇremove\n{quote}\n\nAfter");
+        for (keys, replacement) in [("c c n e w escape", "new"), ("y y p", "remove\nremove")] {
+            cx.set_state(&state, Mode::Normal);
+            cx.executor().run_until_parked();
+            cx.simulate_keystrokes(keys);
+            assert_eq!(
+                cx.buffer_text(),
+                format!("Before\n{replacement}\n{quote}\n\nAfter"),
+                "{keys} beside {quote:?}"
+            );
+        }
+        cx.set_state(&state, Mode::Normal);
+        cx.executor().run_until_parked();
+        cx.simulate_keystrokes("shift-v d");
+        assert_eq!(
+            cx.buffer_text(),
+            format!("Before\n{quote}\n\nAfter"),
+            "visual-line delete beside {quote:?}"
+        );
+        cx.set_state(&state, Mode::Normal);
+        cx.executor().run_until_parked();
+        cx.simulate_keystrokes("2 d d");
+        let remaining = quote
+            .split_once('\n')
+            .map_or(String::new(), |(_, rest)| format!("{rest}\n"));
+        assert_eq!(
+            cx.buffer_text(),
+            format!("Before\n{remaining}\nAfter"),
+            "counted delete beside {quote:?}"
+        );
+        cx.set_state(&state, Mode::Normal);
+        cx.executor().run_until_parked();
+        cx.simulate_keystrokes("j shift-v k d");
+        assert_eq!(
+            cx.buffer_text(),
+            format!("Before\n{remaining}\nAfter"),
+            "reversed visual-line delete beside {quote:?}"
+        );
+    }
+}
