@@ -5253,3 +5253,21 @@ async fn test_concealment_placeholders_are_not_flagged_as_hidden_characters(
         "concealed markers must not surface the hidden-character glyph"
     );
 }
+
+/// Inline code reads like the markdown preview's pill: the content between
+/// the backticks carries the `CODE` highlight (plain text color on a faint
+/// background), and the backticks themselves are concealed, not styled.
+#[gpui::test]
+async fn test_inline_code_is_styled_like_the_preview(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nread `refs/refs.bib` and ``a `nested` one`` here\n");
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text()
+            .contains("read refs/refs.bib and a `nested` one here")
+    );
+    let editor = cx.editor.clone();
+    let mut styled = highlighted_texts(&editor, CODE, &mut cx);
+    styled.sort();
+    assert_eq!(styled, vec!["a `nested` one", "refs/refs.bib"]);
+}

@@ -587,6 +587,9 @@ struct MarkerSet {
     /// other inline constructs a tag has no syntax to hide: the `#` is part
     /// of the tag's name, so it is styled in place rather than concealed.
     tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -973,6 +976,7 @@ const CITATION: usize = 6;
 const HIGHLIGHT: usize = 7;
 const TAG: usize = 8;
 const CITATION_UNKNOWN: usize = 9;
+const CODE: usize = 10;
 const HEADING_STYLE_BASE: usize = 100;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
@@ -998,6 +1002,8 @@ fn apply_emphasis_highlights(
     // works in one.
     let highlight_background = cx.theme().status().warning.opacity(0.28);
     let tag_background = cx.theme().status().info_background;
+    // Same pill the markdown preview draws for inline code.
+    let code_background = cx.theme().colors().editor_foreground.opacity(0.08);
     let error_color = cx.theme().status().error;
 
     // A cite key that resolves to no `.bib` entry is the kind of silent error
@@ -1135,6 +1141,15 @@ fn apply_emphasis_highlights(
                 color: Some(accent_color),
                 background_color: Some(tag_background),
                 font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            CODE,
+            markers.map(|markers| markers.code.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                background_color: Some(code_background),
                 ..Default::default()
             },
         ),
@@ -6386,6 +6401,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations: Vec::new(),
         highlights: Vec::new(),
         tags: Vec::new(),
+        code: Vec::new(),
     };
 
     for layer in buffer_snapshot.syntax_layers() {
@@ -6419,6 +6435,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations,
         highlights,
         tags,
+        code,
         ..
     } = extraction;
 
@@ -6462,6 +6479,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations,
         highlights,
         tags,
+        code,
     })
 }
 
@@ -6490,6 +6508,9 @@ struct Extraction<'a> {
     bare_citations: Vec<Range<Anchor>>,
     highlights: Vec<Range<Anchor>>,
     tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
 }
 
 impl Extraction<'_> {
@@ -6875,13 +6896,24 @@ impl Extraction<'_> {
                 }
                 "code_span" => {
                     self.code_spans.push(node.byte_range());
+                    let mut content = node.byte_range();
                     for index in 0..node.child_count() {
                         let Some(child) = node.child(index) else {
                             continue;
                         };
                         if child.kind() == "code_span_delimiter" {
-                            self.hide(child.byte_range(), node.byte_range());
+                            let delimiter = child.byte_range();
+                            if delimiter.start == content.start {
+                                content.start = delimiter.end;
+                            } else {
+                                content.end = content.end.min(delimiter.start);
+                            }
+                            self.hide(delimiter, node.byte_range());
                         }
+                    }
+                    if content.start < content.end {
+                        let range = self.anchor_range(content);
+                        self.code.push(range);
                     }
                 }
                 "inline_link" | "full_reference_link" | "collapsed_reference_link" => {
