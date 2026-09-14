@@ -54,10 +54,17 @@ Or build from source, the same way Zed builds:
 
 ## Credits
 
-Suzuri stands on generous shoulders:
+Suzuri's own code is the work of:
+
+- [Harry Wang](https://github.com/harrywang)
+- [Silouan Wright](https://github.com/silouanwright) — live-preview concealment fixes
+- [David Turnbull](https://github.com/dsturnbull) — the PDF viewer ([zed#51040](https://github.com/zed-industries/zed/pull/51040)) and the hayro text-extraction work it builds on
+
+GitHub's contributors sidebar also lists everyone who has contributed to [Zed](https://github.com/zed-industries/zed) since this fork began, because Suzuri merges upstream weekly.
+
+And it stands on generous shoulders:
 
 - [Zed](https://zed.dev) — the editor underneath everything
-- [David Turnbull](https://github.com/dsturnbull) — the PDF viewer ([zed#51040](https://github.com/zed-industries/zed/pull/51040)) and the hayro text-extraction work it builds on
 - [hayro](https://github.com/LaurenzV/hayro) by Laurenz Stampfl — pure-Rust PDF rendering
 - [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide) by Felix Zeller — the PKM language server behind wikilinks, backlinks, and link diagnostics
 - [Typst](https://github.com/typst/typst) — the compiler behind Typst live preview
