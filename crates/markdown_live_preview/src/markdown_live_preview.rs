@@ -99,28 +99,28 @@ impl Default for MarkdownHeadingStyles {
     fn default() -> Self {
         Self {
             h1: MarkdownHeadingStyle {
-                font_size: 1.6,
-                font_weight: FontWeight::BLACK,
+                font_size: 1.75,
+                font_weight: FontWeight::SEMIBOLD,
             },
             h2: MarkdownHeadingStyle {
                 font_size: 1.4,
-                font_weight: FontWeight::EXTRA_BOLD,
+                font_weight: FontWeight::SEMIBOLD,
             },
             h3: MarkdownHeadingStyle {
                 font_size: 1.2,
-                font_weight: FontWeight::BOLD,
+                font_weight: FontWeight::SEMIBOLD,
             },
             h4: MarkdownHeadingStyle {
-                font_size: 1.1,
+                font_size: 1.0,
                 font_weight: FontWeight::SEMIBOLD,
             },
             h5: MarkdownHeadingStyle {
-                font_size: 1.0,
-                font_weight: FontWeight::MEDIUM,
+                font_size: 0.875,
+                font_weight: FontWeight::SEMIBOLD,
             },
             h6: MarkdownHeadingStyle {
-                font_size: 0.9,
-                font_weight: FontWeight::NORMAL,
+                font_size: 0.85,
+                font_weight: FontWeight::SEMIBOLD,
             },
         }
     }
@@ -1171,7 +1171,11 @@ fn apply_heading_line_styles(
             key,
             ranges.clone(),
             HighlightStyle {
-                color: Some(cx.theme().colors().text),
+                color: Some(if level == 6 {
+                    cx.theme().colors().text_muted
+                } else {
+                    cx.theme().colors().text
+                }),
                 font_weight: Some(heading_style.font_weight),
                 ..Default::default()
             },
@@ -6238,6 +6242,7 @@ fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             font_family: Some(font_family.clone()),
             font_size: Some(metrics.font_size.into()),
             font_weight: Some(metrics.text.font_weight),
+            color: (level == 6).then_some(cx.theme().colors().text_muted),
             line_height: Some(metrics.content_line_height.into()),
             ..Default::default()
         })

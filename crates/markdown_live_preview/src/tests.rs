@@ -51,8 +51,8 @@ async fn markdown_test_context(cx: &mut TestAppContext) -> EditorTestContext {
 fn test_heading_typography_defaults_and_overrides() {
     let defaults =
         MarkdownLivePreviewSettings::from_settings(&settings::SettingsContent::default());
-    assert_eq!(defaults.heading_styles.h1.font_size, 1.6);
-    assert_eq!(defaults.heading_styles.h1.font_weight, FontWeight::BLACK);
+    assert_eq!(defaults.heading_styles.h1.font_size, 1.75);
+    assert_eq!(defaults.heading_styles.h1.font_weight, FontWeight::SEMIBOLD);
 
     let mut content = settings::SettingsContent::default();
     content.markdown_live_preview = Some(settings::MarkdownLivePreviewSettingsContent {
@@ -79,6 +79,70 @@ fn test_heading_typography_defaults_and_overrides() {
         custom.heading_styles.h3,
         MarkdownHeadingStyles::default().h3
     );
+}
+
+#[gpui::test]
+async fn test_heading_defaults_match_markdown_preview(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("# One\n## Two\n### Three\n#### Four\n##### Five\n###### Six\nˇbody");
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        let preview = MarkdownStyle::themed(MarkdownFont::Preview, window, cx);
+        let levels = preview
+            .heading_level_styles
+            .as_ref()
+            .expect("preview heading styles");
+        let rendered = block_markdown_style(window, cx);
+        let rendered_levels = rendered
+            .heading_level_styles
+            .as_ref()
+            .expect("block heading styles");
+        let sizes = [1.75, 1.4, 1.2, 1.0, 0.875, 0.85];
+        for (index, (preview_level, block_level)) in [
+            &levels.h1, &levels.h2, &levels.h3, &levels.h4, &levels.h5, &levels.h6,
+        ]
+        .into_iter()
+        .zip([
+            &rendered_levels.h1,
+            &rendered_levels.h2,
+            &rendered_levels.h3,
+            &rendered_levels.h4,
+            &rendered_levels.h5,
+            &rendered_levels.h6,
+        ])
+        .enumerate()
+        {
+            let level = index as u8 + 1;
+            let preview_level = preview_level.as_ref().expect("preview heading level");
+            let configured = MarkdownLivePreviewSettings::get_global(cx)
+                .heading_styles
+                .for_level(level);
+            assert_eq!(configured.font_size, sizes[index]);
+            assert_eq!(
+                preview_level.font_size,
+                Some(gpui::rems(configured.font_size).into())
+            );
+            assert_eq!(Some(configured.font_weight), preview_level.font_weight);
+            let color = preview_level.color.or(preview.heading.text.color);
+            let (highlight, _) = editor
+                .text_highlights(
+                    HighlightKey::MarkdownLivePreview(HEADING_STYLE_BASE + level as usize),
+                    cx,
+                )
+                .expect("native heading highlight");
+            assert_eq!(highlight.color, color);
+            assert_eq!(highlight.font_weight, preview_level.font_weight);
+            assert_eq!(
+                block_level
+                    .as_ref()
+                    .expect("block heading level")
+                    .color
+                    .or(rendered.heading.text.color)
+                    .or(Some(rendered.base_text_style.color)),
+                color
+            );
+        }
+    });
 }
 
 #[gpui::test]
