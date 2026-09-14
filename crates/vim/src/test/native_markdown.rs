@@ -255,12 +255,12 @@ async fn test_native_heading_search_change_with_other_fold(cx: &mut gpui::TestAp
 
 #[gpui::test]
 async fn test_native_heading_unicode_and_inline_markup(cx: &mut gpui::TestAppContext) {
-    let mut cx = markdown_context(cx, "ˇabove\n## **Κύριε** мир 🌿\nbody").await;
-    assert_eq!(cx.display_text(), "above\nΚύριε мир 🌿\nbody");
+    let mut cx = markdown_context(cx, "ˇabove\n## **άλφα** мир 🌿\nbody").await;
+    assert_eq!(cx.display_text(), "above\nάλφα мир 🌿\nbody");
     cx.simulate_keystrokes("d d");
-    assert_eq!(cx.buffer_text(), "## **Κύριε** мир 🌿\nbody");
+    assert_eq!(cx.buffer_text(), "## **άλφα** мир 🌿\nbody");
     cx.simulate_keystrokes("u");
-    assert_eq!(cx.buffer_text(), "above\n## **Κύριε** мир 🌿\nbody");
+    assert_eq!(cx.buffer_text(), "above\n## **άλφα** мир 🌿\nbody");
 }
 
 #[gpui::test]
