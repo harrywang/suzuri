@@ -218,6 +218,7 @@ the local copy once a merge brings the patch back as vendor code, and clear the 
 | --- | --- | --- |
 | Notebook save destroyed rich outputs (`display_data` images, HTML tables, JSON) and rewrote `execute_result` as `display_data`; cell source also gained a trailing newline, churning every cell | `crates/repl/src/notebook/cell.rs`, `crates/repl/src/outputs.rs` | [zed#63064](https://github.com/zed-industries/zed/pull/63064) |
 | Kernel picker offered an `ipykernel` install for externally managed interpreters, where no installer can succeed, and the failure toast showed uv's trailing `hint:` instead of the reason | `crates/repl/src/kernels/mod.rs`, `crates/repl/src/repl_editor.rs`, `crates/repl/src/components/kernel_options.rs` | [zed#63086](https://github.com/zed-industries/zed/pull/63086) |
+| Kernel picker showed a stale Python environment list: it was scanned once when the notebook opened, so a `.venv` created afterwards never appeared until the tab was reopened. The picker now rescans on open and updates in place | `crates/repl/src/components/kernel_options.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/zed/src/zed/quick_action_bar/repl_menu.rs` | [zed#64170](https://github.com/zed-industries/zed/pull/64170) |
 
 ## Jupyter notebooks (temporary fork delta)
 
