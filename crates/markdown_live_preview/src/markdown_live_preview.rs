@@ -1343,13 +1343,10 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         }
         let mut below = false;
         if rows_intersect(&selection_rows, start.row, end.row) {
-            // Headings remain styled while selected and expose editing inside
-            // their replacement block. Other interactive widgets reveal source
-            // only through their explicit controls.
+            // Interactive widgets reveal source only through their explicit controls.
             let keeps_widget_when_selected = matches!(
                 marker.kind,
-                BlockRenderKind::Heading { .. }
-                    | BlockRenderKind::Table(_)
+                BlockRenderKind::Table(_)
                     | BlockRenderKind::Image { .. }
                     | BlockRenderKind::Frontmatter
             );
@@ -1476,7 +1473,8 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     {
         let render = match &marker.kind {
             BlockRenderKind::Heading { .. } => {
-                unreachable!("headings use native line typography")
+                debug_assert!(false, "headings use native line typography");
+                continue;
             }
             BlockRenderKind::Markdown => {
                 let markdown = cx.new(|cx| {
