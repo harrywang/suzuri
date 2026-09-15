@@ -142,7 +142,7 @@
       "h3": { "font_size": 1.2, "font_weight": 600 },
       "h4": { "font_size": 1.0, "font_weight": 600 },
       "h5": { "font_size": 0.875, "font_weight": 600 },
-      "h6": { "font_size": 0.85, "font_weight": 600 }
+      "h6": { "font_size": 0.85, "font_weight": 600 },
     },
     // SUZURI: Quote colors inherit existing themes unless explicitly overridden.
     // Theme role for plain quote borders: accent, text, muted_text, or line_number.
