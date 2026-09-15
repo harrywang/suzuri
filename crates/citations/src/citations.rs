@@ -26,7 +26,7 @@ pub use library::{DEFAULT_LIBRARY_PATH, Merge, append_entry, merge_entry};
 pub use open_source::{OpenSource, source_for_cursor};
 pub use render::{
     CslStyle, DEFAULT_STYLE, RenderedReference, document_style, render_bibliography,
-    render_reference, style_named,
+    render_reference, style_named, style_xml,
 };
 pub use zotero::{DEFAULT_BASE_URL, ZoteroClient, ZoteroError, ZoteroItem, ZoteroStatus};
 

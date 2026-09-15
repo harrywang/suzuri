@@ -247,6 +247,9 @@ pub struct SettingsContent {
     /// The settings for inserting citations from Zotero into the vault library.
     pub citations: Option<CitationsSettingsContent>,
 
+    /// The settings for exporting markdown notes to other formats.
+    pub markdown_export: Option<MarkdownExportSettingsContent>,
+
     /// The settings for live Typst and LaTeX preview.
     pub typeset_preview: Option<TypesetPreviewSettingsContent>,
 
@@ -412,7 +415,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         // SUZURI: the fork's own settings sections must be listed here too.
-        markdown_live_preview, typeset_preview, citations,
+        markdown_live_preview, typeset_preview, citations, markdown_export,
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
@@ -1376,6 +1379,19 @@ pub struct CitationsSettingsContent {
     ///
     /// Default: "http://127.0.0.1:23119"
     pub zotero_url: Option<String>,
+}
+
+/// The settings for exporting markdown notes to other formats.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct MarkdownExportSettingsContent {
+    /// The program Pandoc typesets PDFs with. Typst is the default because
+    /// live preview already provisions it, so exporting a PDF needs no TeX
+    /// installation; a LaTeX engine such as "xelatex" uses a TeX Live you
+    /// already have.
+    ///
+    /// Default: "typst"
+    pub pdf_engine: Option<String>,
 }
 
 /// The settings for live Typst and LaTeX preview.

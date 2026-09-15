@@ -56,6 +56,17 @@ pub fn style_named(name: &str) -> Option<Arc<CslStyle>> {
     Some(style)
 }
 
+/// The bundled style called `name` as CSL XML.
+///
+/// Hayagriva renders the preview's own citations from its decoded form, but an
+/// external converter speaks CSL and nothing else. Re-serializing the archived
+/// style is what lets an exported document carry the same style the preview
+/// shows, rather than falling back to whatever default the converter ships.
+pub fn style_xml(name: &str) -> Option<String> {
+    let name = name.trim().trim_end_matches(".csl").to_ascii_lowercase();
+    ArchivedStyle::by_name(&name)?.get().to_xml().ok()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedReference {
     /// The in-text form, e.g. `(Vaswani et al., 2017)`.

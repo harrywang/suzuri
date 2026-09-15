@@ -170,6 +170,7 @@ log.workspace = true
 lsp_locations.workspace = true
 markdown.workspace = true
 citations.workspace = true
+markdown_export.workspace = true
 markdown_live_preview.workspace = true
 markdown_preview.workspace = true
 menu.workspace = true

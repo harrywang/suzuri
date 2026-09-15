@@ -10874,6 +10874,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "markdown_export"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "citations",
+ "editor",
+ "gpui",
+ "http_client",
+ "paths",
+ "project",
+ "settings",
+ "smol",
+ "tempfile",
+ "typeset_preview",
+ "util",
+ "which",
+ "workspace",
+]
+
+[[package]]
 name = "markdown_live_preview"
 version = "0.1.0"
 dependencies = [
@@ -23518,6 +23538,7 @@ dependencies = [
  "lsp_command_selector",
  "lsp_locations",
  "markdown",
+ "markdown_export",
  "markdown_live_preview",
  "markdown_preview",
  "menu",

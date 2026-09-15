@@ -547,6 +547,23 @@ async fn compile_command(
     }
 }
 
+/// The Typst this crate provisions, downloading it if it is not there yet.
+///
+/// Exposed so other features that need a typesetting engine share the one
+/// download rather than each fetching a copy: markdown export uses Typst as
+/// its PDF engine for exactly this reason.
+pub async fn ensure_typst_binary(
+    http: std::sync::Arc<dyn http_client::HttpClient>,
+) -> Result<PathBuf> {
+    ensure_typst(http).await
+}
+
+/// Where a provisioned Typst lives, whether or not it has been downloaded.
+/// Callers use it to decide whether an export would have to download first.
+pub fn provisioned_typst_path() -> Option<PathBuf> {
+    provisioned_typst().ok()
+}
+
 async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Result<PathBuf> {
     let binary = provisioned_typst()?;
     if binary.exists() {
