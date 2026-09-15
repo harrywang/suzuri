@@ -33,6 +33,8 @@ Download the latest installer:
 
 The macOS builds are signed and notarized — open the DMG and drag Suzuri to Applications. The Windows installer is not yet signed, so SmartScreen shows a warning: choose "More info → Run anyway".
 
+That first install is the only manual one. Suzuri checks for new releases while it runs, installs them in the background, and shows a "Restart to update" button in the title bar; Suzuri → Check for Updates does the same on demand. Set `"auto_update": false` in settings to turn the background check off.
+
 The Linux build is a plain tarball. Extract it somewhere permanent, put its `bin/suzuri` on your PATH, and optionally copy its `share/` folder into `~/.local/share` for an app-menu entry and icon:
 
 ```sh

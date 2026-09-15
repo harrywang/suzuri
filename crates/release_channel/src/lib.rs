@@ -199,7 +199,10 @@ impl ReleaseChannel {
 
     /// Returns whether we want to poll for updates for this [`ReleaseChannel`]
     pub fn poll_for_updates(&self) -> bool {
-        !matches!(self, ReleaseChannel::Dev)
+        // SUZURI: dev is Suzuri's release channel. A bundled dev build updates
+        // itself from Suzuri's GitHub releases (see `auto_update`), while a
+        // `cargo run` build must never rsync a release over its target dir.
+        !matches!(self, ReleaseChannel::Dev) || option_env!("ZED_BUNDLE").is_some()
     }
 
     /// Returns the display name for this [`ReleaseChannel`].

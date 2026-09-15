@@ -269,7 +269,14 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     })
     .detach();
 
-    let version = release_channel::AppVersion::global(cx);
+    // SUZURI: on the dev channel the running app is a Suzuri release, whose
+    // version line is unrelated to the Zed base's `AppVersion`.
+    let version = match ReleaseChannel::try_global(cx) {
+        Some(ReleaseChannel::Dev) => suzuri_update::SUZURI_VERSION
+            .parse()
+            .unwrap_or_else(|_| release_channel::AppVersion::global(cx)),
+        _ => release_channel::AppVersion::global(cx),
+    };
     let auto_updater = cx.new(|cx| {
         let updater = AutoUpdater::new(version, client, cx);
 
@@ -353,7 +360,13 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
         ReleaseChannel::Nightly => {
             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
         }
-        ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
+        // SUZURI: a dev build is a Suzuri release; its notes are on GitHub.
+        ReleaseChannel::Dev => {
+            let mut version = AutoUpdater::get(cx)?.read(cx).current_version();
+            version.pre = semver::Prerelease::EMPTY;
+            version.build = semver::BuildMetadata::EMPTY;
+            suzuri_update::release_page_url(&version)
+        }
     };
     Some(url)
 }
@@ -676,12 +689,21 @@ impl AutoUpdater {
         arch: &str,
         cx: &mut AsyncApp,
     ) -> Result<ReleaseAsset> {
-        // SUZURI: Suzuri publishes its remote servers as GitHub release assets;
-        // the release index queried below only knows Zed's builds.
+        // SUZURI: Suzuri publishes its builds as GitHub release assets; the
+        // release index queried below only knows Zed's builds, and would
+        // install Zed over Suzuri.
         if asset == "zed-remote-server" {
             return Ok(ReleaseAsset {
                 version: suzuri_update::SUZURI_VERSION.to_string(),
                 url: suzuri_update::remote_server_download_url(os, arch),
+            });
+        }
+        if asset == "zed" && release_channel == ReleaseChannel::Dev {
+            let http_client = this.read_with(cx, |this, _| this.client.http_client());
+            let release = suzuri_update::latest_app_release(http_client, os, arch).await?;
+            return Ok(ReleaseAsset {
+                version: release.version.to_string(),
+                url: release.download_url,
             });
         }
 
@@ -1127,7 +1149,7 @@ async fn download_release(
 async fn install_release_linux(
     temp_dir: &InstallerDir,
     downloaded_tar_gz: &Path,
-    channel: &str,
+    _channel: &str,
     running_app_path: PathBuf,
 ) -> Result<Option<PathBuf>> {
     let home_dir = PathBuf::from(env::var("HOME").context("no HOME env var set")?);
@@ -1155,12 +1177,9 @@ async fn install_release_linux(
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let suffix = if channel != "stable" {
-        format!("-{}", channel)
-    } else {
-        String::default()
-    };
-    let app_folder_name = format!("zed{}.app", suffix);
+    // SUZURI: the tarball's top-level folder is `suzuri.app` on every channel,
+    // and so is the folder a running build lives in; see script/bundle-linux.
+    let app_folder_name = "suzuri.app".to_string();
 
     let from = extracted.join(&app_folder_name);
     let mut to = home_dir.join(".local");
@@ -1206,11 +1225,13 @@ async fn install_release_macos(
     let mut mounted_app_path: OsString = mount_path.join(running_app_filename).into();
 
     mounted_app_path.push("/");
+    // SUZURI: an explicit mount point, because `-mountroot` would mount the
+    // image under its volume name, which `script/bundle-mac` sets to Suzuri.
     let mut cmd = new_command("hdiutil");
     cmd.args(["attach", "-nobrowse"])
         .arg(&downloaded_dmg)
-        .arg("-mountroot")
-        .arg(temp_dir.path());
+        .arg("-mountpoint")
+        .arg(&mount_path);
     let output = cmd
         .output()
         .await

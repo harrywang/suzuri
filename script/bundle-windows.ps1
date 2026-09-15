@@ -69,6 +69,9 @@ Push-Location -Path crates/zed
 $channel = Get-Content "RELEASE_CHANNEL"
 $env:ZED_RELEASE_CHANNEL = $channel
 $env:RELEASE_CHANNEL = $channel
+# SUZURI: marks the build as installed, which is what lets a dev-channel
+# build update itself (see `ReleaseChannel::poll_for_updates`).
+$env:ZED_BUNDLE = "true"
 Pop-Location
 
 function CheckEnvironmentVariables {
