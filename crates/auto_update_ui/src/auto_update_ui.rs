@@ -335,7 +335,11 @@ fn show_update_notification(cx: &mut App) {
     let mut version = updater.read(cx).current_version();
     version.pre = semver::Prerelease::EMPTY;
     version.build = semver::BuildMetadata::EMPTY;
-    let app_name = ReleaseChannel::global(cx).display_name();
+    // SUZURI: Suzuri ships on the dev channel, whose display name is "Zed Dev".
+    let app_name = match ReleaseChannel::global(cx) {
+        ReleaseChannel::Dev => "Suzuri",
+        channel => channel.display_name(),
+    };
 
     if let Some(content) = announcement_for_version(&version, cx) {
         show_app_notification(

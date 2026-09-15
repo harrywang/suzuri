@@ -18003,12 +18003,9 @@ name = "suzuri_update"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "gpui",
+ "futures 0.3.34",
  "http_client",
- "log",
  "semver",
- "settings",
- "workspace",
 ]
 
 [[package]]

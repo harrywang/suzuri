@@ -34,7 +34,7 @@ The fork's own changes are small and additive:
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
-| Update notifications | `crates/suzuri_update/`, `crates/zed/src/zed/app_menus.rs` (the Check for Updates entry) |
+| In-app updates from GitHub releases (see "Cutting a release") | `crates/suzuri_update/`, `crates/auto_update/src/auto_update.rs` (`init`, `get_release_asset`, `release_notes_url`, the macOS and Linux installers), `crates/auto_update_ui/src/auto_update_ui.rs` (app name), `crates/release_channel/src/lib.rs` (`poll_for_updates`) |
 | Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
 | Remote server provisioning on the dev channel (SSH/Docker/WSL remotes; see "Cutting a release") | `crates/auto_update/src/auto_update.rs` (`get_release_asset`), `crates/remote/src/transport/ssh.rs`, `docker.rs`, `wsl.rs` (`ensure_server_binary`) |
 | Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
@@ -275,11 +275,12 @@ The chain is spread across crates and the compiler only catches part of it:
 
 ## Cutting a release
 
-Suzuri ships on the **dev** release channel, which is what keeps Zed's auto-updater
-dormant (`ReleaseChannel::poll_for_updates` returns false for `Dev`) and what makes
+Suzuri ships on the **dev** release channel, which is what makes
 `[package.metadata.bundle]` — the block carrying Suzuri's branding — the one
-`script/bundle-mac` selects. Do not switch the channel casually: `bundle-stable` is
-still Zed's own metadata, so a stable build would install itself as `Zed.app`.
+`script/bundle-mac` selects, and what tells Zed's updater to update from Suzuri's
+GitHub releases (see "In-app updates" below). Do not switch the channel casually:
+`bundle-stable` is still Zed's own metadata, so a stable build would install itself
+as `Zed.app`, and on any other channel the updater asks Zed's release server.
 
 To release:
 
@@ -310,10 +311,19 @@ same commit, so never replace a release's assets by hand; and a locally bundled,
 untagged build will look for a release that does not exist — dogfood remoting from a
 debug build, which compiles the server from source instead.
 
-`suzuri_update` only *notifies*; it never installs. Zed's installer (`auto_update`)
-is not wired up, and adopting it would need, at minimum, its hardcoded `Zed` DMG
-mount path in `install_release_macos` reconciled with `bundle-mac`'s `-volname Suzuri`,
-plus signing secrets present on every release build.
+**In-app updates.** Zed's own updater (`auto_update`) downloads, installs and
+restarts; the fork only points it at Suzuri. On the dev channel it takes its running
+version from `SUZURI_VERSION`, resolves the `zed` asset through
+`suzuri_update::latest_app_release` (the DMG, installer `.exe` or tarball of the
+newest `suzuri-v*` GitHub release), and opens that release's page as the release
+notes; Zed's release server is never asked. `ReleaseChannel::poll_for_updates` is
+true for a dev build only when `ZED_BUNDLE` was set at compile time, which every
+bundle script does, so a `cargo run` build never rsyncs a release over its target
+dir. Two installer details are fork-owned: the DMG mounts at an explicit
+`-mountpoint` because `bundle-mac` names the volume Suzuri, and the Linux tarball's
+folder is `suzuri.app`. All hunks are tagged `SUZURI:`. The macOS install rsyncs
+over the running bundle with no rollback, exactly as Zed does; the DMGs are
+Developer ID signed and notarized, so the result passes Gatekeeper.
 
 ## Crash recovery
 
