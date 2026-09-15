@@ -2576,8 +2576,18 @@ fn render_markdown_block(
             .max_width
             .min((visible_width - block_cx.margins.right).max(gpui::px(1.)));
         let source_click_editor = editor.clone();
+        let is_quote = markdown
+            .read(block_cx.app)
+            .source()
+            .trim_start()
+            .starts_with('>');
         div()
             .debug_selector(|| "mdlp-prose-block".into())
+            // The editor rounds block heights up to whole rows. Share that
+            // unused space above and below a quote instead of leaving it below.
+            .when(is_quote, |block| {
+                block.flex().flex_col().justify_center().h_full()
+            })
             .pl(gutter_width)
             .w(max_width)
             .cursor_pointer()

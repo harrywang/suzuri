@@ -5474,23 +5474,25 @@ async fn test_quote_wraps_with_wide_source_line(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_quote_has_no_trailing_renderer_margin(cx: &mut TestAppContext) {
+async fn test_quote_balances_unused_row_space(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
-    for source in [
-        "> first",
-        "> first\n>\n> second",
-        "> first\n>\n> second\n>\n> third",
-    ] {
-        cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
-        cx.executor().run_until_parked();
-        let quote = cx.cx.debug_bounds("markdown-quote").unwrap();
-        let block = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
-        assert_eq!(
-            quote.bottom(),
-            block.bottom(),
-            "trailing margin for {source:?}"
-        );
-        cx.update_editor(|editor, window, cx| {
+    let mut balanced_nonzero_space = false;
+    for width in [420., 800.] {
+        cx.cx
+            .simulate_resize(gpui::size(gpui::px(width), gpui::px(1080.)));
+        for source in [
+            "> first",
+            "> first\n>\n> second",
+            "> first\n>\n> second\n>\n> third",
+            "> A longer quote that wraps across several lines in a narrow editor pane, while retaining balanced space above and below its rendered content.\n>\n> Another paragraph in the same quote.",
+        ] {
+            cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
+            cx.executor().run_until_parked();
+            let quote = cx.cx.debug_bounds("markdown-quote").unwrap();
+            let block = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
+            let space_above = quote.top() - block.top();
+            balanced_nonzero_space |= space_above > gpui::px(1.);
+            cx.update_editor(|editor, window, cx| {
             let snapshot = editor.display_snapshot(cx);
             let id = editor.addon::<LivePreviewAddon>().unwrap().applied_blocks[0].block_id;
             let rows = snapshot
@@ -5500,14 +5502,25 @@ async fn test_quote_has_no_trailing_renderer_margin(cx: &mut TestAppContext) {
             let line_height = editor
                 .style(cx)
                 .text
-                .line_height_in_pixels(window.rem_size())
-                .round();
+                .line_height_in_pixels(window.rem_size());
             let reserved = line_height * rows as f32;
-            assert!(reserved >= quote.size.height);
+            let space_below = block.top() + reserved - quote.bottom();
+            assert!(space_above >= gpui::px(0.));
+            assert!(space_below >= gpui::px(0.));
+            // Layout may snap the two edges to neighboring pixels.
             assert!(
-                reserved - quote.size.height < line_height,
+                (space_above - space_below).abs() <= gpui::px(1.),
+                "unequal quote spacing for {source:?}: above={space_above:?}, below={space_below:?}"
+            );
+            assert!(
+                space_above + space_below < line_height,
                 "more than rounding slack: {source:?}"
             );
         });
+        }
     }
+    assert!(
+        balanced_nonzero_space,
+        "exercise quotes with visible rounding space"
+    );
 }
