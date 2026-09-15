@@ -142,11 +142,26 @@
       "h3": { "font_size": 1.2, "font_weight": 600 },
       "h4": { "font_size": 1.0, "font_weight": 600 },
       "h5": { "font_size": 0.875, "font_weight": 600 },
-      "h6": { "font_size": 0.85, "font_weight": 600 }
+      "h6": { "font_size": 0.85, "font_weight": 600 },
     },
     // Folder for attachments dropped onto a markdown buffer, relative to the
     // note's folder. An empty string stores attachments in the note's folder.
     "attachments_folder": "attachments",
+  },
+  // Markdown export settings
+  "markdown_export": {
+    // The program Pandoc typesets PDFs with.
+    //
+    // "typst" is the default because live preview already provisions Typst,
+    // so exporting a PDF needs no TeX installation at all. Naming a LaTeX
+    // engine instead uses a TeX Live you already have, which is what a
+    // conference template pinning \RequirePDFTeX will want:
+    //   "typst", "xelatex", "lualatex", "pdflatex", "context"
+    "pdf_engine": "typst",
+    // The BibLaTeX file citations are resolved against, relative to the
+    // project root. When it exists, Pandoc formats every [@key] from it in
+    // the style the note's frontmatter names and appends the reference list.
+    "bibliography": "refs/refs.bib",
   },
   // Live Typst and LaTeX preview settings
   "typeset_preview": {
