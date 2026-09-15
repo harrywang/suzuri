@@ -151,6 +151,9 @@
     // Null preserves existing spacing; zero is allowed.
     "block_quote_border_width": null,
     "block_quote_gap": null,
+    // Space between paragraphs inside plain quotes, in logical pixels.
+    // Null uses the renderer's default (8px); zero removes the paragraph gap.
+    "block_quote_paragraph_spacing": null,
     // Folder for attachments dropped onto a markdown buffer, relative to the
     // note's folder. An empty string stores attachments in the note's folder.
     "attachments_folder": "attachments",

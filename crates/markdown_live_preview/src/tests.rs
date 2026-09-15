@@ -5421,11 +5421,18 @@ async fn test_quote_geometry_settings(cx: &mut TestAppContext) {
                     let quote = content.markdown_live_preview.get_or_insert_default();
                     quote.block_quote_border_width = value;
                     quote.block_quote_gap = value;
+                    quote.block_quote_paragraph_spacing = value;
                 });
             });
             let style = block_markdown_style(window, cx);
             assert_eq!(style.block_quote_border_width, expected.map(gpui::px));
             assert_eq!(style.block_quote_gap, expected.map(gpui::px));
+            assert_eq!(
+                MarkdownLivePreviewSettings::get_global(cx).block_quote_paragraph_spacing,
+                expected
+            );
+            // The override is applied only when rendering a plain quote.
+            assert_eq!(style.paragraph_spacing, gpui::px(8.));
         });
     }
 }
@@ -5474,7 +5481,7 @@ async fn test_quote_wraps_with_wide_source_line(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_quote_text_stays_on_editor_rows(cx: &mut TestAppContext) {
+async fn test_quote_paragraph_spacing_keeps_first_line_anchored(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     for (font_size, line_height) in [(14., 1.3), (17.5, 1.4)] {
         cx.cx.update(|_, cx| {
@@ -5489,48 +5496,67 @@ async fn test_quote_text_stays_on_editor_rows(cx: &mut TestAppContext) {
         for width in [420., 800.] {
             cx.cx
                 .simulate_resize(gpui::size(gpui::px(width), gpui::px(1080.)));
-            for source in [
-                "> first",
-                "> first\n>\n> second",
-                "> first\n>\n>\n>\n> second",
-                "> first\n>\n> second\n>\n> third",
-                "> A longer quote that wraps across several lines in a narrow editor pane, while retaining the editor line spacing throughout its rendered content.\n>\n> Another paragraph in the same quote.",
-            ] {
-                cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
-                cx.executor().run_until_parked();
-                let quote = cx.cx.debug_bounds("markdown-quote").unwrap();
-                let block = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
-                assert_eq!(
-                    quote.top(),
-                    block.top(),
-                    "shifted first line for {source:?}"
-                );
-                cx.update_editor(|editor, window, cx| {
-                    let snapshot = editor.display_snapshot(cx);
-                    let id = editor.addon::<LivePreviewAddon>().unwrap().applied_blocks[0].block_id;
-                    let rows = snapshot
-                        .block_for_id(editor::display_map::BlockId::Custom(id))
-                        .unwrap()
-                        .height();
-                    let line_height = editor
-                        .style(cx)
-                        .text
-                        .line_height_in_pixels(window.rem_size());
-                    let reserved = line_height * rows as f32;
-                    assert!(
-                        (reserved - quote.size.height).abs() <= gpui::px(1.),
-                        "unused space for {source:?}: reserved={reserved:?}, quote={quote:?}"
-                    );
-                    if !source.starts_with("> A longer") {
-                        let paragraphs =
-                            source.lines().filter(|line| line.starts_with("> ")).count();
-                        assert_eq!(
-                            rows as usize,
-                            paragraphs * 2 - 1,
-                            "one editor row per paragraph and one row per paragraph break"
-                        );
-                    }
+            for spacing in [None, Some(0.), Some(12.5), Some(48.), None] {
+                cx.cx.update(|_, cx| {
+                    SettingsStore::update_global(cx, |store, cx| {
+                        store.update_user_settings(cx, |content| {
+                            content
+                                .markdown_live_preview
+                                .get_or_insert_default()
+                                .block_quote_paragraph_spacing = spacing;
+                        });
+                    });
                 });
+                for source in [
+                    "> first",
+                    "> first\n>\n> second",
+                    "> first\n>\n>\n>\n> second",
+                    "> first\n>\n> second\n>\n> third",
+                    "> A longer quote that wraps across several lines in a narrow editor pane, while retaining the editor line spacing throughout its rendered content.\n>\n> Another paragraph in the same quote.",
+                ] {
+                    cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
+                    cx.executor().run_until_parked();
+                    let quote = cx.cx.debug_bounds("markdown-quote").unwrap();
+                    let block = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
+                    assert_eq!(
+                        quote.top(),
+                        block.top(),
+                        "shifted first line for {source:?}, spacing={spacing:?}"
+                    );
+                    assert_eq!(quote.bottom(), block.bottom(), "trailing renderer margin");
+                    cx.update_editor(|editor, window, cx| {
+                        let snapshot = editor.display_snapshot(cx);
+                        let id = editor.addon::<LivePreviewAddon>().unwrap().applied_blocks[0].block_id;
+                        let rows = snapshot
+                            .block_for_id(editor::display_map::BlockId::Custom(id))
+                            .unwrap()
+                            .height();
+                        let line_height = editor
+                            .style(cx)
+                            .text
+                            .line_height_in_pixels(window.rem_size());
+                        let reserved = line_height * rows as f32;
+                        let slack = reserved - quote.size.height;
+                        assert!(
+                            slack >= -gpui::px(1.) && slack < line_height + gpui::px(1.),
+                            "more than rounding slack for {source:?}, spacing={spacing:?}: {slack:?}"
+                        );
+                        let paragraphs = source.lines().filter(|line| line.starts_with("> ")).count();
+                        let gaps = gpui::px(spacing.unwrap_or(8.)) * (paragraphs - 1) as f32;
+                        let text_height = quote.size.height - gaps;
+                        let text_rows = (text_height / line_height).round();
+                        assert!(
+                            (text_height - line_height * text_rows).abs() <= gpui::px(1.),
+                            "wrapped text must retain the editor line height"
+                        );
+                        if !source.starts_with("> A longer") {
+                            assert!(
+                                (text_height - line_height * paragraphs as f32).abs() <= gpui::px(1.),
+                                "unexpected paragraph gap for {source:?}, spacing={spacing:?}: {quote:?}"
+                            );
+                        }
+                    });
+                }
             }
         }
     }
