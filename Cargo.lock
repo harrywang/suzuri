@@ -10819,6 +10819,7 @@ dependencies = [
  "urlencoding",
  "util",
  "workspace",
+ "zed_actions",
  "zlog",
 ]
 

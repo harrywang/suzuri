@@ -781,6 +781,11 @@ impl BufferSerialization {
 
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
+    // SUZURI: Editable previews must reveal source before a motion is mapped through their replacement rows.
+    fn editable_replacement_blocks(&self) -> Vec<(Range<Anchor>, CustomBlockId)> {
+        Vec::new()
+    }
+
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
 
     fn render_buffer_header_controls(

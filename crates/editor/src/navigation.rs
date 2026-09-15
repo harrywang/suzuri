@@ -1,6 +1,138 @@
 use super::*;
 
 impl Editor {
+    // SUZURI: Let editable previews expose their source before vertical navigation loses the target row.
+    pub fn prepare_vertical_navigation(
+        &mut self,
+        row_delta: i64,
+        display_lines: bool,
+        inclusive_selection: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let candidates = self
+            .addons
+            .values()
+            .flat_map(|addon| addon.editable_replacement_blocks())
+            .collect::<Vec<_>>();
+        if candidates.is_empty() || row_delta == 0 {
+            return;
+        }
+        let snapshot = self.display_snapshot(cx);
+        let targets = self
+            .selections
+            .all::<Point>(&snapshot)
+            .into_iter()
+            .map(|selection| {
+                let head = if inclusive_selection && !selection.reversed && !selection.is_empty() {
+                    movement::left(&snapshot, selection.end.to_display_point(&snapshot))
+                        .to_point(&snapshot)
+                } else {
+                    selection.head()
+                };
+                if display_lines {
+                    let row = snapshot.point_to_display_point(head, Bias::Left).row().0;
+                    i64::from(row)
+                        .saturating_add(row_delta)
+                        .clamp(0, i64::from(snapshot.max_point().row().0))
+                        as u32
+                } else {
+                    let row = snapshot
+                        .fold_snapshot()
+                        .to_fold_point(snapshot.inlay_snapshot().to_inlay_point(head), Bias::Left)
+                        .row();
+                    i64::from(row)
+                        .saturating_add(row_delta)
+                        .clamp(0, i64::from(snapshot.fold_snapshot().max_point().row()))
+                        as u32
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut reveal = HashSet::default();
+        for (range, id) in candidates {
+            if display_lines {
+                let Some(row) = self.row_for_block(id, cx) else {
+                    continue;
+                };
+                let Some(block) = snapshot.block_for_id(BlockId::Custom(id)) else {
+                    continue;
+                };
+                if targets.iter().any(|target| {
+                    *target >= row.0 && *target < row.0.saturating_add(block.height())
+                }) {
+                    reveal.insert(id);
+                }
+            } else {
+                let start = snapshot
+                    .fold_snapshot()
+                    .to_fold_point(
+                        snapshot
+                            .inlay_snapshot()
+                            .to_inlay_point(range.start.to_point(&snapshot)),
+                        Bias::Left,
+                    )
+                    .row();
+                let end = snapshot
+                    .fold_snapshot()
+                    .to_fold_point(
+                        snapshot
+                            .inlay_snapshot()
+                            .to_inlay_point(range.end.to_point(&snapshot)),
+                        Bias::Right,
+                    )
+                    .row();
+                if targets
+                    .iter()
+                    .any(|target| *target >= start && *target <= end)
+                {
+                    reveal.insert(id);
+                }
+            }
+        }
+        if !reveal.is_empty() {
+            self.remove_blocks(reveal, None, cx);
+        }
+    }
+
+    // SUZURI: Linewise edits must resolve replacement-widget boundaries in source coordinates.
+    pub fn prepare_linewise_edit(&mut self, rows: u32, cx: &mut Context<Self>) {
+        let candidates = self
+            .addons
+            .values()
+            .flat_map(|addon| addon.editable_replacement_blocks())
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return;
+        }
+        let snapshot = self.display_snapshot(cx);
+        let ranges = self
+            .selections
+            .all::<Point>(&snapshot)
+            .into_iter()
+            .map(|selection| {
+                let end_row = if !selection.is_empty() && selection.end.column == 0 {
+                    selection.end.row.saturating_sub(1)
+                } else {
+                    selection.end.row
+                };
+                selection.start.row..=end_row.saturating_add(rows)
+            })
+            .collect::<Vec<_>>();
+        let reveal = candidates
+            .into_iter()
+            .filter_map(|(range, id)| {
+                let start = range.start.to_point(&snapshot).row;
+                let end = range.end.to_point(&snapshot).row;
+                ranges
+                    .iter()
+                    .any(|range| start <= *range.end() && end >= *range.start())
+                    .then_some(id)
+            })
+            .collect::<HashSet<_>>();
+        if !reveal.is_empty() {
+            self.remove_blocks(reveal, None, cx);
+        }
+    }
+
     pub fn move_left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
@@ -42,6 +174,8 @@ impl Editor {
     }
 
     pub fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+        // SUZURI: Reveal editable replacement content before resolving the destination.
+        self.prepare_vertical_navigation(-1, true, false, cx);
         if self.take_rename(true, window, cx).is_some() {
             return;
         }
@@ -86,6 +220,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // SUZURI: Counted vertical motions need the same source exposure as single-row motions.
+        self.prepare_vertical_navigation(-i64::from(action.lines), true, false, cx);
         if self.take_rename(true, window, cx).is_some() {
             return;
         }
@@ -121,6 +257,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // SUZURI: Counted vertical motions need the same source exposure as single-row motions.
+        self.prepare_vertical_navigation(i64::from(action.lines), true, false, cx);
         if self.take_rename(true, window, cx).is_some() {
             return;
         }
@@ -156,6 +294,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // SUZURI: Counted vertical motions need the same source exposure as single-row motions.
+        self.prepare_vertical_navigation(i64::from(action.lines), true, false, cx);
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, goal| {
@@ -170,6 +310,8 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // SUZURI: Counted vertical motions need the same source exposure as single-row motions.
+        self.prepare_vertical_navigation(-i64::from(action.lines), true, false, cx);
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, goal| {
@@ -253,6 +395,8 @@ impl Editor {
     }
 
     pub fn select_up(&mut self, _: &SelectUp, window: &mut Window, cx: &mut Context<Self>) {
+        // SUZURI: Reveal editable replacement content before resolving the destination.
+        self.prepare_vertical_navigation(-1, true, false, cx);
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, goal| {
@@ -262,6 +406,8 @@ impl Editor {
     }
 
     pub fn move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
+        // SUZURI: Reveal editable replacement content before resolving the destination.
+        self.prepare_vertical_navigation(1, true, false, cx);
         if self.take_rename(true, window, cx).is_some() {
             return;
         }
@@ -374,6 +520,8 @@ impl Editor {
     }
 
     pub fn select_down(&mut self, _: &SelectDown, window: &mut Window, cx: &mut Context<Self>) {
+        // SUZURI: Reveal editable replacement content before resolving the destination.
+        self.prepare_vertical_navigation(1, true, false, cx);
         let text_layout_details = &self.text_layout_details(window, cx);
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_heads_with(&mut |map, head, goal| {

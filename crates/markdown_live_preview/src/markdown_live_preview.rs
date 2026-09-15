@@ -191,6 +191,10 @@ fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
 pub struct MarkdownLivePreviewSettings {
     pub enabled: bool,
     pub heading_styles: MarkdownHeadingStyles,
+    pub block_quote_border_color: settings::MarkdownQuoteBorderColor,
+    pub block_quote_border_width: Option<f32>,
+    pub block_quote_gap: Option<f32>,
+    pub block_quote_paragraph_spacing: Option<f32>,
 }
 
 impl Settings for MarkdownLivePreviewSettings {
@@ -200,6 +204,16 @@ impl Settings for MarkdownLivePreviewSettings {
         let defaults = MarkdownHeadingStyles::default();
         Self {
             enabled: content.enabled.unwrap_or(true),
+            block_quote_border_color: content.block_quote_border_color.unwrap_or_default(),
+            block_quote_border_width: content
+                .block_quote_border_width
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            block_quote_gap: content
+                .block_quote_gap
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            block_quote_paragraph_spacing: content
+                .block_quote_paragraph_spacing
+                .filter(|value| value.is_finite() && *value >= 0.0),
             heading_styles: MarkdownHeadingStyles {
                 h1: defaults.h1.with_content(heading_content.h1),
                 h2: defaults.h2.with_content(heading_content.h2),
@@ -463,6 +477,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         image_cache,
         markers: None,
         applied_blocks: Vec::new(),
+        markdown_blocks: HashMap::default(),
         selected_image: None,
         active_cell: None,
         active_property: None,
@@ -495,6 +510,7 @@ struct LivePreviewAddon {
     image_cache: Entity<RetainAllImageCache>,
     markers: Option<Arc<MarkerSet>>,
     applied_blocks: Vec<AppliedBlock>,
+    markdown_blocks: HashMap<(usize, usize), (String, Entity<Markdown>, Subscription)>,
     /// The image widget currently selected (Obsidian-style click state),
     /// identified by its marker range.
     selected_image: Option<Range<Anchor>>,
@@ -535,6 +551,14 @@ struct LivePreviewAddon {
 }
 
 impl Addon for LivePreviewAddon {
+    fn editable_replacement_blocks(&self) -> Vec<(Range<Anchor>, CustomBlockId)> {
+        self.applied_blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockRenderKind::Markdown) && !block.below)
+            .map(|block| (block.range.clone(), block.block_id))
+            .collect()
+    }
+
     fn to_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1214,12 +1238,27 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     let image_cache = addon.image_cache.clone();
     let callout_collapse = addon.callout_collapse.clone();
     let applied_blocks = std::mem::take(&mut addon.applied_blocks);
+    let mut markdown_blocks = std::mem::take(&mut addon.markdown_blocks);
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let Some(markers) = markers else {
         clear_decorations(editor, applied_blocks, cx);
         return;
     };
+
+    let markdown_ranges = markers
+        .blocks
+        .iter()
+        .filter_map(|marker| {
+            matches!(marker.kind, BlockRenderKind::Markdown).then(|| {
+                (
+                    marker.range.start.to_offset(&snapshot).0,
+                    marker.range.end.to_offset(&snapshot).0,
+                )
+            })
+        })
+        .collect::<HashSet<_>>();
+    markdown_blocks.retain(|range, _| markdown_ranges.contains(range));
 
     // Session restore can resurrect concealments saved as folds by older
     // builds as plain `⋯` folds this addon does not own; heal them whenever
@@ -1479,19 +1518,42 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 unreachable!("headings use native line typography")
             }
             BlockRenderKind::Markdown => {
-                let markdown = cx.new(|cx| {
-                    Markdown::new_with_options(
-                        SharedString::from(source.clone()),
-                        language_registry.clone(),
-                        None,
-                        markdown::MarkdownOptions {
-                            parse_html: true,
-                            render_mermaid_diagrams: true,
-                            ..Default::default()
-                        },
-                        cx,
-                    )
-                });
+                let key = (
+                    marker.range.start.to_offset(&snapshot).0,
+                    marker.range.end.to_offset(&snapshot).0,
+                );
+                if !markdown_blocks
+                    .get(&key)
+                    .is_some_and(|(cached_source, _, _)| cached_source == &source)
+                {
+                    let markdown = cx.new(|cx| {
+                        Markdown::new_with_options(
+                            SharedString::from(source.clone()),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    });
+                    let subscription = cx.observe(&markdown, |editor, _, cx| {
+                        apply_decorations(editor, cx);
+                    });
+                    markdown_blocks.insert(key, (source.clone(), markdown, subscription));
+                }
+                let Some((_, markdown, _)) = markdown_blocks.get(&key) else {
+                    continue;
+                };
+                // A fresh Markdown entity is empty until its background parse
+                // finishes. Keep source visible rather than collapsing the block
+                // for a frame, and retain parsed content while editing its source.
+                if markdown.read(cx).is_parsing() {
+                    continue;
+                }
+                let markdown = markdown.clone();
                 render_markdown_block(
                     markdown,
                     weak_editor.clone(),
@@ -1723,6 +1785,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
 
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
         addon.applied_blocks = new_applied_blocks;
+        addon.markdown_blocks = markdown_blocks;
     }
 }
 
@@ -2494,7 +2557,7 @@ fn render_markdown_block(
     image_cache: Entity<RetainAllImageCache>,
 ) -> RenderBlock {
     Arc::new(move |block_cx| {
-        let style = block_markdown_style(block_cx.window, block_cx.app);
+        let mut style = block_markdown_style(block_cx.window, block_cx.app);
         let editor = editor.clone();
         let start = range.start;
         let range = range.clone();
@@ -2502,9 +2565,45 @@ fn render_markdown_block(
         let image_cache = image_cache.clone();
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
-        let max_width = block_cx.max_width;
+        // The scroll range can exceed the pane width because of other source
+        // lines. Rendered prose must wrap inside the visible editor instead.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width);
+        let max_width = block_cx
+            .max_width
+            .min((visible_width - block_cx.margins.right).max(gpui::px(1.)));
         let source_click_editor = editor.clone();
+        let is_quote = markdown
+            .read(block_cx.app)
+            .source()
+            .trim_start()
+            .starts_with('>');
+        if is_quote {
+            // Match the editor's rounded line height without forcing paragraph
+            // gaps onto whole rows.
+            style.base_text_style.line_height = block_cx.line_height.into();
+            style.container_style.text.line_height = Some(block_cx.line_height.into());
+            style.paragraph_line_height = block_cx.line_height.into();
+            if let Some(spacing) =
+                MarkdownLivePreviewSettings::get_global(block_cx.app).block_quote_paragraph_spacing
+            {
+                style.paragraph_spacing = gpui::px(spacing);
+            }
+        }
         div()
+            .debug_selector(|| "mdlp-prose-block".into())
+            // The editor rounds block heights up to whole rows. Share that
+            // unused space above and below a quote instead of leaving it below.
+            .when(is_quote, |block| {
+                block.flex().flex_col().justify_center().h_full()
+            })
             .pl(gutter_width)
             .w(max_width)
             .cursor_pointer()
@@ -6228,12 +6327,35 @@ fn image_context_menu(
 
 fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
-    let buffer_font = theme_settings::ThemeSettings::get_global(cx)
-        .buffer_font
-        .clone();
-    let font_family = buffer_font.family;
-    style.base_text_style.font_family = font_family.clone();
-    style.container_style.text.font_family = Some(font_family.clone());
+    // A quote marker needs foreground contrast; theme borders can blend into the editor background.
+    let quote_settings = MarkdownLivePreviewSettings::get_global(cx);
+    style.block_quote_border_width = quote_settings.block_quote_border_width.map(gpui::px);
+    style.block_quote_gap = quote_settings.block_quote_gap.map(gpui::px);
+    let colors = cx.theme().colors();
+    style.block_quote_border_color =
+        match MarkdownLivePreviewSettings::get_global(cx).block_quote_border_color {
+            settings::MarkdownQuoteBorderColor::Accent => colors.text_accent,
+            settings::MarkdownQuoteBorderColor::Text => colors.editor_foreground,
+            settings::MarkdownQuoteBorderColor::MutedText => colors.text_muted,
+            settings::MarkdownQuoteBorderColor::LineNumber => colors.editor_line_number,
+        };
+    let settings = theme_settings::ThemeSettings::get_global(cx);
+    let font_family = settings.buffer_font.family.clone();
+    // Rendered prose must retain the source editor's metrics rather than the
+    // UI typography that MarkdownFont::Editor uses for general Markdown views.
+    let typography = TextStyleRefinement {
+        font_family: Some(font_family.clone()),
+        font_features: Some(settings.buffer_font.features.clone()),
+        font_fallbacks: settings.buffer_font.fallbacks.clone(),
+        font_size: Some(settings.buffer_font_size(cx).into()),
+        font_weight: Some(settings.buffer_font.weight),
+        line_height: Some(gpui::relative(settings.buffer_line_height.value())),
+        ..Default::default()
+    };
+    style.base_text_style.refine(&typography);
+    style.base_text_style.font_fallbacks = settings.buffer_font.fallbacks.clone();
+    style.container_style.text = typography;
+    style.paragraph_line_height = gpui::relative(settings.buffer_line_height.value());
     style.heading.text.font_family = Some(font_family.clone());
 
     let heading = |level| {
