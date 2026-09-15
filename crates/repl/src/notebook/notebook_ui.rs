@@ -237,7 +237,25 @@ impl NotebookEditor {
         })
         .detach();
 
+        // A kernel is spawned into its own session, so nothing reaps it when Zed
+        // exits, and entities are not dropped on quit either, so the kernel's
+        // `Drop` never runs. Without this the kernel process outlives the app.
+        // `ReplStore` does the same for REPL sessions, which a notebook is not.
+        cx.on_app_quit(|editor, _cx| {
+            editor.shutdown_kernel();
+            std::future::ready(())
+        })
+        .detach();
+
         editor
+    }
+
+    fn shutdown_kernel(&mut self) {
+        if let Kernel::RunningKernel(mut kernel) =
+            std::mem::replace(&mut self.kernel, Kernel::Shutdown)
+        {
+            kernel.kill();
+        }
     }
 
     fn refresh_kernelspecs(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut App) {
@@ -2116,6 +2134,8 @@ mod tests {
     use super::*;
     use feature_flags::FeatureFlag as _;
     use gpui::{TestAppContext, VisualTestContext};
+    use jupyter_protocol::{ExecutionState, KernelInfoReply};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // SUZURI: contract test. `init` only registers `NotebookEditor` as the handler for
     // `.ipynb` when this resolves true, and in a release build `enabled_for_all` is the
@@ -2272,6 +2292,70 @@ mod tests {
         (editor, cx)
     }
 
+    /// Stands in for a launched kernel so a test can observe it being killed
+    /// without spawning a real interpreter.
+    #[derive(Debug)]
+    struct FakeRunningKernel {
+        killed: Arc<AtomicBool>,
+        request_tx: futures::channel::mpsc::Sender<JupyterMessage>,
+        stdin_tx: futures::channel::mpsc::Sender<JupyterMessage>,
+        working_directory: PathBuf,
+        execution_state: ExecutionState,
+        kernel_info: Option<KernelInfoReply>,
+    }
+
+    impl FakeRunningKernel {
+        fn new(killed: Arc<AtomicBool>) -> Self {
+            Self {
+                killed,
+                request_tx: futures::channel::mpsc::channel(1).0,
+                stdin_tx: futures::channel::mpsc::channel(1).0,
+                working_directory: PathBuf::from("/"),
+                execution_state: ExecutionState::Idle,
+                kernel_info: None,
+            }
+        }
+    }
+
+    impl crate::kernels::RunningKernel for FakeRunningKernel {
+        fn request_tx(&self) -> futures::channel::mpsc::Sender<JupyterMessage> {
+            self.request_tx.clone()
+        }
+
+        fn stdin_tx(&self) -> futures::channel::mpsc::Sender<JupyterMessage> {
+            self.stdin_tx.clone()
+        }
+
+        fn working_directory(&self) -> &PathBuf {
+            &self.working_directory
+        }
+
+        fn execution_state(&self) -> &ExecutionState {
+            &self.execution_state
+        }
+
+        fn set_execution_state(&mut self, state: ExecutionState) {
+            self.execution_state = state;
+        }
+
+        fn kernel_info(&self) -> Option<&KernelInfoReply> {
+            self.kernel_info.as_ref()
+        }
+
+        fn set_kernel_info(&mut self, info: KernelInfoReply) {
+            self.kernel_info = Some(info);
+        }
+
+        fn force_shutdown(&mut self, _window: &mut Window, _cx: &mut App) -> Task<Result<()>> {
+            self.kill();
+            Task::ready(Ok(()))
+        }
+
+        fn kill(&mut self) {
+            self.killed.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// The launch task of a kernel that is still starting. Panics if it already
     /// resolved.
     fn pending_kernel(
@@ -2403,6 +2487,31 @@ mod tests {
                 other => panic!("expected a single error output, got: {other:?}"),
             }
         });
+    }
+
+    /// A kernel runs in its own process session, so nothing reaps it when the app
+    /// exits, and entities are not dropped on quit, so the kernel's own `Drop`
+    /// never runs either. Without an explicit shutdown the interpreter outlived
+    /// Zed, holding its environment's memory until killed by hand.
+    #[gpui::test]
+    async fn test_kernel_is_killed_when_the_app_quits(cx: &mut TestAppContext) {
+        let (editor, cx) = notebook_with_missing_interpreter(cx).await;
+
+        let killed = Arc::new(AtomicBool::new(false));
+        editor.update(cx, |editor, _| {
+            editor.kernel = Kernel::RunningKernel(Box::new(FakeRunningKernel::new(killed.clone())));
+        });
+
+        // Quit through the real shutdown path so the `on_app_quit` registration is
+        // exercised. `cx.cx` is the underlying app context: `VisualTestContext`'s
+        // own `update` goes through the window, which shutdown has already torn
+        // down by the time it returns.
+        cx.cx.update(|cx| cx.shutdown());
+
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "quitting the app must shut the notebook's kernel down"
+        );
     }
 
     /// Opening a notebook as a single file (its own worktree) leaves the
