@@ -2551,7 +2551,7 @@ fn render_markdown_block(
     image_cache: Entity<RetainAllImageCache>,
 ) -> RenderBlock {
     Arc::new(move |block_cx| {
-        let style = block_markdown_style(block_cx.window, block_cx.app);
+        let mut style = block_markdown_style(block_cx.window, block_cx.app);
         let editor = editor.clone();
         let start = range.start;
         let range = range.clone();
@@ -2579,13 +2579,16 @@ fn render_markdown_block(
             .source()
             .trim_start()
             .starts_with('>');
+        if is_quote {
+            // Keep quote text on the editor's row grid. One blank row between
+            // paragraphs avoids fractional block heights without shifting the first line.
+            style.base_text_style.line_height = block_cx.line_height.into();
+            style.container_style.text.line_height = Some(block_cx.line_height.into());
+            style.paragraph_line_height = block_cx.line_height.into();
+            style.paragraph_spacing = block_cx.line_height;
+        }
         div()
             .debug_selector(|| "mdlp-prose-block".into())
-            // The editor rounds block heights up to whole rows. Share that
-            // unused space above and below a quote instead of leaving it below.
-            .when(is_quote, |block| {
-                block.flex().flex_col().justify_center().h_full()
-            })
             .pl(gutter_width)
             .w(max_width)
             .cursor_pointer()
