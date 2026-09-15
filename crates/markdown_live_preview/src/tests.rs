@@ -5481,8 +5481,9 @@ async fn test_quote_wraps_with_wide_source_line(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_quote_paragraph_spacing_keeps_first_line_anchored(cx: &mut TestAppContext) {
+async fn test_quote_paragraph_spacing_balances_unused_row_space(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
+    let mut balanced_nonzero_space = false;
     for (font_size, line_height) in [(14., 1.3), (17.5, 1.4)] {
         cx.cx.update(|_, cx| {
             SettingsStore::update_global(cx, |store, cx| {
@@ -5518,12 +5519,8 @@ async fn test_quote_paragraph_spacing_keeps_first_line_anchored(cx: &mut TestApp
                     cx.executor().run_until_parked();
                     let quote = cx.cx.debug_bounds("markdown-quote").unwrap();
                     let block = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
-                    assert_eq!(
-                        quote.top(),
-                        block.top(),
-                        "shifted first line for {source:?}, spacing={spacing:?}"
-                    );
-                    assert_eq!(quote.bottom(), block.bottom(), "trailing renderer margin");
+                    let space_above = quote.top() - block.top();
+                    balanced_nonzero_space |= space_above > gpui::px(1.);
                     cx.update_editor(|editor, window, cx| {
                         let snapshot = editor.display_snapshot(cx);
                         let id = editor.addon::<LivePreviewAddon>().unwrap().applied_blocks[0].block_id;
@@ -5536,6 +5533,14 @@ async fn test_quote_paragraph_spacing_keeps_first_line_anchored(cx: &mut TestApp
                             .text
                             .line_height_in_pixels(window.rem_size());
                         let reserved = line_height * rows as f32;
+                        let space_below = block.top() + reserved - quote.bottom();
+                        assert!(space_above >= -gpui::px(1.));
+                        assert!(space_below >= -gpui::px(1.));
+                        // Layout may snap the two edges to neighboring pixels.
+                        assert!(
+                            (space_above - space_below).abs() <= gpui::px(1.),
+                            "unequal quote spacing for {source:?}, spacing={spacing:?}: above={space_above:?}, below={space_below:?}"
+                        );
                         let slack = reserved - quote.size.height;
                         assert!(
                             slack >= -gpui::px(1.) && slack < line_height + gpui::px(1.),
@@ -5560,4 +5565,5 @@ async fn test_quote_paragraph_spacing_keeps_first_line_anchored(cx: &mut TestApp
             }
         }
     }
+    assert!(balanced_nonzero_space, "exercise visible rounding space");
 }

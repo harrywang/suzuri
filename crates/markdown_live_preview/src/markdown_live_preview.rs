@@ -2584,8 +2584,8 @@ fn render_markdown_block(
             .trim_start()
             .starts_with('>');
         if is_quote {
-            // Match the editor's rounded line height while keeping paragraph
-            // spacing independent. Whole-row allocation can leave unused space below.
+            // Match the editor's rounded line height without forcing paragraph
+            // gaps onto whole rows.
             style.base_text_style.line_height = block_cx.line_height.into();
             style.container_style.text.line_height = Some(block_cx.line_height.into());
             style.paragraph_line_height = block_cx.line_height.into();
@@ -2597,6 +2597,11 @@ fn render_markdown_block(
         }
         div()
             .debug_selector(|| "mdlp-prose-block".into())
+            // The editor rounds block heights up to whole rows. Share that
+            // unused space above and below a quote instead of leaving it below.
+            .when(is_quote, |block| {
+                block.flex().flex_col().justify_center().h_full()
+            })
             .pl(gutter_width)
             .w(max_width)
             .cursor_pointer()
