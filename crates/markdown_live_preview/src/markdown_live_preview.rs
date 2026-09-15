@@ -194,6 +194,7 @@ pub struct MarkdownLivePreviewSettings {
     pub block_quote_border_color: settings::MarkdownQuoteBorderColor,
     pub block_quote_border_width: Option<f32>,
     pub block_quote_gap: Option<f32>,
+    pub block_quote_paragraph_spacing: Option<f32>,
 }
 
 impl Settings for MarkdownLivePreviewSettings {
@@ -209,6 +210,9 @@ impl Settings for MarkdownLivePreviewSettings {
                 .filter(|value| value.is_finite() && *value >= 0.0),
             block_quote_gap: content
                 .block_quote_gap
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            block_quote_paragraph_spacing: content
+                .block_quote_paragraph_spacing
                 .filter(|value| value.is_finite() && *value >= 0.0),
             heading_styles: MarkdownHeadingStyles {
                 h1: defaults.h1.with_content(heading_content.h1),
@@ -2580,12 +2584,16 @@ fn render_markdown_block(
             .trim_start()
             .starts_with('>');
         if is_quote {
-            // Keep quote text on the editor's row grid. One blank row between
-            // paragraphs avoids fractional block heights without shifting the first line.
+            // Match the editor's rounded line height while keeping paragraph
+            // spacing independent. Whole-row allocation can leave unused space below.
             style.base_text_style.line_height = block_cx.line_height.into();
             style.container_style.text.line_height = Some(block_cx.line_height.into());
             style.paragraph_line_height = block_cx.line_height.into();
-            style.paragraph_spacing = block_cx.line_height;
+            if let Some(spacing) =
+                MarkdownLivePreviewSettings::get_global(block_cx.app).block_quote_paragraph_spacing
+            {
+                style.paragraph_spacing = gpui::px(spacing);
+            }
         }
         div()
             .debug_selector(|| "mdlp-prose-block".into())

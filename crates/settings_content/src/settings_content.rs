@@ -1372,6 +1372,9 @@ pub struct MarkdownLivePreviewSettingsContent {
     /// Gap between a plain block quote border and its text, in logical pixels.
     /// Default: null (use the renderer’s existing spacing). Must be non-negative.
     pub block_quote_gap: Option<f32>,
+    /// Space between paragraphs inside plain block quotes, in logical pixels.
+    /// Null uses the renderer's default (8px). Zero is allowed.
+    pub block_quote_paragraph_spacing: Option<f32>,
     /// Folder for attachments dropped onto a markdown buffer, relative to
     /// the note's folder. An empty string stores attachments directly in
     /// the note's folder.
