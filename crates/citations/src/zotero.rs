@@ -33,10 +33,15 @@ pub enum ZoteroError {
 impl std::fmt::Display for ZoteroError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotRunning(_) => write!(formatter, "Zotero is not running"),
+            Self::NotRunning(_) => {
+                write!(
+                    formatter,
+                    "Zotero is not running, so only the vault was searched."
+                )
+            }
             Self::LocalApiDisabled => write!(
                 formatter,
-                "Zotero's local API is off: tick Settings › Advanced › \"Allow other applications on this computer to communicate with Zotero\""
+                "Zotero's local API is off. In Zotero, open Settings › Advanced and tick \"Allow other applications on this computer to communicate with Zotero\"."
             ),
             Self::Http { status, body } => {
                 write!(formatter, "Zotero answered {status}: {}", body.trim())

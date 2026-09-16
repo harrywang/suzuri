@@ -22,7 +22,10 @@ use gpui::{
 use picker::{Picker, PickerDelegate};
 use project::Project;
 use settings::Settings as _;
-use ui::{Color, HighlightedLabel, Label, LabelSize, ListItem, ListItemSpacing, prelude::*};
+use ui::{
+    Color, HighlightedLabel, Icon, IconName, IconSize, Label, LabelSize, ListItem, ListItemSpacing,
+    prelude::*,
+};
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace, notifications::NotifyTaskExt as _};
 
@@ -167,7 +170,7 @@ impl CitationPicker {
                     matches: Vec::new(),
                     selected_index: 0,
                     chosen: Vec::new(),
-                    zotero_note: None,
+                    zotero_status: ZoteroStatus::Idle,
                     query: String::new(),
                 },
                 bibliography,
@@ -271,6 +274,17 @@ struct Match {
     positions: Vec<usize>,
 }
 
+/// What the picker's footer says about Zotero, so the user can see that
+/// two places are searched and what happened in the second one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ZoteroStatus {
+    /// The query is too short to send to Zotero.
+    Idle,
+    Searching,
+    Results(usize),
+    Unavailable(SharedString),
+}
+
 pub struct CitationPickerDelegate {
     modal: WeakEntity<CitationPicker>,
     workspace: WeakEntity<Workspace>,
@@ -288,8 +302,7 @@ pub struct CitationPickerDelegate {
     selected_index: usize,
     /// The multi-selection, in the order the user picked.
     chosen: Vec<Candidate>,
-    /// Why Zotero results are missing, when they are.
-    zotero_note: Option<SharedString>,
+    zotero_status: ZoteroStatus,
     query: String,
 }
 
@@ -424,6 +437,34 @@ impl CitationPickerDelegate {
     }
 }
 
+impl CitationPickerDelegate {
+    fn vault_match_count(&self) -> usize {
+        self.matches
+            .iter()
+            .take_while(|found| matches!(found.candidate, Candidate::Vault(_)))
+            .count()
+    }
+
+    fn footer_text(&self) -> SharedString {
+        let vault = self.vault_match_count();
+        let vault_part = match vault {
+            0 if self.query.is_empty() => "No .bib entries in this vault".to_string(),
+            0 => "No vault matches".to_string(),
+            1 => "1 in the vault".to_string(),
+            n => format!("{n} in the vault"),
+        };
+        let zotero_part = match &self.zotero_status {
+            ZoteroStatus::Idle => "type two or more characters to search Zotero too".to_string(),
+            ZoteroStatus::Searching => "searching Zotero…".to_string(),
+            ZoteroStatus::Results(0) => "no Zotero matches".to_string(),
+            ZoteroStatus::Results(1) => "1 from Zotero".to_string(),
+            ZoteroStatus::Results(n) => format!("{n} from Zotero"),
+            ZoteroStatus::Unavailable(message) => message.to_string(),
+        };
+        format!("{vault_part} · {zotero_part}").into()
+    }
+}
+
 fn normalized(title: &str) -> String {
     title
         .split_whitespace()
@@ -461,13 +502,21 @@ impl PickerDelegate for CitationPickerDelegate {
     }
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
-        if let Some(note) = &self.zotero_note {
-            return Some(note.clone());
+        Some(match &self.zotero_status {
+            ZoteroStatus::Idle => "No vault matches; keep typing to search Zotero too".into(),
+            ZoteroStatus::Searching => "No vault matches; searching Zotero…".into(),
+            ZoteroStatus::Results(_) => "No matches in the vault or Zotero".into(),
+            ZoteroStatus::Unavailable(_) => "No vault matches".into(),
+        })
+    }
+
+    fn separators_after_indices(&self) -> Vec<usize> {
+        let vault = self.vault_match_count();
+        if vault > 0 && vault < self.matches.len() {
+            vec![vault - 1]
+        } else {
+            Vec::new()
         }
-        if self.query.chars().count() < 2 {
-            return Some("Type to search Zotero".into());
-        }
-        Some("No matches".into())
     }
 
     fn update_matches(
@@ -478,6 +527,11 @@ impl PickerDelegate for CitationPickerDelegate {
     ) -> Task<()> {
         let query = query.trim().to_string();
         self.query = query.clone();
+        self.zotero_status = if query.chars().count() < 2 {
+            ZoteroStatus::Idle
+        } else {
+            ZoteroStatus::Searching
+        };
         let executor = cx.background_executor().clone();
         let candidates = self.vault_candidates.clone();
         let zotero = self.zotero.clone();
@@ -517,7 +571,6 @@ impl PickerDelegate for CitationPickerDelegate {
                         })
                     })
                     .collect();
-                delegate.zotero_note = None;
                 picker.set_selected_index(0, None, false, window, cx);
                 cx.notify();
             })
@@ -532,16 +585,21 @@ impl PickerDelegate for CitationPickerDelegate {
                 let delegate = &mut picker.delegate;
                 match result {
                     Ok(items) => {
+                        let mut added = 0;
                         for item in items {
                             if !delegate.duplicates_vault_entry(&item) {
                                 delegate.matches.push(Match {
                                     candidate: Candidate::Zotero(item),
                                     positions: Vec::new(),
                                 });
+                                added += 1;
                             }
                         }
+                        delegate.zotero_status = ZoteroStatus::Results(added);
                     }
-                    Err(error) => delegate.zotero_note = Some(error.to_string().into()),
+                    Err(error) => {
+                        delegate.zotero_status = ZoteroStatus::Unavailable(error.to_string().into())
+                    }
                 }
                 cx.notify();
             })
@@ -620,7 +678,6 @@ impl PickerDelegate for CitationPickerDelegate {
         let found = self.matches.get(ix)?;
         Some(
             ListItem::new(ix)
-                .inset(true)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
                 .child(
@@ -646,17 +703,38 @@ impl PickerDelegate for CitationPickerDelegate {
         _window: &mut Window,
         cx: &mut Context<Picker<Self>>,
     ) -> Option<AnyElement> {
-        let note = self.zotero_note.clone()?;
-        if self.matches.is_empty() {
-            // `no_matches_text` already shows it.
-            return None;
-        }
+        // A failure to reach Zotero is the one thing here the user must not
+        // miss, so it gets the warning color and an icon; the rest stays
+        // quiet. Plain text rather than a `Label`, so a long message wraps.
+        let unavailable = matches!(self.zotero_status, ZoteroStatus::Unavailable(_));
+        let color = if unavailable {
+            Color::Warning
+        } else {
+            Color::Muted
+        };
         Some(
             h_flex()
-                .p_2()
+                .items_start()
+                .gap_1p5()
+                .px_2()
+                .py_1()
                 .border_t_1()
                 .border_color(cx.theme().colors().border_variant)
-                .child(Label::new(note).size(LabelSize::Small).color(Color::Muted))
+                .when(unavailable, |this| {
+                    this.child(
+                        Icon::new(IconName::Warning)
+                            .size(IconSize::Small)
+                            .color(color),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_ui_sm(cx)
+                        .text_color(color.color(cx))
+                        .child(self.footer_text()),
+                )
                 .into_any_element(),
         )
     }
@@ -944,8 +1022,16 @@ mod tests {
         });
         cx.executor().advance_clock(ZOTERO_DEBOUNCE * 2);
         cx.run_until_parked();
-        let note = picker.read_with(cx, |picker, _| picker.delegate.zotero_note.clone());
-        let note = note.expect("the disabled API is reported");
-        assert!(note.contains("Allow other applications"), "{note}");
+        let (status, footer) = picker.read_with(cx, |picker, _| {
+            (
+                picker.delegate.zotero_status.clone(),
+                picker.delegate.footer_text(),
+            )
+        });
+        assert!(
+            matches!(status, ZoteroStatus::Unavailable(ref message) if message.contains("Allow other applications")),
+            "{status:?}"
+        );
+        assert!(footer.contains("Allow other applications"), "{footer}");
     }
 }
