@@ -237,7 +237,25 @@ impl NotebookEditor {
         })
         .detach();
 
+        // A kernel is spawned into its own session, so nothing reaps it when Zed
+        // exits, and entities are not dropped on quit either, so the kernel's
+        // `Drop` never runs. Without this the kernel process outlives the app.
+        // `ReplStore` does the same for REPL sessions, which a notebook is not.
+        cx.on_app_quit(|editor, _cx| {
+            editor.shutdown_kernel();
+            std::future::ready(())
+        })
+        .detach();
+
         editor
+    }
+
+    fn shutdown_kernel(&mut self) {
+        if let Kernel::RunningKernel(mut kernel) =
+            std::mem::replace(&mut self.kernel, Kernel::Shutdown)
+        {
+            kernel.kill();
+        }
     }
 
     fn refresh_kernelspecs(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut App) {
@@ -585,37 +603,70 @@ impl NotebookEditor {
             ..Default::default()
         };
         let message: JupyterMessage = request.into();
-        let msg_id = message.header.msg_id.clone();
-
-        let send_result = match &mut self.kernel {
-            Kernel::RunningKernel(kernel) => kernel
-                .request_tx()
-                .try_send(message)
-                .map_err(|err| format!("failed to send execute request to kernel (the kernel process may have died): {err}")),
-            Kernel::StartingKernel(_) => Err("the kernel is still starting".to_string()),
-            Kernel::ErroredLaunch(error) => Err(format!("the kernel failed to launch: {error}")),
-            Kernel::ShuttingDown | Kernel::Shutdown => Err("the kernel is shut down".to_string()),
-            Kernel::Restarting => Err("the kernel is restarting".to_string()),
-        };
 
         if let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id) {
             cell.update(cx, |cell, cx| {
                 if cell.has_outputs() {
                     cell.clear_outputs();
                 }
-                if let Err(error) = &send_result {
-                    cell.show_kernel_error(error, window, cx);
-                } else {
-                    cell.start_execution();
-                }
+                cell.start_execution();
                 cx.notify();
             });
         }
 
-        if let Err(error) = send_result {
-            log::error!("notebook: cannot execute cell: {error}");
-        } else {
-            self.execution_requests.insert(msg_id, cell_id.clone());
+        self.send_execute_request(message, cell_id, window, cx);
+    }
+
+    /// A kernel takes seconds to come up, and a notebook is usually run the
+    /// moment it opens, so a request that arrives while the kernel is still
+    /// starting is held until the launch resolves rather than rejected. The
+    /// toolbar REPL queues the same way.
+    fn send_execute_request(
+        &mut self,
+        message: JupyterMessage,
+        cell_id: CellId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.cell_map.contains_key(&cell_id) {
+            return;
+        }
+
+        let msg_id = message.header.msg_id.clone();
+        let error = match &mut self.kernel {
+            Kernel::RunningKernel(kernel) => match kernel.request_tx().try_send(message) {
+                Ok(()) => {
+                    self.execution_requests.insert(msg_id, cell_id);
+                    return;
+                }
+                Err(err) => format!(
+                    "failed to send execute request to kernel (the kernel process may have died): {err}"
+                ),
+            },
+            Kernel::StartingKernel(pending_kernel) => {
+                let pending_kernel = pending_kernel.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    pending_kernel.await;
+                    this.update_in(cx, |editor, window, cx| {
+                        editor.send_execute_request(message, cell_id, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
+            Kernel::ErroredLaunch(error) => format!("the kernel failed to launch: {error}"),
+            Kernel::ShuttingDown | Kernel::Shutdown => "the kernel is shut down".to_string(),
+            Kernel::Restarting => "the kernel is restarting".to_string(),
+        };
+
+        log::error!("notebook: cannot execute cell: {error}");
+
+        if let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id) {
+            cell.update(cx, |cell, cx| {
+                cell.show_kernel_error(&error, window, cx);
+                cx.notify();
+            });
         }
     }
 
@@ -2082,7 +2133,9 @@ impl KernelSession for NotebookEditor {
 mod tests {
     use super::*;
     use feature_flags::FeatureFlag as _;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
+    use jupyter_protocol::{ExecutionState, KernelInfoReply};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // SUZURI: contract test. `init` only registers `NotebookEditor` as the handler for
     // `.ipynb` when this resolves true, and in a release build `enabled_for_all` is the
@@ -2151,11 +2204,13 @@ mod tests {
         ]
     }"#;
 
-    /// When the configured interpreter doesn't exist (e.g. Python isn't installed),
-    /// running a cell must not leave it stuck in the executing state. It should
-    /// instead surface the kernel launch error as an error output on the cell.
-    #[gpui::test]
-    async fn test_run_cell_with_missing_interpreter_shows_error(cx: &mut TestAppContext) {
+    /// Opens the one-cell notebook with a kernel whose interpreter doesn't exist,
+    /// simulating a machine where Python isn't installed properly. The returned
+    /// editor has already launched that kernel, so it is still starting and will
+    /// eventually fail.
+    async fn notebook_with_missing_interpreter(
+        cx: &mut TestAppContext,
+    ) -> (Entity<NotebookEditor>, &mut VisualTestContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -2234,13 +2289,108 @@ mod tests {
             cx.new(|cx| NotebookEditor::new(project.clone(), notebook_item, window, cx))
         });
 
+        (editor, cx)
+    }
+
+    /// Stands in for a launched kernel so a test can observe it being killed
+    /// without spawning a real interpreter.
+    #[derive(Debug)]
+    struct FakeRunningKernel {
+        killed: Arc<AtomicBool>,
+        request_tx: futures::channel::mpsc::Sender<JupyterMessage>,
+        stdin_tx: futures::channel::mpsc::Sender<JupyterMessage>,
+        working_directory: PathBuf,
+        execution_state: ExecutionState,
+        kernel_info: Option<KernelInfoReply>,
+    }
+
+    impl FakeRunningKernel {
+        fn new(killed: Arc<AtomicBool>) -> Self {
+            Self {
+                killed,
+                request_tx: futures::channel::mpsc::channel(1).0,
+                stdin_tx: futures::channel::mpsc::channel(1).0,
+                working_directory: PathBuf::from("/"),
+                execution_state: ExecutionState::Idle,
+                kernel_info: None,
+            }
+        }
+    }
+
+    impl crate::kernels::RunningKernel for FakeRunningKernel {
+        fn request_tx(&self) -> futures::channel::mpsc::Sender<JupyterMessage> {
+            self.request_tx.clone()
+        }
+
+        fn stdin_tx(&self) -> futures::channel::mpsc::Sender<JupyterMessage> {
+            self.stdin_tx.clone()
+        }
+
+        fn working_directory(&self) -> &PathBuf {
+            &self.working_directory
+        }
+
+        fn execution_state(&self) -> &ExecutionState {
+            &self.execution_state
+        }
+
+        fn set_execution_state(&mut self, state: ExecutionState) {
+            self.execution_state = state;
+        }
+
+        fn kernel_info(&self) -> Option<&KernelInfoReply> {
+            self.kernel_info.as_ref()
+        }
+
+        fn set_kernel_info(&mut self, info: KernelInfoReply) {
+            self.kernel_info = Some(info);
+        }
+
+        fn force_shutdown(&mut self, _window: &mut Window, _cx: &mut App) -> Task<Result<()>> {
+            self.kill();
+            Task::ready(Ok(()))
+        }
+
+        fn kill(&mut self) {
+            self.killed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The launch task of a kernel that is still starting. Panics if it already
+    /// resolved.
+    fn pending_kernel(
+        editor: &Entity<NotebookEditor>,
+        cx: &mut VisualTestContext,
+    ) -> Shared<Task<()>> {
+        editor.read_with(cx, |editor, _| match &editor.kernel {
+            Kernel::StartingKernel(task) => task.clone(),
+            _ => panic!("kernel should still be starting"),
+        })
+    }
+
+    fn code_cell(
+        editor: &Entity<NotebookEditor>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<crate::notebook::CodeCell> {
+        editor.read_with(cx, |editor, _| {
+            let cell_id = editor.cell_order.first().expect("notebook has one cell");
+            match editor.cell_map.get(cell_id) {
+                Some(Cell::Code(cell)) => cell.clone(),
+                _ => panic!("expected a code cell"),
+            }
+        })
+    }
+
+    /// When the configured interpreter doesn't exist (e.g. Python isn't installed),
+    /// running a cell must not leave it stuck in the executing state. It should
+    /// instead surface the kernel launch error as an error output on the cell.
+    #[gpui::test]
+    async fn test_run_cell_with_missing_interpreter_shows_error(cx: &mut TestAppContext) {
+        let (editor, cx) = notebook_with_missing_interpreter(cx).await;
+
         // Creating the editor launches the kernel. Wait for the actual launch
         // task, which fails because the interpreter cannot be spawned.
-        let pending_kernel = editor.read_with(cx, |editor, _| match &editor.kernel {
-            Kernel::StartingKernel(task) => task.clone(),
-            _ => panic!("kernel should be starting right after the editor is created"),
-        });
-        pending_kernel.await;
+        pending_kernel(&editor, cx).await;
 
         editor.read_with(cx, |editor, _| {
             assert!(
@@ -2282,6 +2432,86 @@ mod tests {
                 other => panic!("expected a single error output, got: {other:?}"),
             }
         });
+    }
+
+    /// A kernel takes seconds to start and a notebook is typically run as soon as
+    /// it opens, so a cell run while the kernel is still starting must be queued
+    /// until the launch resolves. Rejecting it outright dropped the execution: the
+    /// cell reported "the kernel is still starting" and never ran, even though the
+    /// kernel came up moments later.
+    #[gpui::test]
+    async fn test_run_cell_while_kernel_is_starting_queues_the_execution(cx: &mut TestAppContext) {
+        let (editor, cx) = notebook_with_missing_interpreter(cx).await;
+
+        let pending = pending_kernel(&editor, cx);
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.run_current_cell(&Run, window, cx);
+        });
+
+        let cell = code_cell(&editor, cx);
+        cell.read_with(cx, |cell, _| {
+            assert!(
+                cell.is_executing(),
+                "a cell run while the kernel is starting should be queued, not rejected"
+            );
+            assert!(
+                !cell.has_outputs(),
+                "queueing must not report an error output while the kernel is still starting"
+            );
+        });
+
+        // The launch fails here because the interpreter cannot be spawned. What
+        // matters is that the queued request was re-dispatched rather than dropped,
+        // so the cell ends up with the launch failure instead of hanging.
+        pending.await;
+        cx.run_until_parked();
+
+        cell.read_with(cx, |cell, cx| {
+            assert!(
+                !cell.is_executing(),
+                "the queued cell must not be left spinning once the kernel launch resolves"
+            );
+
+            let nbformat::v4::Cell::Code { outputs, .. } = cell.to_nbformat_cell(cx) else {
+                panic!("expected a code cell");
+            };
+            match outputs.as_slice() {
+                [nbformat::v4::Output::Error(error)] => {
+                    let traceback = error.traceback.join("\n");
+                    assert!(
+                        traceback.contains("the kernel failed to launch"),
+                        "the queued request should be re-dispatched to the resolved kernel, got: {traceback}"
+                    );
+                }
+                other => panic!("expected a single error output, got: {other:?}"),
+            }
+        });
+    }
+
+    /// A kernel runs in its own process session, so nothing reaps it when the app
+    /// exits, and entities are not dropped on quit, so the kernel's own `Drop`
+    /// never runs either. Without an explicit shutdown the interpreter outlived
+    /// Zed, holding its environment's memory until killed by hand.
+    #[gpui::test]
+    async fn test_kernel_is_killed_when_the_app_quits(cx: &mut TestAppContext) {
+        let (editor, cx) = notebook_with_missing_interpreter(cx).await;
+
+        let killed = Arc::new(AtomicBool::new(false));
+        editor.update(cx, |editor, _| {
+            editor.kernel = Kernel::RunningKernel(Box::new(FakeRunningKernel::new(killed.clone())));
+        });
+
+        // Quit through the real shutdown path so the `on_app_quit` registration is
+        // exercised. `cx.cx` is the underlying app context: `VisualTestContext`'s
+        // own `update` goes through the window, which shutdown has already torn
+        // down by the time it returns.
+        cx.cx.update(|cx| cx.shutdown());
+
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "quitting the app must shut the notebook's kernel down"
+        );
     }
 
     /// Opening a notebook as a single file (its own worktree) leaves the
