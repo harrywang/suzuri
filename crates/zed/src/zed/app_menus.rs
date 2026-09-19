@@ -139,6 +139,16 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Save As…", workspace::SaveAs),
                 MenuItem::action("Save All", workspace::SaveAll { save_intent: None }),
                 MenuItem::separator(),
+                // SUZURI: exporting a markdown note to a document that leaves
+                // the editor.
+                MenuItem::submenu(Menu::new("Export").items([
+                    MenuItem::action("PDF", markdown_export::ExportToPdf),
+                    MenuItem::action("Word", markdown_export::ExportToDocx),
+                    MenuItem::action("HTML", markdown_export::ExportToHtml),
+                    MenuItem::action("LaTeX", markdown_export::ExportToLatex),
+                    MenuItem::action("EPUB", markdown_export::ExportToEpub),
+                ])),
+                MenuItem::separator(),
                 MenuItem::action(
                     "Close Editor",
                     workspace::CloseActiveItem {
