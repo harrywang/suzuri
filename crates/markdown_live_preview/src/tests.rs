@@ -1,5 +1,4 @@
 use super::*;
-use editor::display_map::ToDisplayPoint as _;
 use editor::test::editor_test_context::EditorTestContext;
 use gpui::{Modifiers, TestAppContext, UpdateGlobal as _};
 use language::{Language, LanguageConfig};

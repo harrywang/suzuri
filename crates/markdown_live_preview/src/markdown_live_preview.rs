@@ -20,9 +20,10 @@ use std::{
 
 use collections::{HashMap, HashSet};
 use editor::{
-    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey, RowHighlightOptions,
+    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey, RowHighlightOptions, RowMotion,
     display_map::{
-        BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId, RenderBlock,
+        BlockId, BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId,
+        RenderBlock, ToDisplayPoint as _,
     },
 };
 use gpui::{
@@ -353,6 +354,64 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         }),
     );
 
+    // A vertical motion into a rendered quote must resolve against its source
+    // rows, so the quote is revealed before the editor's own handler runs. These
+    // listeners run ahead of the built-in ones and always pass the action on.
+    // Intercepting here rather than inside `Editor::move_up` and friends keeps
+    // `navigation.rs` identical to upstream.
+    use editor::actions::{
+        MoveDownByLines, MoveUpByLines, SelectDown, SelectDownByLines, SelectUp, SelectUpByLines,
+    };
+    use zed_actions::editor::{MoveDown, MoveUp};
+    for row_delta in [-1, 1] {
+        let weak_editor = cx.weak_entity();
+        let reveal = move |cx: &mut App| {
+            weak_editor
+                .update(cx, |editor, cx| {
+                    editor.prepare_vertical_navigation(row_delta, true, false, cx);
+                })
+                .log_err();
+            cx.propagate();
+        };
+        if row_delta < 0 {
+            let on_move = reveal.clone();
+            subscriptions.push(editor.register_action::<MoveUp>(move |_, _, cx| on_move(cx)));
+            subscriptions.push(editor.register_action::<SelectUp>(move |_, _, cx| reveal(cx)));
+        } else {
+            let on_move = reveal.clone();
+            subscriptions.push(editor.register_action::<MoveDown>(move |_, _, cx| on_move(cx)));
+            subscriptions.push(editor.register_action::<SelectDown>(move |_, _, cx| reveal(cx)));
+        }
+    }
+    // The by-lines motions keep their line count private to the editor crate, so
+    // the distance is unknown here: reveal every editable quote in the direction
+    // of travel. They are bound in no default keymap, and the blocks a motion
+    // does not land in are restored by the recompute its selection change triggers.
+    for upward in [true, false] {
+        let weak_editor = cx.weak_entity();
+        let reveal = move |cx: &mut App| {
+            weak_editor
+                .update(cx, |editor, cx| {
+                    reveal_editable_blocks_toward(editor, upward, cx);
+                })
+                .log_err();
+            cx.propagate();
+        };
+        if upward {
+            let on_move = reveal.clone();
+            subscriptions
+                .push(editor.register_action::<MoveUpByLines>(move |_, _, cx| on_move(cx)));
+            subscriptions
+                .push(editor.register_action::<SelectUpByLines>(move |_, _, cx| reveal(cx)));
+        } else {
+            let on_move = reveal.clone();
+            subscriptions
+                .push(editor.register_action::<MoveDownByLines>(move |_, _, cx| on_move(cx)));
+            subscriptions
+                .push(editor.register_action::<SelectDownByLines>(move |_, _, cx| reveal(cx)));
+        }
+    }
+
     // Local images are cached by path, so overwriting a file in place (say,
     // re-cropping a screenshot) would otherwise keep serving the bitmap
     // decoded on first render for the life of the process: gpui's app-level
@@ -550,13 +609,157 @@ struct LivePreviewAddon {
     _subscriptions: Vec<Subscription>,
 }
 
-impl Addon for LivePreviewAddon {
+impl LivePreviewAddon {
+    /// Rendered prose blocks whose source can be edited in place: a motion that
+    /// lands inside one must see its source rows, not the widget's.
     fn editable_replacement_blocks(&self) -> Vec<(Range<Anchor>, CustomBlockId)> {
         self.applied_blocks
             .iter()
             .filter(|block| matches!(block.kind, BlockRenderKind::Markdown) && !block.below)
             .map(|block| (block.range.clone(), block.block_id))
             .collect()
+    }
+}
+
+fn reveal_editable_blocks_toward(editor: &mut Editor, upward: bool, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon::<LivePreviewAddon>() else {
+        return;
+    };
+    let candidates = addon.editable_replacement_blocks();
+    if candidates.is_empty() {
+        return;
+    }
+    let snapshot = editor.display_snapshot(cx);
+    let head_rows = editor
+        .selections
+        .all::<Point>(&snapshot)
+        .into_iter()
+        .map(|selection| selection.head().row)
+        .collect::<Vec<_>>();
+    let reveal = candidates
+        .into_iter()
+        .filter_map(|(range, id)| {
+            let start = range.start.to_point(&snapshot).row;
+            let end = range.end.to_point(&snapshot).row;
+            head_rows
+                .iter()
+                .any(|head| if upward { start <= *head } else { end >= *head })
+                .then_some(id)
+        })
+        .collect::<HashSet<_>>();
+    if !reveal.is_empty() {
+        editor.remove_blocks(reveal, None, cx);
+    }
+}
+
+impl Addon for LivePreviewAddon {
+    fn blocks_to_reveal_before(
+        &self,
+        motion: &RowMotion,
+        editor: &Editor,
+        cx: &mut Context<Editor>,
+    ) -> Vec<CustomBlockId> {
+        let candidates = self.editable_replacement_blocks();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let snapshot = editor.display_snapshot(cx);
+        let selections = editor.selections.all::<Point>(&snapshot);
+        match *motion {
+            RowMotion::Vertical {
+                row_delta,
+                display_lines,
+                inclusive_selection,
+            } => {
+                if row_delta == 0 {
+                    return Vec::new();
+                }
+                let fold_row = |point: Point, bias: text::Bias| {
+                    snapshot
+                        .fold_snapshot()
+                        .to_fold_point(snapshot.inlay_snapshot().to_inlay_point(point), bias)
+                        .row()
+                };
+                let targets = selections
+                    .into_iter()
+                    .map(|selection| {
+                        let head = if inclusive_selection
+                            && !selection.reversed
+                            && !selection.is_empty()
+                        {
+                            editor::movement::left(
+                                &snapshot,
+                                selection.end.to_display_point(&snapshot),
+                            )
+                            .to_point(&snapshot)
+                        } else {
+                            selection.head()
+                        };
+                        let (row, max_row) = if display_lines {
+                            (
+                                snapshot
+                                    .point_to_display_point(head, text::Bias::Left)
+                                    .row()
+                                    .0,
+                                snapshot.max_point().row().0,
+                            )
+                        } else {
+                            (
+                                fold_row(head, text::Bias::Left),
+                                snapshot.fold_snapshot().max_point().row(),
+                            )
+                        };
+                        i64::from(row)
+                            .saturating_add(row_delta)
+                            .clamp(0, i64::from(max_row)) as u32
+                    })
+                    .collect::<Vec<_>>();
+                candidates
+                    .into_iter()
+                    .filter_map(|(range, id)| {
+                        let lands_inside = if display_lines {
+                            let row = editor.row_for_block(id, cx)?;
+                            let block = snapshot.block_for_id(BlockId::Custom(id))?;
+                            let end = row.0.saturating_add(block.height());
+                            targets
+                                .iter()
+                                .any(|target| *target >= row.0 && *target < end)
+                        } else {
+                            let start = fold_row(range.start.to_point(&snapshot), text::Bias::Left);
+                            let end = fold_row(range.end.to_point(&snapshot), text::Bias::Right);
+                            targets
+                                .iter()
+                                .any(|target| *target >= start && *target <= end)
+                        };
+                        lands_inside.then_some(id)
+                    })
+                    .collect()
+            }
+            RowMotion::Linewise { rows } => {
+                let ranges = selections
+                    .into_iter()
+                    .map(|selection| {
+                        let end_row = if !selection.is_empty() && selection.end.column == 0 {
+                            selection.end.row.saturating_sub(1)
+                        } else {
+                            selection.end.row
+                        };
+                        selection.start.row..=end_row.saturating_add(rows)
+                    })
+                    .collect::<Vec<_>>();
+                candidates
+                    .into_iter()
+                    .filter_map(|(range, id)| {
+                        let start = range.start.to_point(&snapshot).row;
+                        let end = range.end.to_point(&snapshot).row;
+                        ranges
+                            .iter()
+                            .any(|range| start <= *range.end() && end >= *range.start())
+                            .then_some(id)
+                    })
+                    .collect()
+            }
+        }
     }
 
     fn to_any(&self) -> &dyn std::any::Any {

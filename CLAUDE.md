@@ -30,7 +30,7 @@ The fork's own changes are small and additive:
 | Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
 | Native heading search reveal and Vim integration regressions | `crates/editor/src/editor.rs` (`selection_is_from_search`), `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
 | Optional plain block quote geometry | `crates/markdown/src/markdown.rs` (style overrides preserve shared renderer defaults) |
-| Editable preview navigation | `crates/editor/src/navigation.rs`, `crates/editor/src/editor.rs` (addon opt-in), `crates/vim/src/motion.rs`, `crates/vim/src/vim.rs` |
+| Editable preview navigation | `crates/editor/src/editor.rs` (`RowMotion`, `Addon::blocks_to_reveal_before`; the logic lives in the addon), `crates/vim/src/motion.rs`, `crates/vim/src/vim.rs` (Vim motions bypass editor actions) |
 | Markdown attachments: drag-and-drop and clipboard paste | `crates/editor/src/items.rs` |
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
@@ -211,6 +211,27 @@ When carrying one:
   knows to drop the local copy instead of keeping it.
 - If review reshapes the patch, the merge conflicts against your local copy — resolve by
   taking upstream's.
+
+## Keeping the vendor surface small
+
+When live preview needs the editor to behave differently, reach for these in order, and
+stop at the first that works:
+
+1. **Intercept from the addon.** `Editor::register_action` is upstream's own public API, and
+   a listener registered through it runs *before* the editor's built-in handler; calling
+   `cx.propagate()` passes the action on. Live preview already does this for `Paste`,
+   `Backspace`, `Delete`, `Newline`, and the vertical motions (`MoveUp`, `MoveDown`,
+   `SelectUp`, `SelectDown`). Zero vendor lines. `test_quote_arrow_navigation_uses_source_rows`
+   fails if that ordering ever changes upstream.
+2. **A hook, not the logic.** If no action exists to intercept (Vim's motions bypass editor
+   actions entirely), add the smallest generic hook to the vendor file, a trait method with a
+   default body plus a thin dispatcher, and keep the reasoning in the fork-owned crate.
+   `RowMotion` / `Addon::blocks_to_reveal_before` in `editor.rs` is the model: the addon
+   decides which blocks to reveal, the editor only removes them.
+3. **Logic in a vendor file** only when neither works, in one contiguous block.
+
+Prefer one contiguous `SUZURI: begin` ... `SUZURI: end` block over call sites sprinkled
+through a function Zed edits often: every separate hunk is a separate conflict.
 
 ## External contributions
 
