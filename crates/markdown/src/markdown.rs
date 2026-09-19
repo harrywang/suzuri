@@ -115,9 +115,10 @@ pub struct MarkdownStyle {
     pub link_callback: Option<LinkStyleCallback>,
     pub rule_color: Hsla,
     pub block_quote_border_color: Hsla,
-    // SUZURI: Live preview can override plain quote geometry without changing other Markdown views.
+    // SUZURI: begin. Live preview can override plain quote geometry without changing other Markdown views.
     pub block_quote_border_width: Option<Pixels>,
     pub block_quote_gap: Option<Pixels>,
+    // SUZURI: end
     pub block_quote_kind_colors: BlockQuoteKindColors,
     pub syntax: Arc<SyntaxTheme>,
     pub selection_background_color: Hsla,
@@ -149,8 +150,10 @@ impl Default for MarkdownStyle {
             link_callback: None,
             rule_color: Default::default(),
             block_quote_border_color: Default::default(),
+            // SUZURI: begin. Defaults for the live-preview quote geometry overrides above.
             block_quote_border_width: None,
             block_quote_gap: None,
+            // SUZURI: end
             block_quote_kind_colors: Default::default(),
             syntax: Arc::new(SyntaxTheme::default()),
             selection_background_color: Default::default(),

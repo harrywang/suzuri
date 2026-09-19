@@ -233,6 +233,24 @@ stop at the first that works:
 Prefer one contiguous `SUZURI: begin` ... `SUZURI: end` block over call sites sprinkled
 through a function Zed edits often: every separate hunk is a separate conflict.
 
+## `SUZURI:` markers
+
+A `SUZURI:` comment marks a deliberate fork change in one of Zed's files and says why, so
+that whoever resolves an upstream merge conflict there (Claude does these merges) knows the
+lines are intentional and what they are for.
+
+- A marker on its own covers **the next line or the next whole item** (a function, a struct,
+  a match arm in braces). That is unambiguous and needs no end marker.
+- When the change is **a run of lines inside a larger list that Zed owns** (dependencies in a
+  `Cargo.toml`, the settings sections list, struct fields, struct-literal fields), bracket it:
+  `// SUZURI: begin. <why>` ... `// SUZURI: end`. Without the end, nothing says where the
+  fork's part stops and Zed's resumes.
+- Do not tag a fix carried from an upstream PR; see "Carrying a fix locally" above.
+- Markers are an aid, not the record. Many older hunks carry none, and adding one to every
+  hunk would itself be conflict surface. The exact fork delta for any file is always
+  `git diff $(git merge-base upstream/main main) main -- <path>`; use it whenever a conflict
+  region has no marker to explain it.
+
 ## External contributions
 
 The vendor-hygiene rule applies to incoming PRs too: functional changes belong in
