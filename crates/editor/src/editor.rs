@@ -779,10 +779,64 @@ impl BufferSerialization {
     }
 }
 
+// SUZURI: begin. Editable previews reveal their source before a row-based motion is mapped
+// through their replacement rows. The addon decides which blocks; the editor only removes them,
+// so the reasoning stays out of vendor code. Editor motions reach this through the addon's own
+// `register_action` listeners; Vim's motions bypass editor actions and call these directly.
+pub enum RowMotion {
+    Vertical {
+        row_delta: i64,
+        display_lines: bool,
+        inclusive_selection: bool,
+    },
+    Linewise {
+        rows: u32,
+    },
+}
+
+impl Editor {
+    pub fn prepare_vertical_navigation(
+        &mut self,
+        row_delta: i64,
+        display_lines: bool,
+        inclusive_selection: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.reveal_blocks_before(
+            RowMotion::Vertical {
+                row_delta,
+                display_lines,
+                inclusive_selection,
+            },
+            cx,
+        );
+    }
+
+    pub fn prepare_linewise_edit(&mut self, rows: u32, cx: &mut Context<Self>) {
+        self.reveal_blocks_before(RowMotion::Linewise { rows }, cx);
+    }
+
+    fn reveal_blocks_before(&mut self, motion: RowMotion, cx: &mut Context<Self>) {
+        let mut reveal = HashSet::default();
+        for addon in self.addons.values() {
+            reveal.extend(addon.blocks_to_reveal_before(&motion, self, cx));
+        }
+        if !reveal.is_empty() {
+            self.remove_blocks(reveal, None, cx);
+        }
+    }
+}
+// SUZURI: end
+
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
-    // SUZURI: Editable previews must reveal source before a motion is mapped through their replacement rows.
-    fn editable_replacement_blocks(&self) -> Vec<(Range<Anchor>, CustomBlockId)> {
+    // SUZURI: See `RowMotion` above.
+    fn blocks_to_reveal_before(
+        &self,
+        _: &RowMotion,
+        _: &Editor,
+        _: &mut Context<Editor>,
+    ) -> Vec<CustomBlockId> {
         Vec::new()
     }
 
