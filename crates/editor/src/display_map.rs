@@ -1765,9 +1765,10 @@ pub struct DisplaySnapshot {
     pub companion_display_snapshot: Option<Arc<DisplaySnapshot>>,
     pub crease_snapshot: CreaseSnapshot,
     block_snapshot: BlockSnapshot,
-    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    // SUZURI: begin. Native line typography must share row geometry with editor input and painting.
     visual_row_map: Arc<VisualRowMap>,
     line_style_map: Arc<LineStyleMap>,
+    // SUZURI: end
     text_highlights: TextHighlights,
     inlay_highlights: InlayHighlights,
     semantic_token_highlights: SemanticTokensHighlights,
