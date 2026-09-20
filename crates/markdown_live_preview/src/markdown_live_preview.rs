@@ -3789,7 +3789,26 @@ fn render_table_block(
         // flex growth: growing distributed leftover space equally, which
         // ballooned short columns whenever the block was wider than the
         // table's content.
-        let column_width = |weight: f32| gpui::px((weight * 8. + 20.).max(48.));
+        // Cells render in the buffer font, so the per-character budget has to
+        // come from that font's own advance: a fixed estimate wraps every
+        // header as soon as the buffer font is larger than the guess.
+        // `block_cx.em_width` is the ink width of `m`, narrower than the
+        // advance, so it would still wrap.
+        let character_width = {
+            let settings = theme_settings::ThemeSettings::get_global(block_cx.app);
+            let font = settings.buffer_font.clone();
+            let font_size = settings.buffer_font_size(block_cx.app);
+            let text_system = block_cx.window.text_system();
+            let font_id = text_system.resolve_font(&font);
+            text_system
+                .ch_advance(font_id, font_size)
+                .log_err()
+                .unwrap_or(block_cx.em_width)
+        };
+        // `px_2` on both sides, plus the cell border and rounding slack.
+        let cell_padding = block_cx.window.rem_size() + gpui::px(6.);
+        let column_width =
+            move |weight: f32| (character_width * weight + cell_padding).max(gpui::px(48.));
         let handle_width = gpui::px(14.);
         // The grid needs its explicit content width: fixed-width cells only
         // overflow their rows visually, so without it the scroll container

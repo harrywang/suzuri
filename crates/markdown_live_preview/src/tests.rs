@@ -5023,6 +5023,52 @@ async fn test_narrow_table_columns_take_content_width(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_table_columns_fit_their_widest_cell(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    // A large buffer font is the case a fixed per-character estimate gets
+    // wrong: at the default size a stale guess still happens to be wide
+    // enough.
+    cx.cx.update(|_, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.theme.buffer_font_size = Some(22.0.into());
+            });
+        });
+    });
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | Outlook | Humidity | Windy |
+        | --- | --- | --- |
+        | overcast | normal | FALSE |
+    "});
+    cx.executor().run_until_parked();
+
+    // Column widths are budgeted per character, so they have to use the
+    // buffer font's advance: any narrower estimate wraps the widest cell.
+    let advance = cx.update_editor(|_, window, cx| {
+        let settings = theme_settings::ThemeSettings::get_global(cx);
+        let font_id = window.text_system().resolve_font(&settings.buffer_font);
+        window
+            .text_system()
+            .ch_advance(font_id, settings.buffer_font_size(cx))
+            .expect("buffer font has a '0' glyph")
+    });
+
+    for (column, widest) in [(0, "overcast"), (1, "Humidity"), (2, "FALSE")] {
+        let bounds = cx
+            .cx
+            .debug_bounds(format!("mdlp-cell-h-{column}").leak())
+            .expect("header cell rendered");
+        assert!(
+            bounds.size.width >= advance * widest.chars().count() as f32,
+            "column {column} must fit {widest:?} without wrapping, got {:?}",
+            bounds.size.width
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
