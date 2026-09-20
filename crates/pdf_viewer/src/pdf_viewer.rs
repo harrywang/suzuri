@@ -903,7 +903,17 @@ impl Render for PdfViewer {
             .on_action(cx.listener(Self::fit_to_view))
             .on_action(cx.listener(Self::zoom_to_actual_size))
             .on_action(cx.listener(Self::copy_document_text))
-            .size_full()
+            // Take the space the pane leaves rather than asking for the
+            // parent's full height: measured in a running window, a
+            // `size_full` root put this view's bounds 45px below the pane's
+            // content mask — exactly the height of the toolbar rendered above
+            // it. That strip is clipped, and because it sits at the end of the
+            // scroll range, the canvas margin below the last page could never
+            // be scrolled into view: the last page ran off the bottom of the
+            // pane while every other page break showed its gap.
+            .w_full()
+            .flex_1()
+            .min_h_0()
             .bg(cx.theme().colors().editor_background)
             .child(
                 h_flex()
