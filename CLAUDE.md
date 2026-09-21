@@ -150,12 +150,29 @@ with a `SUZURI:` tag so the next merge keeps it. Order the checks so drift surfa
 2. `cargo check -p zed -p editor -p project_panel` — the shared files the fork patches.
 3. `cargo nextest run -p markdown_live_preview -p pdf_viewer -p typeset_preview` — the
    contract tests catch semantic drift a clean compile hides.
-4. `cargo nextest run -p project_panel -p languages`. Note `undo_create_dirty_file` in
-   `project_panel` fails on a clean upstream tree too; verify by stashing before blaming a merge.
+4. `cargo nextest run -p project_panel -p languages`.
 5. Bundle and smoke-test the real app: live preview, a PDF, a Typst preview, the panel's
    refresh button. GUI behavior can also be verified without a human at the screen:
    `VisualTestAppContext` (see `crates/zed/src/visual_test_runner.rs`) renders offscreen
    with real Metal and captures screenshots without Screen Recording permission.
+
+### Tests the fork breaks permanently
+
+A full `cargo nextest run --workspace` fails in the same places on every merge. None of
+them mean the merge is broken, and all of them are the fork's own doing, so do not spend a
+merge chasing them:
+
+| Tests | Why |
+| --- | --- |
+| 11 save-prompt tests in `workspace` and `zed`, plus `project_panel tests::undo::undo_create_dirty_file` | The fork's `autosave` default in `assets/settings/default.json`. Tests load the shipped defaults, so buffers save themselves and upstream's tests never see the prompt they wait for. Setting `"autosave": "off"` in that file makes all twelve pass. |
+| `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer` and `typeset_preview`. |
+| `collab db_tests::*_postgres` (14) | Need a local Postgres; CI provisions one. |
+
+Anything *else* that fails is worth investigating. Before blaming the merge, check whether
+the fork has any delta on the files involved: `git diff $(git merge-base upstream/main main) main -- <path>`.
+A failure in a file with no fork delta is upstream's, and `undo_create_dirty_file` is the
+cautionary tale — it was recorded here as "fails on clean upstream too", which was wrong
+and sent a later session looking in the wrong place.
 
 Conflicts recur in the same handful of registration points (`Cargo.toml` members and paths,
 `crates/zed/src/main.rs` init calls, `crates/zed/src/zed.rs` toolbar block,
