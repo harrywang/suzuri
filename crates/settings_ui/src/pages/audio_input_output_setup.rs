@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use audio::{AudioDeviceInfo, AvailableAudioDevices};
 use cpal::DeviceId;
 use gpui::{AnyElement, App, ElementId, ReadGlobal, SharedString, Window};
@@ -43,10 +44,10 @@ where
 
     let menu = ContextMenu::build(window, cx, {
         let current_device = current_device.clone();
-        move |mut menu, _, _cx| {
+        move |mut menu, _, cx| {
             let is_system_default = current_device.is_none();
             menu = menu.toggleable_entry(
-                SYSTEM_DEFAULT,
+                localize(SYSTEM_DEFAULT, cx),
                 is_system_default,
                 IconPosition::Start,
                 None,
@@ -86,7 +87,7 @@ where
         dropdown_id,
         current_device
             .map(|info| info.desc.name().to_string())
-            .unwrap_or(SYSTEM_DEFAULT.to_string()),
+            .unwrap_or_else(|| localize(SYSTEM_DEFAULT, cx).to_string()),
         menu,
     )
     .style(DropdownStyle::Outlined)

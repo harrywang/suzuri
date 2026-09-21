@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use std::rc::Rc;
 
 use editor::{Editor, MultiBufferOffset};
@@ -175,7 +176,7 @@ impl RenderOnce for SettingsInputField {
                 }
 
                 if let Some(placeholder) = placeholder {
-                    editor.set_placeholder_text(placeholder, window, cx);
+                    editor.set_placeholder_text(&localize(placeholder, cx), window, cx);
                 }
                 editor.set_text_style_refinement(styles);
                 editor
@@ -217,9 +218,10 @@ impl RenderOnce for SettingsInputField {
         let confirm_for_button = self.confirm.clone();
         let is_editor_empty = editor_text.trim().is_empty();
 
-        let aria_label = self
-            .aria_label
-            .or_else(|| self.placeholder.map(SharedString::new_static));
+        let aria_label = self.aria_label.or_else(|| {
+            self.placeholder
+                .map(|placeholder| localize(placeholder, cx))
+        });
         let aria_description = self.aria_description;
 
         let (a11y_value, a11y_text_runs) =
@@ -236,7 +238,7 @@ impl RenderOnce for SettingsInputField {
             })
             .aria_value(a11y_value)
             .when_some(self.placeholder, |this, placeholder| {
-                this.aria_placeholder(placeholder)
+                this.aria_placeholder(localize(placeholder, cx))
             })
             .a11y_synthetic_children(a11y_text_runs)
             .on_a11y_action(AccessibleAction::SetValue, {
@@ -295,8 +297,8 @@ impl RenderOnce for SettingsInputField {
                                 IconButton::new("clear-button", IconName::Close)
                                     .icon_size(IconSize::Small)
                                     .icon_color(Color::Muted)
-                                    .aria_label("Clear")
-                                    .tooltip(Tooltip::text("Clear"))
+                                    .aria_label(localize("Clear", cx))
+                                    .tooltip(Tooltip::text(localize("Clear", cx)))
                                     .on_click(move |_, window, cx| {
                                         let Some(editor) = weak_editor_for_clear.upgrade() else {
                                             return;
@@ -315,8 +317,8 @@ impl RenderOnce for SettingsInputField {
                                 IconButton::new("confirm-button", IconName::Check)
                                     .icon_size(IconSize::Small)
                                     .icon_color(Color::Success)
-                                    .aria_label("Confirm")
-                                    .tooltip(Tooltip::text("Enter to Confirm"))
+                                    .aria_label(localize("Confirm", cx))
+                                    .tooltip(Tooltip::text(localize("Enter to Confirm", cx)))
                                     .on_click(move |_, window, cx| {
                                         let Some(confirm) = confirm_for_button.as_ref() else {
                                             return;

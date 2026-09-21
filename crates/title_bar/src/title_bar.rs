@@ -38,7 +38,7 @@ use project::{
     trusted_worktrees::TrustedWorktrees,
 };
 use remote::RemoteConnectionOptions;
-use settings::{Settings as _, SettingsStore};
+use settings::{Settings as _, SettingsStore, localization::text};
 
 use std::any::TypeId;
 use std::path::Path;
@@ -807,7 +807,7 @@ impl TitleBar {
         let display_name = if let Some(ref name) = name {
             util::truncate_and_trailoff(name, MAX_PROJECT_NAME_LENGTH)
         } else {
-            "Open Recent Project".to_string()
+            settings::localization::text("welcome.open_recent", cx).to_string()
         };
 
         let is_sidebar_open = self
@@ -1195,24 +1195,27 @@ impl TitleBar {
         }
     }
 
-    pub fn render_sign_in_button(&mut self, _: &mut Context<Self>) -> Button {
+    pub fn render_sign_in_button(&mut self, cx: &mut Context<Self>) -> Button {
         let client = self.client.clone();
         let workspace = self.workspace.clone();
-        Button::new("sign_in", "Sign In")
-            .label_size(LabelSize::Small)
-            .tab_index(0isize)
-            .on_click(move |_, window, cx| {
-                let client = client.clone();
-                let workspace = workspace.clone();
-                window
-                    .spawn(cx, async move |mut cx| {
-                        client
-                            .sign_in_with_optional_connect(true, cx)
-                            .await
-                            .notify_workspace_async_err(workspace, &mut cx);
-                    })
-                    .detach();
-            })
+        Button::new(
+            "sign_in",
+            settings::localization::text("onboarding.sign_in", cx),
+        )
+        .label_size(LabelSize::Small)
+        .tab_index(0isize)
+        .on_click(move |_, window, cx| {
+            let client = client.clone();
+            let workspace = workspace.clone();
+            window
+                .spawn(cx, async move |mut cx| {
+                    client
+                        .sign_in_with_optional_connect(true, cx)
+                        .await
+                        .notify_workspace_async_err(workspace, &mut cx);
+                })
+                .detach();
+        })
     }
 
     pub fn render_user_menu_button(&mut self, cx: &mut Context<Self>) -> impl Element {
@@ -1291,7 +1294,7 @@ impl TitleBar {
                 let is_agent = matches!(current_layout, WindowLayout::Agent(_));
                 let is_custom = matches!(current_layout, WindowLayout::Custom(_));
 
-                ContextMenu::build(window, cx, |menu, _, _cx| {
+                ContextMenu::build(window, cx, |menu, _, cx| {
                     menu.when(is_signed_in, |this| {
                         let username = username.clone();
                         this.custom_entry(
@@ -1317,7 +1320,13 @@ impl TitleBar {
                                     .w_full()
                                     .gap_1()
                                     .justify_between()
-                                    .child(Label::new("Restart to update Zed").color(Color::Accent))
+                                    .child(
+                                        Label::new(settings::localization::text(
+                                            "update.restart",
+                                            _cx,
+                                        ))
+                                        .color(Color::Accent),
+                                    )
                                     .child(
                                         Icon::new(IconName::Download)
                                             .size(IconSize::Small)
@@ -1385,25 +1394,32 @@ impl TitleBar {
 
                         this.separator()
                     })
-                    .action("Settings", zed_actions::OpenSettings.boxed_clone())
-                    .action("Keymap", Box::new(zed_actions::OpenKeymap))
                     .action(
-                        "Themes…",
+                        text("user_menu.settings", cx),
+                        zed_actions::OpenSettings.boxed_clone(),
+                    )
+                    .action(
+                        text("user_menu.keymap", cx),
+                        Box::new(zed_actions::OpenKeymap),
+                    )
+                    .action(
+                        text("user_menu.themes", cx),
                         zed_actions::theme_selector::Toggle::default().boxed_clone(),
                     )
                     .action(
-                        "Icon Themes…",
+                        text("user_menu.icon_themes", cx),
                         zed_actions::icon_theme_selector::Toggle::default().boxed_clone(),
                     )
                     .action(
-                        "Extensions",
+                        text("user_menu.extensions", cx),
                         zed_actions::Extensions::default().boxed_clone(),
                     )
                     .when(ai_enabled, |menu| {
-                        menu.separator()
-                            .submenu("Panel Layout", move |menu, _window, _cx| {
+                        menu.separator().submenu(
+                            text("user_menu.panel_layout", cx),
+                            move |menu, _window, cx| {
                                 menu.toggleable_entry(
-                                    "Classic",
+                                    text("user_menu.classic", cx),
                                     is_editor,
                                     IconPosition::Start,
                                     Some(UseClassicLayout.boxed_clone()),
@@ -1412,7 +1428,7 @@ impl TitleBar {
                                     },
                                 )
                                 .toggleable_entry(
-                                    "Agentic",
+                                    text("user_menu.agentic", cx),
                                     is_agent,
                                     IconPosition::Start,
                                     Some(UseAgenticLayout.boxed_clone()),
@@ -1422,16 +1438,19 @@ impl TitleBar {
                                 )
                                 .when(is_custom, |menu| {
                                     menu.item(
-                                        ContextMenuEntry::new("Custom")
+                                        ContextMenuEntry::new(text("user_menu.custom", cx))
                                             .toggleable(IconPosition::Start, true)
                                             .disabled(true),
                                     )
                                 })
-                            })
+                            },
+                        )
                     })
                     .when(is_signed_in, |this| {
-                        this.separator()
-                            .action("Sign Out", client::SignOut.boxed_clone())
+                        this.separator().action(
+                            text("user_menu.sign_out", cx),
+                            client::SignOut.boxed_clone(),
+                        )
                     })
                 })
                 .into()

@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use std::{collections::HashSet, sync::Arc};
 
 use editor::Editor;
@@ -85,7 +86,7 @@ pub(crate) fn render_add_llm_provider_popover(
 
     PopoverMenu::new("add-llm-provider-popover")
         .trigger(
-            Button::new("add-llm-provider", "Add Provider")
+            Button::new("add-llm-provider", localize("Add Provider", cx))
                 .style(ButtonStyle::Outlined)
                 .track_focus(&focus_handle)
                 .label_size(LabelSize::Small)
@@ -102,8 +103,8 @@ pub(crate) fn render_add_llm_provider_popover(
         })
         .menu(move |window, cx| {
             let settings_window = settings_window.clone();
-            Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                menu.header("Compatible APIs")
+            Some(ContextMenu::build(window, cx, move |menu, _window, cx| {
+                menu.header(localize("Compatible APIs", cx))
                     .entry("OpenAI", None, {
                         let settings_window = settings_window.clone();
                         move |window, cx| {
@@ -165,6 +166,7 @@ fn render_provider_section(
                 settings.title,
                 settings.description,
                 view,
+                cx,
             )
         }
         Some(ProviderSettingsView::SubPage(settings)) => {
@@ -213,7 +215,7 @@ fn render_api_key_providers_item(
     provider: &Arc<dyn LanguageModelProvider>,
     provider_name: SharedString,
     config: ApiKeyConfiguration,
-    _cx: &mut Context<SettingsWindow>,
+    cx: &mut Context<SettingsWindow>,
 ) -> AnyElement {
     let provider_id = provider.id();
     let has_key = config.has_key;
@@ -229,14 +231,18 @@ fn render_api_key_providers_item(
         };
         let button_id = format!("reset-api-key-{}", provider_id.0);
 
-        let card = ConfiguredApiCard::new(button_id, configured_label)
-            .button_label("Reset Key")
+        let card = ConfiguredApiCard::new(button_id, localize(configured_label, cx))
+            .button_label(localize("Reset Key", cx))
             .button_tab_index(0)
             .disabled(is_from_env_var)
             .when(is_from_env_var, |this| {
-                this.tooltip_label(format!(
-                    "To reset your API key, unset the {env_var_name} environment variable."
-                ))
+                this.tooltip_label(
+                    localize(
+                        "To reset your API key, unset the {variable} environment variable.",
+                        cx,
+                    )
+                    .replace("{variable}", &env_var_name),
+                )
             })
             .on_click({
                 let provider = provider.clone();
@@ -267,7 +273,7 @@ fn render_api_key_providers_item(
                         .min_w_0()
                         .max_w_1_2()
                         .gap_0p5()
-                        .child(Label::new("API Key"))
+                        .child(Label::new(localize("API Key", cx)))
                         .child(
                             h_flex()
                                 .w_full()
@@ -275,7 +281,7 @@ fn render_api_key_providers_item(
                                 .flex_wrap()
                                 .gap_0p5()
                                 .child(
-                                    Label::new("Visit the")
+                                    Label::new(localize("Visit the", cx))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 )
@@ -289,15 +295,13 @@ fn render_api_key_providers_item(
                                     .label_color(Color::Muted),
                                 )
                                 .child(
-                                    Label::new("to generate an API key.")
+                                    Label::new(localize("to generate an API key.", cx))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted),
                                 ),
                         )
                         .child(
-                            Label::new(format!(
-                                "Or set the {env_var_name} env var and restart Zed for it to take effect."
-                            ))
+                            Label::new(localize("Or set the {variable} env var and restart Zed for it to take effect.", cx).replace("{variable}", &env_var_name))
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                         ),
@@ -325,6 +329,7 @@ fn render_inline_body(
     title: Option<SharedString>,
     description: Option<InlineDescription>,
     view: impl IntoElement,
+    cx: &App,
 ) -> AnyElement {
     let view = view.into_any_element();
 
@@ -349,9 +354,11 @@ fn render_inline_body(
                 .min_w_0()
                 .max_w_1_2()
                 .debug_selector(|| "inline-provider-description".into())
-                .when_some(title, |this, title| this.child(Label::new(title)))
+                .when_some(title, |this, title| {
+                    this.child(Label::new(localize(&title, cx)))
+                })
                 .when_some(description, |this, description| {
-                    this.child(render_inline_description(provider_name, description))
+                    this.child(render_inline_description(provider_name, description, cx))
                 }),
         )
         .child(
@@ -385,24 +392,27 @@ fn render_subpage_item(
                 .min_w_0()
                 .max_w_1_2()
                 .gap_0p5()
-                .child(Label::new("Configure Provider"))
+                .child(Label::new(localize("Configure Provider", cx)))
                 .when_some(description, |this, description| {
-                    this.child(render_inline_description(provider_name, description))
+                    this.child(render_inline_description(provider_name, description, cx))
                 }),
         )
         .child(
-            Button::new(format!("configure-{}", provider_id.0), "Configure")
-                .style(ButtonStyle::OutlinedGhost)
-                .size(ButtonSize::Medium)
-                .end_icon(
-                    Icon::new(IconName::ChevronRight)
-                        .size(IconSize::Small)
-                        .color(Color::Muted),
-                )
-                .tab_index(0isize)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    open_provider_configuration(this, provider_id.clone(), window, cx);
-                })),
+            Button::new(
+                format!("configure-{}", provider_id.0),
+                localize("Configure", cx),
+            )
+            .style(ButtonStyle::OutlinedGhost)
+            .size(ButtonSize::Medium)
+            .end_icon(
+                Icon::new(IconName::ChevronRight)
+                    .size(IconSize::Small)
+                    .color(Color::Muted),
+            )
+            .tab_index(0isize)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                open_provider_configuration(this, provider_id.clone(), window, cx);
+            })),
         )
         .into_any_element()
 }
@@ -410,12 +420,13 @@ fn render_subpage_item(
 fn render_inline_description(
     provider_name: SharedString,
     description: InlineDescription,
+    cx: &App,
 ) -> AnyElement {
     match description {
         InlineDescription::ApiKeyUrl(url) => h_flex()
             .gap_0p5()
             .child(
-                Label::new("To find an API key, visit the")
+                Label::new(localize("To find an API key, visit the", cx))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
@@ -664,14 +675,17 @@ fn render_llm_provider_form_page(
                 .pb_16()
                 .gap_4()
                 .overflow_y_scroll()
-                .child(Label::new(match form.kind {
-                    CompatibleProviderKind::OpenAi => {
-                        "This provider will use an OpenAI-compatible API."
-                    }
-                    CompatibleProviderKind::Anthropic => {
-                        "This provider will use an Anthropic Messages-compatible API."
-                    }
-                }))
+                .child(Label::new(localize(
+                    match form.kind {
+                        CompatibleProviderKind::OpenAi => {
+                            "This provider will use an OpenAI-compatible API."
+                        }
+                        CompatibleProviderKind::Anthropic => {
+                            "This provider will use an Anthropic Messages-compatible API."
+                        }
+                    },
+                    cx,
+                )))
                 .child(Divider::horizontal().flex_shrink_0())
                 .child(render_form_field(
                     "Provider Name",
@@ -723,15 +737,18 @@ fn render_form_field(
             v_flex()
                 .gap_0p5()
                 .child(
-                    h_flex().gap_0p5().child(Label::new(title)).child(
-                        Label::new("*")
-                            .size(LabelSize::Small)
-                            .color(Color::Error)
-                            .mb_2(),
-                    ),
+                    h_flex()
+                        .gap_0p5()
+                        .child(Label::new(localize(title, cx)))
+                        .child(
+                            Label::new("*")
+                                .size(LabelSize::Small)
+                                .color(Color::Error)
+                                .mb_2(),
+                        ),
                 )
                 .child(
-                    Label::new(description)
+                    Label::new(localize(description, cx))
                         .size(LabelSize::Small)
                         .color(Color::Muted),
                 ),
@@ -764,9 +781,9 @@ fn render_models_section(
         .child(
             h_flex()
                 .justify_between()
-                .child(Label::new("Models"))
+                .child(Label::new(localize("Models", cx)))
                 .child(
-                    Button::new("add-model", "Add Model")
+                    Button::new("add-model", localize("Add Model", cx))
                         .start_icon(
                             Icon::new(IconName::Plus)
                                 .size(IconSize::XSmall)
@@ -832,7 +849,7 @@ fn render_model(
         .child(render_model_capabilities(kind, model, index, window, cx))
         .when(model_count > 1, |this| {
             this.child(
-                Button::new(("remove-model", index), "Remove Model")
+                Button::new(("remove-model", index), localize("Remove Model", cx))
                     .start_icon(
                         Icon::new(IconName::Trash)
                             .size(IconSize::XSmall)
@@ -952,7 +969,7 @@ fn render_capability_checkbox(
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
     Checkbox::new((id, index), state)
-        .label(label)
+        .label(localize(label, cx))
         .on_click(cx.listener(move |this, checked, _window, cx| {
             if let Some(form) = this.llm_provider_form.as_mut()
                 && let Some(model) = form.models.get_mut(index)
@@ -970,12 +987,12 @@ fn render_reasoning_effort_selector(
     cx: &mut Context<SettingsWindow>,
 ) -> impl IntoElement {
     let settings_window = cx.weak_entity();
-    let menu = ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+    let menu = ContextMenu::build(window, cx, move |mut menu, _window, cx| {
         for effort in OpenAiReasoningEffort::OPENAI_COMPATIBLE_SELECTABLE {
             let is_selected = effort == selected;
             let settings_window = settings_window.clone();
             menu.push_item(
-                ui::ContextMenuEntry::new(effort.label())
+                ui::ContextMenuEntry::new(localize(effort.label(), cx))
                     .toggleable(IconPosition::End, is_selected)
                     .handler(move |_window, cx| {
                         settings_window
@@ -996,17 +1013,17 @@ fn render_reasoning_effort_selector(
 
     v_flex()
         .gap_1()
-        .child(Label::new("Default reasoning effort").size(LabelSize::Small))
+        .child(Label::new(localize("Default reasoning effort", cx)).size(LabelSize::Small))
         .child(
             DropdownMenu::new(
                 ElementId::Name(format!("reasoning-effort-selector-{index}").into()),
-                selected.label(),
+                localize(selected.label(), cx),
                 menu,
             )
             .style(DropdownStyle::Outlined)
             .trigger_size(ButtonSize::Compact)
             .full_width(true)
-            .aria_label("Default reasoning effort"),
+            .aria_label(localize("Default reasoning effort", cx)),
         )
 }
 
@@ -1028,7 +1045,7 @@ fn render_form_actions(cx: &mut Context<SettingsWindow>) -> impl IntoElement {
         .gap_1()
         .justify_end()
         .child(
-            Button::new("llm-provider-form-cancel", "Cancel").on_click(cx.listener(
+            Button::new("llm-provider-form-cancel", localize("Cancel", cx)).on_click(cx.listener(
                 |this, _, window, cx| {
                     this.llm_provider_form = None;
                     this.pop_sub_page(window, cx);
@@ -1036,7 +1053,7 @@ fn render_form_actions(cx: &mut Context<SettingsWindow>) -> impl IntoElement {
             )),
         )
         .child(
-            Button::new("llm-provider-form-save", "Save Provider")
+            Button::new("llm-provider-form-save", localize("Save Provider", cx))
                 .style(ButtonStyle::Filled)
                 .on_click(cx.listener(|this, _, window, cx| {
                     save_llm_provider_form(this, window, cx);
@@ -1336,7 +1353,7 @@ mod tests {
     struct YoungAccountProviderRow;
 
     impl Render for YoungAccountProviderRow {
-        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             div().size_full().p_4().child(
                 div()
                     .w_full()
@@ -1349,6 +1366,7 @@ mod tests {
                                 .into(),
                         )),
                         cloud::test_support::young_account_configuration(),
+                        cx,
                     )),
             )
         }

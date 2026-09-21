@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use codestral::{CODESTRAL_API_URL, codestral_api_key_state, codestral_api_url};
 use edit_prediction::{
     ApiKeyState,
@@ -167,17 +168,24 @@ fn render_provider_dropdown(window: &mut Window, cx: &mut App) -> AnyElement {
                         .w_full()
                         .min_w_0()
                         .max_w_1_2()
-                        .child(Label::new("Provider"))
+                        .child(Label::new(localize("Provider", cx)))
                         .child(
-                            Label::new("Select which provider to use for edit predictions.")
-                                .size(LabelSize::Small)
-                                .color(Color::Muted),
+                            Label::new(localize(
+                                "Select which provider to use for edit predictions.",
+                                cx,
+                            ))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
                         ),
                 )
                 .child(
-                    DropdownMenu::new("provider-dropdown", current_provider_name, menu)
-                        .tab_index(0)
-                        .style(DropdownStyle::Outlined),
+                    DropdownMenu::new(
+                        "provider-dropdown",
+                        localize(current_provider_name, cx),
+                        menu,
+                    )
+                    .tab_index(0)
+                    .style(DropdownStyle::Outlined),
                 ),
         )
         .into_any_element()
@@ -251,7 +259,7 @@ fn render_api_key_provider(
 
     let description = match docs {
         ApiKeyDocs::Custom { message } => div().min_w_0().w_full().child(
-            Label::new(message)
+            Label::new(localize(&message, cx))
                 .size(LabelSize::Small)
                 .color(Color::Muted),
         ),
@@ -261,7 +269,7 @@ fn render_api_key_provider(
             .flex_wrap()
             .gap_0p5()
             .child(
-                Label::new("Visit the")
+                Label::new(localize("Visit the", cx))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             )
@@ -272,7 +280,7 @@ fn render_api_key_provider(
                     .label_color(Color::Muted),
             )
             .child(
-                Label::new("to generate an API key.")
+                Label::new(localize("to generate an API key.", cx))
                     .size(LabelSize::Small)
                     .color(Color::Muted),
             ),
@@ -286,21 +294,27 @@ fn render_api_key_provider(
 
     let container = if has_key {
         base_container.child(header).child(
-            ConfiguredApiCard::new(format!("{title}-reset-key"), configured_card_label)
-                .button_label("Reset Key")
-                .button_tab_index(0)
-                .disabled(is_from_env_var)
-                .when_some(env_var_name, |this, env_var_name| {
-                    this.when(is_from_env_var, |this| {
-                        this.tooltip_label(format!(
-                            "To reset your API key, unset the {} environment variable.",
-                            env_var_name
-                        ))
-                    })
+            ConfiguredApiCard::new(
+                format!("{title}-reset-key"),
+                localize(configured_card_label, cx),
+            )
+            .button_label(localize("Reset Key", cx))
+            .button_tab_index(0)
+            .disabled(is_from_env_var)
+            .when_some(env_var_name, |this, env_var_name| {
+                this.when(is_from_env_var, |this| {
+                    this.tooltip_label(
+                        localize(
+                            "To reset your API key, unset the {variable} environment variable.",
+                            cx,
+                        )
+                        .replace("{variable}", &env_var_name),
+                    )
                 })
-                .on_click(move |_, _, cx| {
-                    write_key(None, cx);
-                }),
+            })
+            .on_click(move |_, _, cx| {
+                write_key(None, cx);
+            }),
         )
     } else {
         base_container.child(header).child(
@@ -315,14 +329,13 @@ fn render_api_key_provider(
                         .min_w_0()
                         .max_w_1_2()
                         .gap_0p5()
-                        .child(Label::new("API Key"))
+                        .child(Label::new(localize("API Key", cx)))
                         .child(description)
                         .when_some(env_var_name, |this, env_var_name| {
                             this.child({
-                                let label = format!(
-                                    "Or set the {} env var and restart Zed.",
-                                    env_var_name.as_ref()
-                                );
+                                let label =
+                                    localize("Or set the {variable} env var and restart Zed.", cx)
+                                        .replace("{variable}", env_var_name.as_ref());
                                 Label::new(label).size(LabelSize::Small).color(Color::Muted)
                             })
                         }),

@@ -1,5 +1,7 @@
 {
   "$schema": "zed://schemas/settings",
+  // Suzuri interface language: "en" or "zh-CN". Restart to apply.
+  "ui_language": "en",
   // The name of the Zed theme to use for the UI.
   //
   // `mode` is one of:

@@ -173,7 +173,7 @@ impl ApplicationMenu {
         })
     }
 
-    fn render_application_menu(&self, entry: &MenuEntry) -> impl IntoElement {
+    fn render_application_menu(&self, entry: &MenuEntry, cx: &App) -> impl IntoElement {
         let handle = entry.handle.clone();
 
         let menu_name = entry.menu.name.clone();
@@ -197,7 +197,10 @@ impl ApplicationMenu {
                         .icon_size(IconSize::Small)
                         .tab_index(0isize)
                         .aria_label("Application menu"),
-                        Tooltip::text("Open Application Menu"),
+                        Tooltip::text(settings::localization::text(
+                            "menu.open_application_menu",
+                            cx,
+                        )),
                     )
                     .with_handle(handle),
             )
@@ -250,9 +253,9 @@ impl ApplicationMenu {
         &mut self,
         action: &OpenApplicationMenu,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
-        self.pending_menu_open = Some(action.0.clone());
+        self.pending_menu_open = Some(settings::localization::menu_name(&action.0, cx).to_string());
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -353,7 +356,7 @@ impl Render for ApplicationMenu {
             .flex_row()
             .gap_x_1()
             .when(!all_menus_shown && !self.entries.is_empty(), |this| {
-                this.child(self.render_application_menu(&self.entries[0]))
+                this.child(self.render_application_menu(&self.entries[0], cx))
             })
             .when(all_menus_shown, |this| {
                 this.children(

@@ -12,6 +12,7 @@ use notifications::status_toast::StatusToast;
 use project::agent_server_store::AllAgentServersSettings;
 use schemars::JsonSchema;
 use serde::Deserialize;
+use settings::localization::text;
 use settings::{SettingsStore, VsCodeSettingsSource};
 use std::sync::Arc;
 use ui::{
@@ -274,7 +275,7 @@ impl Onboarding {
     }
 
     fn on_finish(_: &Finish, _: &mut Window, cx: &mut App) {
-        telemetry::event!("Finish Setup");
+        telemetry::event!(text("onboarding.finish", cx));
         go_to_welcome_page(cx);
     }
 
@@ -354,11 +355,11 @@ impl Render for Onboarding {
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Suzuri")
+                                                        Headline::new(text("welcome.title", cx))
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
-                                                        Label::new("Code and write in one place")
+                                                        Label::new(text("welcome.tagline", cx))
                                                             .color(Color::Muted)
                                                             .size(LabelSize::Small)
                                                             .italic(),
@@ -399,8 +400,8 @@ impl Focusable for Onboarding {
 impl Item for Onboarding {
     type Event = ItemEvent;
 
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Onboarding".into()
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        text("onboarding.tab", cx).into()
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

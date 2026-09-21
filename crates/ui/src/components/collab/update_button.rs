@@ -13,6 +13,7 @@ pub struct UpdateButton {
     icon_animate: bool,
     icon_color: Option<Color>,
     message: SharedString,
+    dismiss_label: SharedString,
     tooltip: Option<Box<dyn Fn(&mut Window, &mut App) -> AnyView + 'static>>,
     disabled: bool,
     show_dismiss: bool,
@@ -28,6 +29,7 @@ impl UpdateButton {
             icon_animate: false,
             icon_color: None,
             message: message.into(),
+            dismiss_label: "Dismiss".into(),
             tooltip: None,
             disabled: false,
             show_dismiss: false,
@@ -96,6 +98,16 @@ impl UpdateButton {
 
     pub fn progress(mut self, progress: impl Into<Option<f32>>) -> Self {
         self.progress = progress.into();
+        self
+    }
+
+    pub fn message(mut self, message: impl Into<SharedString>) -> Self {
+        self.message = message.into();
+        self
+    }
+
+    pub fn dismiss_label(mut self, label: impl Into<SharedString>) -> Self {
+        self.dismiss_label = label.into();
         self
     }
 
@@ -210,7 +222,7 @@ impl RenderOnce for UpdateButton {
                         IconButton::new(dismiss_button_id, IconName::Close)
                             .icon_size(IconSize::Indicator)
                             .when_some(self.on_dismiss, |this, handler| this.on_click(handler))
-                            .tooltip(Tooltip::text("Dismiss")),
+                            .tooltip(Tooltip::text(self.dismiss_label)),
                     ),
                 )
             })

@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use audio::{AudioSettings, CHANNEL_COUNT, RodioExt, SAMPLE_RATE};
 use cpal::DeviceId;
 use gpui::{
@@ -219,18 +220,18 @@ impl Render for AudioTestWindow {
             .child(
                 v_flex()
                     .gap_1()
-                    .child(Label::new("Output Device"))
+                    .child(Label::new(localize("Output Device", cx)))
                     .child(output_dropdown),
             )
             .child(
                 v_flex()
                     .gap_1()
-                    .child(Label::new("Input Device"))
+                    .child(Label::new(localize("Input Device", cx)))
                     .child(input_dropdown),
             )
             .child(
                 h_flex().w_full().justify_center().pt_4().child(
-                    Button::new("test-audio-toggle", button_text)
+                    Button::new("test-audio-toggle", localize(button_text, cx))
                         .style(button_style)
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_testing(cx))),
                 ),

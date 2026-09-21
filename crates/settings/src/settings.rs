@@ -4,6 +4,7 @@ mod editable_setting_control;
 mod editorconfig_store;
 mod granted_write_path;
 mod keymap_file;
+pub mod localization;
 mod settings_file;
 mod settings_store;
 mod vscode_import;

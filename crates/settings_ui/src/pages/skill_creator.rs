@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use agent_skills::{
     AGENTS_DIR_NAME, MAX_SKILL_DESCRIPTION_LEN, MAX_SKILL_FILE_SIZE, SKILL_FILE_NAME,
     SKILLS_DIR_NAME, SkillMetadata, SkillsUpdatedHook, global_skills_dir, parse_skill_file_content,
@@ -183,7 +184,7 @@ impl SkillCreatorPage {
 
         let name_editor = cx.new(|cx| {
             InputField::new(window, cx, "my-new-skill")
-                .label("Name")
+                .label(localize("Name", cx))
                 .tab_index(NAME_FIELD_TAB_INDEX)
                 .tab_stop(true)
         });
@@ -191,14 +192,12 @@ impl SkillCreatorPage {
         window.focus(&name_editor.focus_handle(cx), cx);
 
         let description_editor = cx.new(|cx| {
-            InputField::new(
-                window,
-                cx,
-                "e.g., Fill the PR description following this template.",
-            )
-            .label("Description")
-            .tab_index(DESCRIPTION_FIELD_TAB_INDEX)
-            .tab_stop(true)
+            let placeholder =
+                localize("e.g., Fill the PR description following this template.", cx);
+            InputField::new(window, cx, &placeholder)
+                .label(localize("Description", cx))
+                .tab_index(DESCRIPTION_FIELD_TAB_INDEX)
+                .tab_stop(true)
         });
 
         let body_editor = cx.new(|cx| {
@@ -208,7 +207,7 @@ impl SkillCreatorPage {
                 buffer
             });
             let mut editor = Editor::for_buffer(buffer, None, window, cx);
-            editor.set_placeholder_text("Add skill content…", window, cx);
+            editor.set_placeholder_text(&localize("Add skill content…", cx), window, cx);
             editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
             editor.set_show_gutter(false, cx);
             editor.set_show_wrap_guides(false, cx);
@@ -696,27 +695,26 @@ impl SkillCreatorPage {
         cx.notify();
     }
 
-    fn render_url_import(&self) -> impl IntoElement {
+    fn render_url_import(&self, cx: &App) -> impl IntoElement {
         v_flex()
             .flex_shrink_0()
             .gap_2()
             .child(
                 h_flex()
                     .gap_1()
-                    .child(Label::new("Import from URL"))
-                    .child(Label::new("(optional)").color(Color::Muted)),
+                    .child(Label::new(localize("Import from URL", cx)))
+                    .child(Label::new(localize("(optional)", cx)).color(Color::Muted)),
             )
             .child(self.url_editor.clone())
             .child(match &self.url_import_status {
                 UrlImportStatus::Idle => Label::new(
-                    "Paste a GitHub .md URL to fetch it and fill out the form. \
-                     For private files, Zed retries using GITHUB_TOKEN, if set.",
+                    localize("Paste a GitHub .md URL to fetch it and fill out the form. For private files, Zed retries using GITHUB_TOKEN, if set.", cx),
                 )
                 .size(LabelSize::Small)
                 .color(Color::Muted)
                 .into_any_element(),
                 UrlImportStatus::Fetching => {
-                    LoadingLabel::new("Fetching and parsing…").into_any_element()
+                    LoadingLabel::new(localize("Fetching and parsing…", cx)).into_any_element()
                 }
                 UrlImportStatus::Error(error) => h_flex()
                     .gap_1()
@@ -743,7 +741,7 @@ impl SkillCreatorPage {
             .child(
                 v_flex()
                     .gap_2()
-                    .child(Label::new("Front-matter"))
+                    .child(Label::new(localize("Front-matter", cx)))
                     .child(self.name_editor.clone())
                     .child(self.description_editor.clone()),
             )
@@ -754,7 +752,7 @@ impl SkillCreatorPage {
                     .flex_grow_1()
                     .flex_shrink_0()
                     .gap_2()
-                    .child(Label::new("Skill Content"))
+                    .child(Label::new(localize("Skill Content", cx)))
                     .child(self.render_body_field(window, cx))
                     .when_some(self.body_error, |this, error| {
                         this.child(Label::new(error).size(LabelSize::Small).color(Color::Error))
@@ -852,7 +850,7 @@ impl SkillCreatorPage {
             })
             .child(
                 h_flex().w_full().gap_1().justify_end().child(
-                    Button::new("save-skill", main_action)
+                    Button::new("save-skill", localize(main_action, cx))
                         .size(ButtonSize::Medium)
                         .style(ButtonStyle::Outlined)
                         .loading(saving)
@@ -946,7 +944,7 @@ impl Render for SkillCreatorPage {
                             .gap_4()
                             .px_8()
                             .py_4()
-                            .child(self.render_url_import())
+                            .child(self.render_url_import(cx))
                             .child(Divider::horizontal().flex_shrink_0().flex_grow_1())
                             .child(self.render_form_fields(window, cx)),
                     ),

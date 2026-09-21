@@ -15,7 +15,7 @@ use menu::{SelectNext, SelectPrevious};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use settings::{DefaultOpenBehavior, Settings};
+use settings::{DefaultOpenBehavior, Settings, localization::text};
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
 use zed_actions::{
@@ -147,10 +147,15 @@ struct SectionEntry {
 }
 
 impl SectionEntry {
-    fn render(&self, button_index: usize, focus: &FocusHandle) -> Option<impl IntoElement> {
+    fn render(
+        &self,
+        button_index: usize,
+        focus: &FocusHandle,
+        cx: &App,
+    ) -> Option<impl IntoElement> {
         self.visibility_guard.is_visible().then(|| {
             SectionButton::new(
-                self.title,
+                text(self.title, cx),
                 self.icon,
                 self.action,
                 button_index,
@@ -162,52 +167,52 @@ impl SectionEntry {
 
 const CONTENT: (Section<4>, Section<3>) = (
     Section {
-        title: "Get Started",
+        title: "welcome.get_started",
         entries: [
             SectionEntry {
                 icon: IconName::Plus,
-                title: "New File",
+                title: "welcome.new_file",
                 action: &NewFile,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::FolderOpen,
-                title: "Open Project",
+                title: "welcome.open_project",
                 action: &Open::DEFAULT,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::CloudDownload,
-                title: "Clone Repository",
+                title: "welcome.clone_repository",
                 action: &GitClone,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::ListCollapse,
-                title: "Open Command Palette",
+                title: "welcome.command_palette",
                 action: &command_palette::Toggle,
                 visibility_guard: SectionVisibility::Always,
             },
         ],
     },
     Section {
-        title: "Configure",
+        title: "welcome.configure",
         entries: [
             SectionEntry {
                 icon: IconName::Settings,
-                title: "Open Settings",
+                title: "menu.open_settings",
                 action: &OpenSettings,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::Keyboard,
-                title: "Customize Keymaps",
+                title: "welcome.customize_keymaps",
                 action: &OpenKeymap,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
                 icon: IconName::Blocks,
-                title: "Explore Extensions",
+                title: "welcome.explore_extensions",
                 action: &Extensions {
                     category_filter: None,
                     id: None,
@@ -224,15 +229,15 @@ struct Section<const COLS: usize> {
 }
 
 impl<const COLS: usize> Section<COLS> {
-    fn render(self, index_offset: usize, focus: &FocusHandle) -> impl IntoElement {
+    fn render(self, index_offset: usize, focus: &FocusHandle, cx: &App) -> impl IntoElement {
         v_flex()
             .min_w_full()
-            .child(SectionHeader::new(self.title))
+            .child(SectionHeader::new(text(self.title, cx)))
             .children(
                 self.entries
                     .iter()
                     .enumerate()
-                    .filter_map(|(index, entry)| entry.render(index_offset + index, focus)),
+                    .filter_map(|(index, entry)| entry.render(index_offset + index, focus, cx)),
             )
     }
 }
@@ -330,7 +335,7 @@ impl WelcomePage {
         let focus = self.focus_handle.clone();
         let color = cx.theme().colors();
 
-        let description = "Run multiple threads at once, mix and match any ACP-compatible agent, and keep work conflict-free with worktrees.";
+        let description = text("welcome.agent_description", cx);
 
         v_flex()
             .w_full()
@@ -351,7 +356,7 @@ impl WelcomePage {
                             .color(Color::Muted)
                             .size(IconSize::Small),
                     )
-                    .child(Label::new("Collaborate with Agents")),
+                    .child(Label::new(text("welcome.agent_title", cx))),
             )
             .child(
                 Label::new(description)
@@ -360,7 +365,7 @@ impl WelcomePage {
                     .mb_2(),
             )
             .child(
-                Button::new("open-agent", "Open Agent Panel")
+                Button::new("open-agent", text("welcome.open_agent", cx))
                     .full_width()
                     .tab_index(tab_index as isize)
                     .style(ButtonStyle::Outlined)
@@ -378,10 +383,11 @@ impl WelcomePage {
     fn render_recent_project_section(
         &self,
         recent_projects: Vec<impl IntoElement>,
+        cx: &App,
     ) -> impl IntoElement {
         v_flex()
             .w_full()
-            .child(SectionHeader::new("Recent Projects"))
+            .child(SectionHeader::new(text("welcome.recent_projects", cx)))
             .children(recent_projects)
     }
 
@@ -439,22 +445,22 @@ impl Render for WelcomePage {
         let showing_recent_projects =
             self.fallback_to_recent_projects && !recent_projects.is_empty();
         let second_section = if showing_recent_projects {
-            self.render_recent_project_section(recent_projects)
+            self.render_recent_project_section(recent_projects, cx)
                 .into_any_element()
         } else {
             second_section
-                .render(first_section_entries, &self.focus_handle)
+                .render(first_section_entries, &self.focus_handle, cx)
                 .into_any_element()
         };
 
         let welcome_label = if self.fallback_to_recent_projects {
-            "Welcome back to Suzuri"
+            text("welcome.back", cx)
         } else {
-            "Welcome to Suzuri"
+            text("welcome.title", cx)
         };
 
         h_flex()
-            .key_context("Welcome")
+            .key_context(text("welcome.tab", cx))
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::select_previous))
             .on_action(cx.listener(Self::select_next))
@@ -480,14 +486,14 @@ impl Render for WelcomePage {
                             .child(Vector::square(VectorName::SuzuriLogo, rems_from_px(45_f32)))
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
-                                    Label::new("Code and write in one place")
+                                    Label::new(text("welcome.tagline", cx))
                                         .size(LabelSize::Small)
                                         .color(Color::Muted)
                                         .italic(),
                                 ),
                             ),
                     )
-                    .child(first_section.render(Default::default(), &self.focus_handle))
+                    .child(first_section.render(Default::default(), &self.focus_handle, cx))
                     .child(second_section)
                     .when(ai_enabled && !showing_recent_projects, |this| {
                         let agent_tab_index = next_tab_index;
@@ -497,7 +503,7 @@ impl Render for WelcomePage {
                     .when(!self.fallback_to_recent_projects, |this| {
                         this.child(
                             v_flex().gap_4().child(Divider::horizontal()).child(
-                                Button::new("welcome-exit", "Return to Onboarding")
+                                Button::new("welcome-exit", text("welcome.return_onboarding", cx))
                                     .tab_index(next_tab_index as isize)
                                     .full_width()
                                     .label_size(LabelSize::XSmall)
@@ -522,8 +528,8 @@ impl Focusable for WelcomePage {
 impl Item for WelcomePage {
     type Event = ItemEvent;
 
-    fn tab_content_text(&self, _detail: usize, _cx: &App) -> SharedString {
-        "Welcome".into()
+    fn tab_content_text(&self, _detail: usize, cx: &App) -> SharedString {
+        text("welcome.tab", cx).into()
     }
 
     fn telemetry_event_text(&self) -> Option<&'static str> {

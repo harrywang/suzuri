@@ -73,8 +73,8 @@ impl PickerDelegate for FontPickerDelegate {
         cx.notify();
     }
 
-    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search fonts…".into()
+    fn placeholder_text(&self, _window: &mut Window, cx: &mut App) -> Arc<str> {
+        settings::localization::text("settings.search_fonts", cx).into()
     }
 
     fn update_matches(

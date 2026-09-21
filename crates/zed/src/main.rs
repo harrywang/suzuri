@@ -499,6 +499,7 @@ fn main() {
         settings::init(cx);
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
+        settings::localization::init(cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
 
         let user_agent = format!(

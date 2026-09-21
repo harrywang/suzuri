@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use std::path::PathBuf;
 
 use agent_settings::AgentSettings;
@@ -61,11 +62,8 @@ pub(crate) fn render_sandbox_settings_page(
         .child(
             SwitchField::new(
                 "sandbox-enabled",
-                Some("Enable Sandbox"),
-                Some(
-                    "Wrap agent-run terminal commands in an OS-level sandbox. When off, commands run with Zed's own permissions."
-                        .into(),
-                ),
+                Some(localize("Enable Sandbox", cx)),
+                Some(localize("Wrap agent-run terminal commands in an OS-level sandbox. When off, commands run with Zed's own permissions.", cx)),
                 sandbox_enabled,
                 move |state, _window, cx| {
                     set_sandbox_enabled(*state == ToggleState::Selected, cx);
@@ -80,7 +78,7 @@ pub(crate) fn render_sandbox_settings_page(
             // Wrap in a row so the button shrinks to its content width instead
             // of stretching across the settings page.
             h_flex().child(
-                Button::new("sandbox-docs-link", "Learn more about sandboxing")
+                Button::new("sandbox-docs-link", localize("Learn more about sandboxing", cx))
                     .label_size(LabelSize::Small)
                     .color(Color::Muted)
                     .end_icon(
@@ -99,7 +97,7 @@ pub(crate) fn render_sandbox_settings_page(
                     .severity(Severity::Warning)
                     .child(Label::new(error).size(LabelSize::Small))
                     .action_slot(
-                        Button::new("dismiss-sandbox-host-error", "Dismiss")
+                        Button::new("dismiss-sandbox-host-error", localize("Dismiss", cx))
                             .style(ButtonStyle::Tinted(ui::TintColor::Warning))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.sandbox_host_validation_error = None;
@@ -115,11 +113,8 @@ pub(crate) fn render_sandbox_settings_page(
                 .child(
                     SwitchField::new(
                         "sandbox-allow-all-hosts",
-                        Some("Allow All Domains"),
-                        Some(
-                            "Let sandboxed commands reach any domain over the network without prompting."
-                                .into(),
-                        ),
+                        Some(localize("Allow All Domains", cx)),
+                        Some(localize("Let sandboxed commands reach any domain over the network without prompting.", cx)),
                         permissions.allow_all_hosts,
                         move |state, _window, cx| {
                             set_allow_all_hosts(*state == ToggleState::Selected, cx);
@@ -133,6 +128,7 @@ pub(crate) fn render_sandbox_settings_page(
                     host_rows,
                     add_host_input,
                     empty_border,
+                    cx,
                 )),
         )
 
@@ -144,11 +140,8 @@ pub(crate) fn render_sandbox_settings_page(
                 .child(
                     SwitchField::new(
                         "sandbox-allow-fs-write-all",
-                        Some("Allow All File System Writes"),
-                        Some(
-                            "Let sandboxed commands write anywhere except protected Git metadata without prompting."
-                                .into(),
-                        ),
+                        Some(localize("Allow All File System Writes", cx)),
+                        Some(localize("Let sandboxed commands write anywhere except protected Git metadata without prompting.", cx)),
                         permissions.allow_fs_write_all,
                         move |state, _window, cx| {
                             set_allow_fs_write_all(*state == ToggleState::Selected, cx);
@@ -162,6 +155,7 @@ pub(crate) fn render_sandbox_settings_page(
                     path_rows,
                     add_path_input,
                     empty_border,
+                    cx,
                 )),
         )
         .child(Divider::horizontal())
@@ -172,11 +166,8 @@ pub(crate) fn render_sandbox_settings_page(
                 .child(
                     SwitchField::new(
                         "sandbox-warn-confusable-unicode",
-                        Some("Warn About Confusable Unicode"),
-                        Some(
-                            "Warn when an approval prompt requests a domain or write path that contains potentially confusable Unicode characters, such as homoglyphs (i.e. two symbols that look similar, such as a Cyrillic `а`)"
-                                .into(),
-                        ),
+                        Some(localize("Warn About Confusable Unicode", cx)),
+                        Some(localize("Warn when an approval prompt requests a domain or write path that contains potentially confusable Unicode characters, such as homoglyphs (i.e. two symbols that look similar, such as a Cyrillic `а`)", cx)),
                         permissions.warn_confusable_unicode,
                         move |state, _window, cx| {
                             set_warn_confusable_unicode(*state == ToggleState::Selected, cx);
@@ -187,11 +178,8 @@ pub(crate) fn render_sandbox_settings_page(
                 .child(
                     SwitchField::new(
                         "sandbox-warn-ntfs-grants",
-                        Some("Warn About Windows-Drive Grants"),
-                        Some(
-                            "Windows only: warn when a sandbox grant targets a file on a Windows drive (accessed inside WSL via DrvFs). Such grants are enforced through a translated path and their sandbox-integrity guarantees are weaker than files on the Linux distro's own filesystem."
-                                .into(),
-                        ),
+                        Some(localize("Warn About Windows-Drive Grants", cx)),
+                        Some(localize("Windows only: warn when a sandbox grant targets a file on a Windows drive (accessed inside WSL via DrvFs). Such grants are enforced through a translated path and their sandbox-integrity guarantees are weaker than files on the Linux distro's own filesystem.", cx)),
                         permissions.warn_ntfs_grants,
                         move |state, _window, cx| {
                             set_warn_ntfs_grants(*state == ToggleState::Selected, cx);
@@ -210,14 +198,15 @@ fn render_list_section(
     rows: Vec<AnyElement>,
     add_input: AnyElement,
     empty_border: gpui::Hsla,
+    cx: &App,
 ) -> impl IntoElement {
     let is_empty = rows.is_empty();
 
     v_flex()
         .gap_0p5()
-        .child(Label::new(title))
+        .child(Label::new(localize(title, cx)))
         .child(
-            Label::new(description)
+            Label::new(localize(description, cx))
                 .size(LabelSize::Small)
                 .color(Color::Muted),
         )
@@ -227,7 +216,7 @@ fn render_list_section(
                 .w_full()
                 .gap_1p5()
                 .when(is_empty, |this| {
-                    this.child(render_empty_state(empty_border))
+                    this.child(render_empty_state(empty_border, cx))
                 })
                 .when(!is_empty, |this| {
                     this.child(v_flex().gap_1p5().children(rows))
@@ -236,7 +225,7 @@ fn render_list_section(
         )
 }
 
-fn render_empty_state(border_color: gpui::Hsla) -> AnyElement {
+fn render_empty_state(border_color: gpui::Hsla, cx: &App) -> AnyElement {
     h_flex()
         .p_2()
         .rounded_md()
@@ -244,7 +233,7 @@ fn render_empty_state(border_color: gpui::Hsla) -> AnyElement {
         .border_dashed()
         .border_color(border_color)
         .child(
-            Label::new("Nothing configured")
+            Label::new(localize("Nothing configured", cx))
                 .size(LabelSize::Small)
                 .color(Color::Disabled),
         )
@@ -265,7 +254,7 @@ fn render_host_row(index: usize, host: String, cx: &mut Context<SettingsWindow>)
             IconButton::new(format!("sandbox-host-delete-{}", index), IconName::Trash)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
-                .tooltip(Tooltip::text("Remove Domain"))
+                .tooltip(Tooltip::text(localize("Remove Domain", cx)))
                 .on_click(cx.listener(move |_, _, _, cx| {
                     remove_network_host(host_for_delete.clone(), cx);
                 })),
@@ -348,7 +337,7 @@ fn render_path_row(index: usize, path: PathBuf, cx: &mut Context<SettingsWindow>
             IconButton::new(format!("sandbox-path-delete-{}", index), IconName::Trash)
                 .icon_size(IconSize::Small)
                 .icon_color(Color::Muted)
-                .tooltip(Tooltip::text("Remove Path"))
+                .tooltip(Tooltip::text(localize("Remove Path", cx)))
                 .on_click(cx.listener(move |_, _, _, cx| {
                     remove_write_path(path_for_delete.clone(), cx);
                 })),

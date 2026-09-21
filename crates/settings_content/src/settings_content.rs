@@ -169,9 +169,37 @@ pub enum ReduceMotionMode {
     Off,
 }
 
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+pub enum UiLanguage {
+    #[default]
+    #[serde(rename = "en")]
+    #[strum(serialize = "English")]
+    English,
+    #[serde(rename = "zh-CN")]
+    #[strum(serialize = "简体中文")]
+    SimplifiedChinese,
+}
+
 #[with_fallible_options]
 #[derive(Debug, PartialEq, Default, Clone, Serialize, JsonSchema, MergeFrom)]
 pub struct SettingsContent {
+    /// Display language for Suzuri's translated interface. Requires a restart.
+    /// Untranslated interface text remains in English. Default: "en".
+    pub ui_language: Option<UiLanguage>,
+
     #[serde(flatten)]
     pub project: ProjectSettingsContent,
 
@@ -409,7 +437,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         // SUZURI: begin. The fork's own settings sections must be listed here too.
-        markdown_live_preview, typeset_preview,
+        markdown_live_preview, typeset_preview, ui_language,
         // SUZURI: end
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,

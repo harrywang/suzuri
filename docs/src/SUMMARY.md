@@ -3,6 +3,7 @@
 # Welcome
 
 - [Getting Started](./getting-started.md)
+- [Suzuri Display Language](./suzuri-localization.md)
 - [Installation](./installation.md)
   - [Update](./update.md)
   - [Uninstall](./uninstall.md)
@@ -232,3 +233,4 @@
   - [Glossary](./development/glossary.md)
 - [Release Notes](./development/release-notes.md)
 - [Debugging Crashes](./development/debugging-crashes.md)
+- [Suzuri Localization Plan](./development/suzuri-localization.md)

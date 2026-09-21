@@ -4,6 +4,7 @@ use anyhow::anyhow;
 use auto_update::{AutoUpdateStatus, AutoUpdater, UpdateCheckType};
 use gpui::{Empty, Render};
 use semver::Version;
+use settings::localization::text;
 use ui::{Tooltip, UpdateButton, prelude::*};
 
 pub struct UpdateVersion {
@@ -81,8 +82,20 @@ impl UpdateVersion {
         cx.notify()
     }
 
-    fn version_tooltip_message(version: &Version) -> String {
-        UpdateButton::version_tooltip_message(version)
+    fn version_tooltip_message(version: &Version, cx: &App) -> String {
+        format!("{} {version}", text("update.version", cx))
+    }
+
+    fn downloading_tooltip_message(version: &Version, progress: Option<f32>, cx: &App) -> String {
+        let message = Self::version_tooltip_message(version, cx);
+        match progress {
+            Some(progress) => format!(
+                "{message} ({:.0}% {})",
+                progress.clamp(0.0, 1.0) * 100.0,
+                text("update.downloaded", cx)
+            ),
+            None => message,
+        }
     }
 }
 
@@ -93,7 +106,9 @@ impl Render for UpdateVersion {
         }
         match &self.status {
             AutoUpdateStatus::Checking if self.update_check_type.is_manual() => {
-                UpdateButton::checking().into_any_element()
+                UpdateButton::checking()
+                    .message(text("update.checking", cx))
+                    .into_any_element()
             }
             AutoUpdateStatus::Downloading { version, progress } => {
                 let rendered_version = version.clone();
@@ -101,23 +116,28 @@ impl Render for UpdateVersion {
                     let status = AutoUpdater::get(cx).map(|updater| updater.read(cx).status());
                     let message = match &status {
                         Some(AutoUpdateStatus::Downloading { version, progress }) => {
-                            UpdateButton::downloading_tooltip_message(version, *progress)
+                            Self::downloading_tooltip_message(version, *progress, cx)
                         }
-                        _ => Self::version_tooltip_message(&rendered_version),
+                        _ => Self::version_tooltip_message(&rendered_version, cx),
                     };
                     Label::new(message).into_any_element()
                 });
                 UpdateButton::downloading(*progress)
+                    .message(text("update.downloading", cx))
                     .tooltip_fn(tooltip)
                     .into_any_element()
             }
             AutoUpdateStatus::Installing { version } => {
-                let version = Self::version_tooltip_message(version);
-                UpdateButton::installing(version).into_any_element()
+                let version = Self::version_tooltip_message(version, cx);
+                UpdateButton::installing(version)
+                    .message(text("update.installing", cx))
+                    .into_any_element()
             }
             AutoUpdateStatus::Updated { version } => {
-                let version = Self::version_tooltip_message(version);
+                let version = Self::version_tooltip_message(version, cx);
                 UpdateButton::updated(version)
+                    .message(text("update.restart", cx))
+                    .dismiss_label(text("update.dismiss", cx))
                     .on_click(|_, _, cx| {
                         workspace::reload(cx);
                     })
@@ -127,6 +147,8 @@ impl Render for UpdateVersion {
             AutoUpdateStatus::Errored { error } => {
                 let error_str = error.to_string();
                 UpdateButton::errored(error_str)
+                    .message(text("update.failed", cx))
+                    .dismiss_label(text("update.dismiss", cx))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(workspace::OpenLog), cx);
                     })
@@ -139,39 +161,61 @@ impl Render for UpdateVersion {
 }
 #[cfg(test)]
 mod tests {
-    use semver::Version;
+    use gpui::UpdateGlobal;
 
     use super::*;
 
-    #[test]
-    fn test_version_tooltip_message() {
-        let message = UpdateVersion::version_tooltip_message(&Version::new(1, 0, 0));
-
-        assert_eq!(message, "Update to Version: 1.0.0");
-
-        let message = UpdateVersion::version_tooltip_message(
-            &"1.0.0+nightly.14d9a4189f058d8736339b06ff2340101eaea5af"
+    #[gpui::test]
+    fn update_tooltips_follow_the_session_language(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            settings::init(cx);
+            settings::localization::init(cx);
+            let version = Version::new(1, 0, 0);
+            assert_eq!(
+                UpdateVersion::version_tooltip_message(&version, cx),
+                "Update to Version: 1.0.0"
+            );
+            assert_eq!(
+                UpdateVersion::downloading_tooltip_message(&version, Some(0.454), cx),
+                "Update to Version: 1.0.0 (45% downloaded)"
+            );
+            assert_eq!(
+                UpdateVersion::downloading_tooltip_message(&version, None, cx),
+                "Update to Version: 1.0.0"
+            );
+            assert_eq!(
+                UpdateVersion::downloading_tooltip_message(&version, Some(1.5), cx),
+                "Update to Version: 1.0.0 (100% downloaded)"
+            );
+            let nightly: Version = "1.0.0+nightly.14d9a4189f058d8736339b06ff2340101eaea5af"
                 .parse()
-                .unwrap(),
-        );
-
-        assert_eq!(
-            message,
-            "Update to Version: 1.0.0+nightly.14d9a4189f058d8736339b06ff2340101eaea5af"
-        );
-    }
-
-    #[test]
-    fn test_downloading_tooltip_message() {
-        let version = Version::new(1, 0, 0);
-
-        let message = UpdateButton::downloading_tooltip_message(&version, None);
-        assert_eq!(message, "Update to Version: 1.0.0");
-
-        let message = UpdateButton::downloading_tooltip_message(&version, Some(0.454));
-        assert_eq!(message, "Update to Version: 1.0.0 (45% downloaded)");
-
-        let message = UpdateButton::downloading_tooltip_message(&version, Some(1.5));
-        assert_eq!(message, "Update to Version: 1.0.0 (100% downloaded)");
+                .expect("valid nightly version");
+            assert_eq!(
+                UpdateVersion::version_tooltip_message(&nightly, cx),
+                "Update to Version: 1.0.0+nightly.14d9a4189f058d8736339b06ff2340101eaea5af"
+            );
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(r#"{"ui_language":"zh-CN"}"#, cx)
+                    .expect("valid language setting");
+            });
+            settings::localization::init(cx);
+            assert_eq!(
+                UpdateVersion::version_tooltip_message(&version, cx),
+                "更新至版本： 1.0.0"
+            );
+            assert_eq!(
+                UpdateVersion::downloading_tooltip_message(&version, None, cx),
+                "更新至版本： 1.0.0"
+            );
+            assert_eq!(
+                UpdateVersion::downloading_tooltip_message(&version, Some(1.5), cx),
+                "更新至版本： 1.0.0 (100% 已下载)"
+            );
+            assert_eq!(
+                UpdateVersion::downloading_tooltip_message(&version, Some(-0.5), cx),
+                "更新至版本： 1.0.0 (0% 已下载)"
+            );
+        });
     }
 }

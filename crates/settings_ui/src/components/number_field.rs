@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use std::{
     fmt::Display,
     num::{NonZero, NonZeroU32, NonZeroU64},
@@ -585,7 +586,7 @@ impl<T: NumberFieldType> RenderOnce for NumberField<T> {
                 this.child(
                     IconButton::new("reset", IconName::RotateCcw)
                         .icon_size(IconSize::Small)
-                        .aria_label("Reset to Default")
+                        .aria_label(localize("Reset to Default", cx))
                         .when_some(self.tab_index, |this, _| this.tab_index(0isize))
                         .on_click(on_reset),
                 )

@@ -140,6 +140,23 @@ fn general_page(cx: &App) -> SettingsPage {
         vec![
             SettingsPageItem::SectionHeader("General Settings"),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Language / 界面语言",
+                description: "Restart Suzuri to apply. Translates menus, welcome screens, settings navigation and common settings; advanced descriptions may remain in English.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("ui_language"),
+                    pick: |settings_content| settings_content.ui_language.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.ui_language = value;
+                    },
+                }),
+                metadata: Some(Box::new(SettingsFieldMetadata {
+                    should_do_titlecase: Some(false),
+                    ..Default::default()
+                })),
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Accessible Mode",
                 description: "Optimize Zed's interface for assistive technology such as screen readers. When enabled, otherwise-collapsed controls stay expanded and keyboard-reachable.",
                 field: Box::new(SettingField {

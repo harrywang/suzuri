@@ -206,6 +206,7 @@ impl VsCodeSettings {
             image_viewer: None,
             markdown_live_preview: None,
             typeset_preview: None,
+            ui_language: None,
             markdown_preview: None,
             journal: None,
             language_models: None,

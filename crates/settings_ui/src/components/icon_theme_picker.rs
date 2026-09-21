@@ -81,8 +81,8 @@ impl PickerDelegate for IconThemePickerDelegate {
         cx.notify();
     }
 
-    fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search icon themes…".into()
+    fn placeholder_text(&self, _window: &mut Window, cx: &mut App) -> Arc<str> {
+        settings::localization::text("settings.search_icon_themes", cx).into()
     }
 
     fn update_matches(

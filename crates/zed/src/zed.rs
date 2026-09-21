@@ -190,6 +190,7 @@ actions!(
 );
 
 pub fn init(cx: &mut App) {
+    init_ui_language_notifications(cx);
     #[cfg(target_os = "macos")]
     cx.on_action(|_: &Hide, cx| cx.hide());
     #[cfg(target_os = "macos")]
@@ -2075,6 +2076,33 @@ impl Settings for ReduceMotionSetting {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         Self(content.reduce_motion.unwrap_or_default())
     }
+}
+
+fn init_ui_language_notifications(cx: &mut App) {
+    use settings::localization::{UiLanguageSetting, active_language, text_for};
+
+    struct UiLanguageChanged;
+    let notification_id = NotificationId::unique::<UiLanguageChanged>();
+    let mut previous = UiLanguageSetting::get_global(cx).0;
+    cx.observe_global::<SettingsStore>(move |cx| {
+        let language = UiLanguageSetting::get_global(cx).0;
+        if language == previous {
+            return;
+        }
+        previous = language;
+        if language == active_language(cx) {
+            dismiss_app_notification(&notification_id, cx);
+            return;
+        }
+        show_app_notification(notification_id.clone(), cx, move |cx| {
+            cx.new(|cx| {
+                MessageNotification::new(text_for(language, "language.restart_message"), cx)
+                    .primary_message(text_for(language, "language.restart"))
+                    .primary_on_click(|_, cx| workspace::reload(cx))
+            })
+        });
+    })
+    .detach();
 }
 
 fn init_reduce_motion(cx: &mut App) {

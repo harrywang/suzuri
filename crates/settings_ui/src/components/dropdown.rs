@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use std::rc::Rc;
 
 use gpui::{App, ElementId, IntoElement, RenderOnce, SharedString};
@@ -94,15 +95,18 @@ impl RenderOnce for EnumVariantDropdown {
         let current_value_label = self.labels[self.selected_index];
 
         let context_menu = window.use_keyed_state(current_value_label, cx, |window, cx| {
-            ContextMenu::new(window, cx, move |mut menu, _, _| {
+            ContextMenu::new(window, cx, move |mut menu, _, cx| {
                 for (index, &label) in self.labels.iter().enumerate() {
                     let on_change = self.on_change.clone();
                     menu = menu.toggleable_entry(
-                        if self.should_do_title_case {
-                            label.to_title_case()
-                        } else {
-                            label.to_string()
-                        },
+                        localize(
+                            &if self.should_do_title_case {
+                                label.to_title_case()
+                            } else {
+                                label.to_string()
+                            },
+                            cx,
+                        ),
                         index == self.selected_index,
                         IconPosition::End,
                         None,
@@ -117,11 +121,14 @@ impl RenderOnce for EnumVariantDropdown {
 
         DropdownMenu::new(
             self.id,
-            if self.should_do_title_case {
-                current_value_label.to_title_case()
-            } else {
-                current_value_label.to_string()
-            },
+            localize(
+                &if self.should_do_title_case {
+                    current_value_label.to_title_case()
+                } else {
+                    current_value_label.to_string()
+                },
+                cx,
+            ),
             context_menu,
         )
         .when_some(self.aria_label, |this, label| this.aria_label(label))

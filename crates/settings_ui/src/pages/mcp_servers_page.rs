@@ -1,3 +1,4 @@
+use crate::localization::localize;
 use std::sync::Arc;
 
 use collections::HashMap;
@@ -55,11 +56,16 @@ pub(crate) fn render_mcp_servers_page(
                 .px_8()
                 .gap_2()
                 .child(
-                    v_flex().child(Label::new("Configured Servers")).child(
-                        Label::new("Manage servers connected directly or via extensions.")
+                    v_flex()
+                        .child(Label::new(localize("Configured Servers", cx)))
+                        .child(
+                            Label::new(localize(
+                                "Manage servers connected directly or via extensions.",
+                                cx,
+                            ))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
-                    ),
+                        ),
                 )
                 .child(server_list)
                 .child(Divider::horizontal()),
@@ -108,9 +114,12 @@ fn render_empty_state(cx: &App) -> AnyElement {
         .border_color(cx.theme().colors().border.opacity(0.6))
         .rounded_sm()
         .child(
-            Label::new("No MCP servers added yet. Click \"Add Server\" to get started.")
-                .color(Color::Muted)
-                .size(LabelSize::Small),
+            Label::new(localize(
+                "No MCP servers added yet. Click \"Add Server\" to get started.",
+                cx,
+            ))
+            .color(Color::Muted)
+            .size(LabelSize::Small),
         )
         .into_any_element()
 }
@@ -124,9 +133,12 @@ fn render_no_project_state(cx: &App) -> AnyElement {
         .border_color(cx.theme().colors().border.opacity(0.6))
         .rounded_sm()
         .child(
-            Label::new("No active project found. Open a workspace to manage MCP servers.")
-                .color(Color::Muted)
-                .size(LabelSize::Small),
+            Label::new(localize(
+                "No active project found. Open a workspace to manage MCP servers.",
+                cx,
+            ))
+            .color(Color::Muted)
+            .size(LabelSize::Small),
         )
         .into_any_element()
 }
@@ -214,9 +226,10 @@ fn render_context_server(
             context_server_id,
             cx.entity().downgrade(),
             server_settings.clone(),
+            cx,
         )
     });
-    let uninstall_button = render_uninstall_button(context_server_id, provided_by_extension);
+    let uninstall_button = render_uninstall_button(context_server_id, provided_by_extension, cx);
 
     // Build toggle switch
     let toggle_switch =
@@ -226,7 +239,13 @@ fn render_context_server(
     // ahead of runtime status feedback, so the misconfiguration is visible.
     let details = match settings_validation_error(server_settings.as_ref()) {
         Some(error) => Some(render_form_error(error).into_any_element()),
-        None => render_status_details(&server_status, context_server_id, store, should_show_logout),
+        None => render_status_details(
+            &server_status,
+            context_server_id,
+            store,
+            should_show_logout,
+            cx,
+        ),
     };
 
     AiSettingItem::new(item_id, display_name, status, source)
@@ -272,6 +291,7 @@ fn render_configure_button(
     context_server_id: &ContextServerId,
     settings_window: WeakEntity<SettingsWindow>,
     server_settings: Option<ContextServerSettings>,
+    cx: &App,
 ) -> impl IntoElement {
     let context_server_id = context_server_id.clone();
 
@@ -281,7 +301,7 @@ fn render_configure_button(
     )
     .icon_size(IconSize::Small)
     .tab_index(0isize)
-    .tooltip(Tooltip::text("Configure MCP Server"))
+    .tooltip(Tooltip::text(localize("Configure MCP Server", cx)))
     .on_click(move |_event, window, cx| {
         let transport = match &server_settings {
             Some(ContextServerSettings::Http { .. }) => McpTransport::Http,
@@ -301,6 +321,7 @@ fn render_configure_button(
 fn render_uninstall_button(
     context_server_id: &ContextServerId,
     provided_by_extension: bool,
+    cx: &App,
 ) -> impl IntoElement {
     let context_server_id = context_server_id.clone();
 
@@ -310,7 +331,7 @@ fn render_uninstall_button(
     )
     .icon_size(IconSize::Small)
     .tab_index(0isize)
-    .tooltip(Tooltip::text("Uninstall MCP Server"))
+    .tooltip(Tooltip::text(localize("Uninstall MCP Server", cx)))
     .on_click(move |_event, _window, cx| {
         uninstall_server(&context_server_id, provided_by_extension, cx);
     })
@@ -379,6 +400,7 @@ fn render_status_details(
     context_server_id: &ContextServerId,
     store: &Entity<ContextServerStore>,
     should_show_logout: bool,
+    cx: &App,
 ) -> Option<AnyElement> {
     let feedback_base = || h_flex().py_1().min_w_0().w_full().gap_1().justify_between();
 
@@ -408,7 +430,7 @@ fn render_status_details(
                     )
                     .when(should_show_logout, |this| {
                         this.child(
-                            Button::new("error-logout", "Log Out")
+                            Button::new("error-logout", localize("Log Out", cx))
                                 .style(ButtonStyle::Outlined)
                                 .label_size(LabelSize::Small)
                                 .on_click({
@@ -441,13 +463,13 @@ fn render_status_details(
                                     .color(Color::Muted),
                             )
                             .child(
-                                Label::new("Authenticate to connect this server")
+                                Label::new(localize("Authenticate to connect this server", cx))
                                     .color(Color::Muted)
                                     .size(LabelSize::Small),
                             ),
                     )
                     .child(
-                        Button::new("authenticate-server", "Authenticate")
+                        Button::new("authenticate-server", localize("Authenticate", cx))
                             .style(ButtonStyle::Outlined)
                             .label_size(LabelSize::Small)
                             .on_click({
@@ -474,9 +496,12 @@ fn render_status_details(
                                 .color(Color::Muted),
                         )
                         .child(
-                            Label::new("A client secret is required to connect this server")
-                                .color(Color::Muted)
-                                .size(LabelSize::Small),
+                            Label::new(localize(
+                                "A client secret is required to connect this server",
+                                cx,
+                            ))
+                            .color(Color::Muted)
+                            .size(LabelSize::Small),
                         ),
                 )
                 .into_any_element(),
@@ -489,7 +514,7 @@ fn render_status_details(
                 .gap_2()
                 .child(div().size_3().flex_shrink_0())
                 .child(
-                    Label::new("Authenticating…")
+                    Label::new(localize("Authenticating…", cx))
                         .color(Color::Muted)
                         .size(LabelSize::Small),
                 )
@@ -504,7 +529,7 @@ fn render_status_details(
                     .w_full()
                     .justify_end()
                     .child(
-                        Button::new("running-logout", "Log Out")
+                        Button::new("running-logout", localize("Log Out", cx))
                             .style(ButtonStyle::Outlined)
                             .label_size(LabelSize::Small)
                             .on_click(move |_event, _window, cx| {
@@ -544,7 +569,7 @@ pub(crate) fn render_add_server_popover(
 
     let popover = PopoverMenu::new("add-mcp-server-popover")
         .trigger(
-            Button::new("add-mcp-server", "Add Server")
+            Button::new("add-mcp-server", localize("Add Server", cx))
                 .style(ButtonStyle::Outlined)
                 .track_focus(&focus_handle)
                 .start_icon(
@@ -558,8 +583,8 @@ pub(crate) fn render_add_server_popover(
         .menu({
             move |window, cx| {
                 let settings_window = settings_window.clone();
-                Some(ContextMenu::build(window, cx, move |menu, _window, _cx| {
-                    menu.entry("Add Local Server", None, {
+                Some(ContextMenu::build(window, cx, move |menu, _window, cx| {
+                    menu.entry(localize("Add Local Server", cx), None, {
                         let settings_window = settings_window.clone();
                         move |window, cx| {
                             settings_window
@@ -575,7 +600,7 @@ pub(crate) fn render_add_server_popover(
                                 .log_err();
                         }
                     })
-                    .entry("Add Remote Server", None, {
+                    .entry(localize("Add Remote Server", cx), None, {
                         let settings_window = settings_window.clone();
                         move |window, cx| {
                             settings_window
@@ -592,7 +617,7 @@ pub(crate) fn render_add_server_popover(
                         }
                     })
                     .separator()
-                    .entry("Install from Extensions", None, {
+                    .entry(localize("Install from Extensions", cx), None, {
                         move |_window, cx| {
                             if let Some(original_window) = original_window.as_ref() {
                                 cx.activate(true);
@@ -1050,7 +1075,7 @@ fn render_kv_section(
                             IconButton::new((kind.remove_id(), ix), IconName::Close)
                                 .icon_size(IconSize::Small)
                                 .icon_color(Color::Muted)
-                                .tooltip(Tooltip::text("Remove"))
+                                .tooltip(Tooltip::text(localize("Remove", cx)))
                                 .on_click(cx.listener(move |this, _, _window, cx| {
                                     if let Some(form) = this.mcp_server_form.as_mut() {
                                         let rows = kind.rows_mut(form);
@@ -1065,7 +1090,7 @@ fn render_kv_section(
                 .child(input_box(&row.value, cx))
         }))
         .child(
-            Button::new(kind.add_id(), "Add")
+            Button::new(kind.add_id(), localize("Add", cx))
                 .style(ButtonStyle::Outlined)
                 .label_size(LabelSize::Small)
                 .start_icon(
@@ -1117,7 +1142,7 @@ fn render_form_actions(cx: &mut Context<SettingsWindow>) -> impl IntoElement {
         .justify_end()
         .pt_2()
         .child(
-            Button::new("mcp-form-cancel", "Cancel")
+            Button::new("mcp-form-cancel", localize("Cancel", cx))
                 .style(ButtonStyle::Subtle)
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.mcp_server_form = None;
@@ -1125,7 +1150,7 @@ fn render_form_actions(cx: &mut Context<SettingsWindow>) -> impl IntoElement {
                 })),
         )
         .child(
-            Button::new("mcp-form-save", "Save")
+            Button::new("mcp-form-save", localize("Save", cx))
                 .style(ButtonStyle::Filled)
                 .on_click(cx.listener(|this, _, window, cx| {
                     save_mcp_server_form(this, window, cx);
