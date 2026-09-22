@@ -30,7 +30,7 @@ use gpui::{
     App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
     HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
     RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
-    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, img, rems,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, rems, svg,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -1518,14 +1518,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         // runs every frame; by the time it draws, the cache holds at least a
         // pending entry.
         if let InlineKind::Math { source, style } = &marker.kind {
-            let text_color = cx.theme().colors().editor_foreground;
             request_math_render(
                 MathKey {
                     source: source.clone(),
                     style: *style,
-                    color: u32::from(gpui::Rgba::from(text_color)),
                 },
-                text_color,
                 cx,
             );
         }
@@ -1917,14 +1914,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 )
             }
             BlockRenderKind::Math { source } => {
-                let text_color = cx.theme().colors().editor_foreground;
                 request_math_render(
                     MathKey {
                         source: SharedString::from(source.clone()),
                         style: MathStyle::Display,
-                        color: u32::from(gpui::Rgba::from(text_color)),
                     },
-                    text_color,
                     cx,
                 );
                 render_math_block(
@@ -2349,20 +2343,19 @@ fn embed_section(text: &str, section: &str) -> Option<String> {
 struct MathKey {
     source: SharedString,
     style: MathStyle,
-    /// Packed RGBA, since `Hsla` is not hashable and the color is baked into
-    /// the SVG's fill.
-    color: u32,
 }
 
 enum MathEntry {
     /// A background render is in flight; callers show the LaTeX source.
     Pending,
     Ready {
-        image: Arc<gpui::RenderImage>,
-        /// Fraction of the image's height that sits below the text baseline.
+        /// The formula as an SVG document, handed to `svg()` so that gpui
+        /// rasterizes it at the size it is actually drawn.
+        svg: Arc<[u8]>,
+        /// Fraction of the formula's height that sits below the text baseline.
         baseline_fraction: f32,
-        /// Width of the image in ems, used to size the inline element so it
-        /// takes exactly the space the glyphs occupy.
+        /// Width of the formula in ems, used to size the element so it takes
+        /// exactly the space the glyphs occupy.
         width_em: f32,
         height_em: f32,
     },
@@ -2383,10 +2376,13 @@ struct MathCache {
 
 impl gpui::Global for MathCache {}
 
-/// Em size the SVG is rasterized at. Larger than any realistic buffer font so
-/// the outlines stay crisp when the element scales them down to the line's
-/// actual size.
-const MATH_RASTER_EM: f32 = 64.0;
+/// Em size, in SVG user units, the formula's outlines are laid out in.
+///
+/// It sets only the coordinate scale of the vector document — `svg()` hands
+/// the outlines to gpui, which rasterizes them at whatever size the element is
+/// drawn — so any value works. It stays well above 1 so the emitted path
+/// coordinates keep their precision.
+const MATH_LAYOUT_EM: f32 = 64.0;
 
 /// Formulas render at this multiple of the buffer font size. The KaTeX fonts
 /// have a visibly smaller x-height than code fonts, so at 1:1 math looks
@@ -2399,7 +2395,7 @@ const MATH_FONT_SCALE: f32 = 1.21;
 ///
 /// Called from `apply_decorations` rather than from the placeholder closure:
 /// kicking off work during render would spawn a task on every frame.
-fn request_math_render(key: MathKey, text_color: Hsla, cx: &mut App) {
+fn request_math_render(key: MathKey, cx: &mut App) {
     if cx.default_global::<MathCache>().entries.contains_key(&key) {
         return;
     }
@@ -2407,42 +2403,29 @@ fn request_math_render(key: MathKey, text_color: Hsla, cx: &mut App) {
         .entries
         .insert(key.clone(), MathEntry::Pending);
 
-    let svg_renderer = cx.svg_renderer();
+    // `svg()` paints through an alpha mask and takes its color from the
+    // element's style, so the fill baked into the document never shows. That
+    // is why `MathKey` carries no color: one render serves every theme.
     let theme = MathTheme {
-        text_color,
-        font_size: MATH_RASTER_EM,
+        text_color: gpui::black(),
+        font_size: MATH_LAYOUT_EM,
     };
     cx.spawn(async move |cx| {
         let rendered = cx
             .background_spawn({
                 let key = key.clone();
-                async move {
-                    let rendered = math_render::render_to_svg(&key.source, key.style, &theme)?;
-                    let image = svg_renderer
-                        .render_single_frame(rendered.svg.as_bytes(), 1.0)
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    anyhow::Ok((rendered, image))
-                }
+                async move { math_render::render_to_svg(&key.source, key.style, &theme) }
             })
             .await;
 
         cx.update(|cx| {
             let entry = match rendered {
-                Ok((rendered, image)) => {
-                    let total_em = rendered.height_em + rendered.depth_em;
-                    let size = image.size(0);
-                    let width_em = if total_em > 0.0 && size.height.0 > 0 {
-                        size.width.0 as f32 / size.height.0 as f32 * total_em
-                    } else {
-                        0.0
-                    };
-                    MathEntry::Ready {
-                        image,
-                        baseline_fraction: rendered.baseline_fraction(),
-                        width_em,
-                        height_em: total_em,
-                    }
-                }
+                Ok(rendered) => MathEntry::Ready {
+                    baseline_fraction: rendered.baseline_fraction(),
+                    width_em: rendered.width_em,
+                    height_em: rendered.height_em + rendered.depth_em,
+                    svg: Arc::from(rendered.svg.into_bytes()),
+                },
                 Err(_) => MathEntry::Failed,
             };
             cx.global_mut::<MathCache>().entries.insert(key, entry);
@@ -2581,7 +2564,6 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                 let key = MathKey {
                     source: source.clone(),
                     style,
-                    color: u32::from(gpui::Rgba::from(text_color)),
                 };
                 let line_height = font_size * theme_settings.line_height();
                 let text_system = cx.text_system().clone();
@@ -2597,7 +2579,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
 
                 match cx.default_global::<MathCache>().entries.get(&key) {
                     Some(MathEntry::Ready {
-                        image,
+                        svg: document,
                         baseline_fraction,
                         width_em,
                         height_em,
@@ -2626,7 +2608,13 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                             .w(width)
                             .pt(pad_top)
                             .pb(pad_bottom)
-                            .child(img(ImageSource::Render(image.clone())).h(height).w(width))
+                            .child(
+                                svg()
+                                    .data(document)
+                                    .text_color(text_color)
+                                    .h(height)
+                                    .w(width),
+                            )
                             .into_any_element()
                     }
                     // While a render is in flight — and permanently for a
@@ -5761,12 +5749,11 @@ fn render_math_block(
         let key = MathKey {
             source: source.clone(),
             style: MathStyle::Display,
-            color: u32::from(gpui::Rgba::from(text_color)),
         };
 
         let content = match cx.default_global::<MathCache>().entries.get(&key) {
             Some(MathEntry::Ready {
-                image,
+                svg: document,
                 width_em,
                 height_em,
                 ..
@@ -5774,7 +5761,9 @@ fn render_math_block(
                 let math_em = font_size * MATH_FONT_SCALE;
                 let height = math_em * *height_em;
                 let width = math_em * *width_em;
-                img(ImageSource::Render(image.clone()))
+                svg()
+                    .data(document)
+                    .text_color(text_color)
                     .h(height)
                     .w(width)
                     .into_any_element()

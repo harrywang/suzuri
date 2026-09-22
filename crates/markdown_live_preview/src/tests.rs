@@ -4423,7 +4423,7 @@ async fn image_sizes_across_eviction(
     struct ImageProbe(ImageSource);
     impl Render for ImageProbe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            img(self.0.clone())
+            gpui::img(self.0.clone())
         }
     }
 
@@ -5611,4 +5611,45 @@ async fn test_quote_paragraph_spacing_balances_unused_row_space(cx: &mut TestApp
         }
     }
     assert!(balanced_nonzero_space, "exercise visible rounding space");
+}
+
+/// Formulas are painted with `svg()`, which hands the document to gpui and
+/// asks it to rasterize at the element's own device size. Two properties of
+/// that path are load-bearing and neither is visible to a text assertion:
+/// the outlines must still cover pixels once shrunk to a line of prose, and
+/// the coverage must land in the alpha channel, because `paint_svg` throws
+/// the colours away and keeps only the mask.
+#[gpui::test]
+fn test_math_svg_rasterizes_to_a_nonempty_alpha_mask(cx: &mut gpui::TestAppContext) {
+    let rendered = math_render::render_to_svg(
+        r"E(S) = \sum_{i=1}^{c} -p_i \log_2 p_i",
+        math_render::MathStyle::Display,
+        &math_render::MathTheme::default(),
+    )
+    .expect("formula should render");
+
+    // The size a display formula occupies at the default buffer font on a
+    // retina display: 15px * MATH_FONT_SCALE * 2.
+    let drawn_width = gpui::DevicePixels((rendered.width_em * 15.0 * 1.21 * 2.0).round() as i32);
+
+    let image = cx.update(|cx| {
+        cx.svg_renderer()
+            .parse_svg(rendered.svg.as_bytes())
+            .and_then(|svg| {
+                cx.svg_renderer().render_parsed(
+                    &svg,
+                    gpui::SvgSize::Size(gpui::size(drawn_width, drawn_width)),
+                )
+            })
+            .expect("gpui should rasterize the formula")
+    });
+
+    let size = image.size(0);
+    let frame = &image.as_bytes(0).expect("a rasterized frame");
+    let covered = frame.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
+    let total = (size.width.0 * size.height.0) as usize;
+    assert!(
+        covered * 100 / total >= 5,
+        "only {covered}/{total} pixels carry alpha; the formula would paint blank"
+    );
 }
