@@ -23,8 +23,8 @@ use picker::{Picker, PickerDelegate};
 use project::Project;
 use settings::Settings as _;
 use ui::{
-    Color, HighlightedLabel, Icon, IconName, IconSize, Label, LabelSize, ListItem, ListItemSpacing,
-    prelude::*,
+    Chip, Color, HighlightedLabel, Icon, IconName, IconSize, Label, LabelSize, ListItem,
+    ListItemSpacing, prelude::*,
 };
 use util::ResultExt as _;
 use workspace::{ModalView, Workspace, notifications::NotifyTaskExt as _};
@@ -165,8 +165,8 @@ impl CitationPicker {
                     zotero,
                     library_path,
                     format,
-                    vault_entries: Vec::new(),
-                    vault_candidates: Vec::new(),
+                    project_entries: Vec::new(),
+                    project_candidates: Vec::new(),
                     matches: Vec::new(),
                     selected_index: 0,
                     chosen: Vec::new(),
@@ -187,7 +187,7 @@ impl CitationPicker {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        delegate.reload_vault(bibliography.read(cx));
+        delegate.reload_project_library(bibliography.read(cx));
         // Titles are long; give the picker more room than the default modal.
         // The width lives on the picker (not the wrapper) so the rows, search
         // bar and footer fill it edge to edge.
@@ -197,7 +197,9 @@ impl CitationPicker {
         // opened a moment ago may finish loading while the picker is up.
         let reload = cx.observe_in(&bibliography, window, |this, bibliography, window, cx| {
             this.picker.update(cx, |picker, cx| {
-                picker.delegate.reload_vault(bibliography.read(cx));
+                picker
+                    .delegate
+                    .reload_project_library(bibliography.read(cx));
                 picker.refresh(window, cx);
             });
         });
@@ -252,7 +254,7 @@ impl Candidate {
             Self::Vault(entry) => {
                 parts.extend(entry.authors.as_ref().map(|authors| authors.to_string()));
                 parts.extend(entry.year.as_ref().map(|year| year.to_string()));
-                parts.push(format!("in vault as @{}", entry.key));
+                parts.push(format!("@{}", entry.key));
             }
             Self::Zotero(item) => {
                 // A preprint can list eighty authors; the first few identify it.
@@ -264,10 +266,21 @@ impl Candidate {
                     parts.push(authors.join(", "));
                 }
                 parts.extend(item.year());
-                parts.push("Zotero".to_string());
             }
         }
         parts.join(" · ")
+    }
+}
+
+impl Candidate {
+    /// Where the row comes from, as a badge: entries already in the project's
+    /// library read quietly, Zotero hits stand out because picking one writes
+    /// to the library.
+    fn source_badge(&self) -> Chip {
+        match self {
+            Self::Vault(_) => Chip::new("Project").label_color(Color::Muted),
+            Self::Zotero(_) => Chip::new("Zotero").label_color(Color::Accent),
+        }
     }
 }
 
@@ -297,10 +310,10 @@ pub struct CitationPickerDelegate {
     zotero: Arc<ZoteroClient>,
     library_path: PathBuf,
     format: CitationFormat,
-    vault_entries: Vec<BibEntry>,
+    project_entries: Vec<BibEntry>,
     /// One per vault entry, in the same order: title, authors, year and key
     /// joined, so a search by author or year finds the entry too.
-    vault_candidates: Vec<StringMatchCandidate>,
+    project_candidates: Vec<StringMatchCandidate>,
     matches: Vec<Match>,
     selected_index: usize,
     /// The multi-selection, in the order the user picked.
@@ -316,11 +329,11 @@ const ZOTERO_RESULT_LIMIT: usize = 20;
 const VAULT_RESULT_LIMIT: usize = 50;
 
 impl CitationPickerDelegate {
-    fn reload_vault(&mut self, bibliography: &Bibliography) {
+    fn reload_project_library(&mut self, bibliography: &Bibliography) {
         let mut entries = bibliography.entries().cloned().collect::<Vec<_>>();
         entries.sort_by(|a, b| a.key.cmp(&b.key));
         entries.dedup_by(|a, b| a.key == b.key);
-        self.vault_candidates = entries
+        self.project_candidates = entries
             .iter()
             .enumerate()
             .map(|(index, entry)| {
@@ -336,18 +349,18 @@ impl CitationPickerDelegate {
                 StringMatchCandidate::new(index, &text)
             })
             .collect();
-        self.vault_entries = entries;
+        self.project_entries = entries;
     }
 
-    fn duplicates_vault_entry(&self, item: &ZoteroItem) -> bool {
+    fn duplicates_project_entry(&self, item: &ZoteroItem) -> bool {
         let title = normalized(&item.title);
-        self.vault_entries.iter().any(|entry| {
+        self.project_entries.iter().any(|entry| {
             item.citation_key.as_deref() == Some(entry.key.as_ref())
                 || (!title.is_empty()
                     && entry
                         .title
                         .as_ref()
-                        .is_some_and(|vault_title| normalized(vault_title) == title))
+                        .is_some_and(|project_title| normalized(project_title) == title))
         })
     }
 
@@ -381,7 +394,7 @@ impl CitationPickerDelegate {
         let bibliography = self.bibliography.clone();
         let project = self.project.clone();
         let mut taken: HashSet<String> = self
-            .vault_entries
+            .project_entries
             .iter()
             .map(|entry| entry.key.to_string())
             .collect();
@@ -441,7 +454,7 @@ impl CitationPickerDelegate {
 }
 
 impl CitationPickerDelegate {
-    fn vault_match_count(&self) -> usize {
+    fn project_match_count(&self) -> usize {
         self.matches
             .iter()
             .take_while(|found| matches!(found.candidate, Candidate::Vault(_)))
@@ -449,12 +462,12 @@ impl CitationPickerDelegate {
     }
 
     fn footer_text(&self) -> SharedString {
-        let vault = self.vault_match_count();
-        let vault_part = match vault {
-            0 if self.query.is_empty() => "No .bib entries in this vault".to_string(),
-            0 => "No vault matches".to_string(),
-            1 => "1 in the vault".to_string(),
-            n => format!("{n} in the vault"),
+        let project_matches = self.project_match_count();
+        let project_part = match project_matches {
+            0 if self.query.is_empty() => "No .bib entries in this project".to_string(),
+            0 => "No project matches".to_string(),
+            1 => "1 in the project".to_string(),
+            n => format!("{n} in the project"),
         };
         let zotero_part = match &self.zotero_status {
             ZoteroStatus::Idle => "type two or more characters to search Zotero too".to_string(),
@@ -464,7 +477,7 @@ impl CitationPickerDelegate {
             ZoteroStatus::Results(n) => format!("{n} from Zotero"),
             ZoteroStatus::Unavailable(message) => message.to_string(),
         };
-        format!("{vault_part} · {zotero_part}").into()
+        format!("{project_part} · {zotero_part}").into()
     }
 }
 
@@ -484,7 +497,7 @@ impl PickerDelegate for CitationPickerDelegate {
     }
 
     fn placeholder_text(&self, _window: &mut Window, _cx: &mut App) -> Arc<str> {
-        "Search the vault and Zotero by title, author or year…".into()
+        "Search the project and Zotero by title, author or year…".into()
     }
 
     fn match_count(&self) -> usize {
@@ -506,17 +519,17 @@ impl PickerDelegate for CitationPickerDelegate {
 
     fn no_matches_text(&self, _window: &mut Window, _cx: &mut App) -> Option<SharedString> {
         Some(match &self.zotero_status {
-            ZoteroStatus::Idle => "No vault matches; keep typing to search Zotero too".into(),
-            ZoteroStatus::Searching => "No vault matches; searching Zotero…".into(),
-            ZoteroStatus::Results(_) => "No matches in the vault or Zotero".into(),
-            ZoteroStatus::Unavailable(_) => "No vault matches".into(),
+            ZoteroStatus::Idle => "No project matches; keep typing to search Zotero too".into(),
+            ZoteroStatus::Searching => "No project matches; searching Zotero…".into(),
+            ZoteroStatus::Results(_) => "No matches in the project or Zotero".into(),
+            ZoteroStatus::Unavailable(_) => "No project matches".into(),
         })
     }
 
     fn separators_after_indices(&self) -> Vec<usize> {
-        let vault = self.vault_match_count();
-        if vault > 0 && vault < self.matches.len() {
-            vec![vault - 1]
+        let project_matches = self.project_match_count();
+        if project_matches > 0 && project_matches < self.matches.len() {
+            vec![project_matches - 1]
         } else {
             Vec::new()
         }
@@ -536,7 +549,7 @@ impl PickerDelegate for CitationPickerDelegate {
             ZoteroStatus::Searching
         };
         let executor = cx.background_executor().clone();
-        let candidates = self.vault_candidates.clone();
+        let candidates = self.project_candidates.clone();
         let zotero = self.zotero.clone();
         cx.spawn_in(window, async move |this, cx| {
             let vault_matches = if query.is_empty() {
@@ -563,7 +576,7 @@ impl PickerDelegate for CitationPickerDelegate {
                 delegate.matches = vault_matches
                     .into_iter()
                     .filter_map(|(index, positions)| {
-                        let entry = delegate.vault_entries.get(index)?;
+                        let entry = delegate.project_entries.get(index)?;
                         let title_length = entry.title.as_ref().map_or(0, |title| title.len());
                         Some(Match {
                             candidate: Candidate::Vault(entry.clone()),
@@ -590,7 +603,7 @@ impl PickerDelegate for CitationPickerDelegate {
                     Ok(items) => {
                         let mut added = 0;
                         for item in items {
-                            if !delegate.duplicates_vault_entry(&item) {
+                            if !delegate.duplicates_project_entry(&item) {
                                 delegate.matches.push(Match {
                                     candidate: Candidate::Zotero(item),
                                     positions: Vec::new(),
@@ -683,6 +696,7 @@ impl PickerDelegate for CitationPickerDelegate {
             ListItem::new(ix)
                 .spacing(ListItemSpacing::Sparse)
                 .toggle_state(selected)
+                .end_slot(found.candidate.source_badge())
                 .child(
                     v_flex()
                         .w_full()

@@ -36,7 +36,7 @@ impl std::fmt::Display for ZoteroError {
             Self::NotRunning(_) => {
                 write!(
                     formatter,
-                    "Zotero is not running, so only the vault was searched."
+                    "Zotero is not running, so only the project's library was searched."
                 )
             }
             Self::LocalApiDisabled => write!(
