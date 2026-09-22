@@ -1926,6 +1926,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     marker.range.clone(),
                     SharedString::from(source.clone()),
                     below,
+                    marker.indent_columns,
                 )
             }
         };
@@ -5737,10 +5738,32 @@ fn render_math_block(
     range: Range<Anchor>,
     source: SharedString,
     below: bool,
+    indent_columns: u32,
 ) -> RenderBlock {
     Arc::new(move |block_cx| {
         let editor = editor.clone();
         let start = range.start;
+        // The block's origin is the editor's left edge, so centering inside
+        // `max_width` alone would center on the gutter's midpoint rather than
+        // the text's. `max_width` also grows with the horizontal scroll range
+        // a long source line adds, so measure the visible text area instead:
+        // a replace block never extends the editor's scroll range, and a
+        // formula centered past the viewport could not be scrolled to.
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width + gutter_width);
+        let text_width = (visible_width - gutter_width - block_cx.margins.right)
+            .min(block_cx.max_width)
+            .max(block_cx.em_width);
+        let horizontal_padding = block_cx.em_width;
         let cx = &mut *block_cx.app;
         let theme_settings = theme_settings::ThemeSettings::get_global(cx);
         let font_size = theme_settings.buffer_font_size(cx);
@@ -5759,17 +5782,20 @@ fn render_math_block(
                 ..
             }) => {
                 let math_em = font_size * MATH_FONT_SCALE;
-                let height = math_em * *height_em;
-                let width = math_em * *width_em;
+                let size = fit_display_math(
+                    gpui::size(math_em * *width_em, math_em * *height_em),
+                    text_width - horizontal_padding * 2.0,
+                );
                 svg()
                     .data(document)
                     .text_color(text_color)
-                    .h(height)
-                    .w(width)
+                    .h(size.height)
+                    .w(size.width)
                     .into_any_element()
             }
             _ if below => Empty.into_any_element(),
             _ => div()
+                .max_w_full()
                 .font(buffer_font)
                 .text_size(font_size)
                 .text_color(text_color)
@@ -5778,7 +5804,9 @@ fn render_math_block(
         };
 
         div()
-            .w(block_cx.max_width)
+            .w(gutter_width + text_width)
+            .pl(gutter_width + horizontal_padding)
+            .pr(horizontal_padding)
             .py(block_cx.line_height * 0.25)
             .flex()
             .justify_center()
@@ -5792,6 +5820,22 @@ fn render_math_block(
             .child(content)
             .into_any_element()
     })
+}
+
+/// Shrinks a display formula, keeping its aspect ratio, to the width it is
+/// centered in. A formula that is wider than the text area cannot be centered
+/// in it: flex centering overflows both sides equally, so the left half lands
+/// on the gutter and the right half past the viewport, where nothing can
+/// scroll to it. A formula that fits is returned unchanged.
+fn fit_display_math(
+    size: gpui::Size<gpui::Pixels>,
+    available: gpui::Pixels,
+) -> gpui::Size<gpui::Pixels> {
+    if size.width <= available || size.width <= gpui::Pixels::ZERO {
+        return size;
+    }
+    let scale = f32::from(available.max(gpui::Pixels::ZERO)) / f32::from(size.width);
+    gpui::size(size.width * scale, size.height * scale)
 }
 
 /// Parses frontmatter (YAML `---` or TOML `+++`) into Properties-card rows.

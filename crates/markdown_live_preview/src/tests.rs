@@ -5613,6 +5613,27 @@ async fn test_quote_paragraph_spacing_balances_unused_row_space(cx: &mut TestApp
     assert!(balanced_nonzero_space, "exercise visible rounding space");
 }
 
+/// A display formula wider than the text area is scaled down to fit it, on
+/// both axes so the glyphs keep their shape; anything narrower keeps its
+/// natural size. Flex centering would otherwise push the overflow onto the
+/// gutter and past the viewport, where no scroll reaches it.
+#[test]
+fn test_display_math_wider_than_the_text_area_shrinks_to_fit() {
+    use gpui::{px, size};
+
+    let fits = fit_display_math(size(px(300.), px(40.)), px(600.));
+    assert_eq!(fits, size(px(300.), px(40.)));
+
+    let exact = fit_display_math(size(px(600.), px(40.)), px(600.));
+    assert_eq!(exact, size(px(600.), px(40.)));
+
+    let shrunk = fit_display_math(size(px(1200.), px(40.)), px(600.));
+    assert_eq!(shrunk, size(px(600.), px(20.)));
+
+    let no_room = fit_display_math(size(px(1200.), px(40.)), px(-10.));
+    assert_eq!(no_room, size(px(0.), px(0.)));
+}
+
 /// Formulas are painted with `svg()`, which hands the document to gpui and
 /// asks it to rasterize at the element's own device size. Two properties of
 /// that path are load-bearing and neither is visible to a text assertion:
