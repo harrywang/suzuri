@@ -22,3 +22,4 @@ ratex-types.workspace = true
 
 [dev-dependencies]
 usvg.workspace = true
+resvg.workspace = true

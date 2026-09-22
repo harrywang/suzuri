@@ -674,6 +674,23 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
     }
 
+    // Run Test 13: LaTeX math renders at the size it is drawn
+    println!("\n--- Test 13: math_rendering ---");
+    match run_math_rendering_visual_tests(app_state.clone(), &mut cx, update_baseline) {
+        Ok(TestResult::Passed) => {
+            println!("✓ math_rendering: PASSED");
+            passed += 1;
+        }
+        Ok(TestResult::BaselineUpdated(_)) => {
+            println!("✓ math_rendering: Baseline updated");
+            updated += 1;
+        }
+        Err(e) => {
+            eprintln!("✗ math_rendering: FAILED - {}", e);
+            failed += 1;
+        }
+    }
+
     // Clean up the main workspace's worktree to stop background scanning tasks
     // This prevents "root path could not be canonicalized" errors when main() drops temp_dir
     workspace_window
@@ -4096,4 +4113,107 @@ fn run_sidebar_duplicate_project_names_visual_tests(
     } else {
         Ok(TestResult::Passed)
     }
+}
+
+/// Renders a note of LaTeX math in a real window, so the glyph weight and
+/// rasterization size of live preview's formulas can be inspected directly.
+/// Formula rendering is invisible to the crate's text assertions.
+#[cfg(target_os = "macos")]
+fn run_math_rendering_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.keep();
+    let canonical_temp = temp_path.canonicalize()?;
+    let vault_dir = canonical_temp.join("math");
+    std::fs::create_dir_all(&vault_dir)?;
+    std::fs::write(
+        vault_dir.join("Math.md"),
+        "Entropy is the measure of impurity, with $p_i$ the class share:\n\n\
+         $$E(S) = \\sum_{i=1}^{c} -p_i \\log_2 p_i$$\n\n\
+         Information gain is entropy reduction:\n\n\
+         $$Gain(T, X) = E(T) - E(T, X)$$\n\n\
+         For outlook:\n\n\
+         $$Gain(PlayGolf, Outlook) = 0.94 - 0.693 = 0.247$$\n",
+    )?;
+
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(1280.0), px(800.0)),
+    };
+    let workspace_window: WindowHandle<Workspace> = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                cx.new(|cx| Workspace::new(None, project.clone(), app_state.clone(), window, cx))
+            },
+        )
+    })?;
+    cx.run_until_parked();
+
+    let add_worktree_task = workspace_window.update(cx, |workspace, _window, cx| {
+        workspace.project().update(cx, |project, cx| {
+            project.find_or_create_worktree(&vault_dir, true, cx)
+        })
+    })?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree_task)
+        .context("Failed to add math worktree")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let open_task = workspace_window.update(cx, |workspace, window, cx| {
+        let worktree = workspace
+            .project()
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .context("math worktree missing")?;
+        let worktree_id = worktree.read(cx).id();
+        let rel_path: std::sync::Arc<util::rel_path::RelPath> =
+            util::rel_path::rel_path("Math.md").into();
+        let project_path: project::ProjectPath = (worktree_id, rel_path).into();
+        anyhow::Ok(workspace.open_path(project_path, None, true, window, cx))
+    })??;
+    cx.background_executor.allow_parking();
+    let opened = cx.foreground_executor.block_test(open_task);
+    cx.background_executor.forbid_parking();
+    opened.context("Failed to open Math.md")?;
+    cx.run_until_parked();
+
+    // Formulas render on a background task, so the first draw shows their
+    // LaTeX source; settle before capturing.
+    cx.update_window(workspace_window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+
+    run_visual_test(
+        "math_rendering",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )
 }

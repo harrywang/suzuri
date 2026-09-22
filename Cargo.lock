@@ -10994,6 +10994,7 @@ dependencies = [
  "ratex-parser",
  "ratex-svg",
  "ratex-types",
+ "resvg",
  "usvg",
 ]
 
