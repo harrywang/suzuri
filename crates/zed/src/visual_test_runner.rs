@@ -4136,7 +4136,13 @@ fn run_math_rendering_visual_tests(
          Information gain is entropy reduction:\n\n\
          $$Gain(T, X) = E(T) - E(T, X)$$\n\n\
          For outlook:\n\n\
-         $$Gain(PlayGolf, Outlook) = 0.94 - 0.693 = 0.247$$\n",
+         $$Gain(PlayGolf, Outlook) = 0.94 - 0.693 = 0.247$$\n\n\
+         Each branch contributes its own entropy, weighted by how much of the data lands in it:\n\n\
+         $$E(PlayGolf, Outlook) = P(sunny)E(3,2) + P(overcast)E(4,0) + P(rainy)E(2,3)$$\n\n\
+         A formula wider than the text area shrinks to fit it instead of spilling onto the gutter:\n\n\
+         $$E(PlayGolf, Outlook) = P(sunny)E(3,2) + P(overcast)E(4,0) + P(rainy)E(2,3) \
+         = \\frac{5}{14}(0.971) + \\frac{4}{14}(0.0) + \\frac{5}{14}(0.971) = 0.693, \
+         \\quad Gain(PlayGolf, Outlook) = 0.940 - 0.693 = 0.247$$\n",
     )?;
 
     let project = cx.update(|cx| {
