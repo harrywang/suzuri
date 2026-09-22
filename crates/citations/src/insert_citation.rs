@@ -188,7 +188,11 @@ impl CitationPicker {
         cx: &mut Context<Self>,
     ) -> Self {
         delegate.reload_vault(bibliography.read(cx));
-        let picker = cx.new(|cx| Picker::uniform_list(delegate, window, cx));
+        // Titles are long; give the picker more room than the default modal.
+        // The width lives on the picker (not the wrapper) so the rows, search
+        // bar and footer fill it edge to edge.
+        let picker =
+            cx.new(|cx| Picker::uniform_list(delegate, window, cx).initial_width(rems(40.)));
         // The index parses `.bib` files off the main thread, so a vault
         // opened a moment ago may finish loading while the picker is up.
         let reload = cx.observe_in(&bibliography, window, |this, bibliography, window, cx| {
@@ -208,7 +212,6 @@ impl Render for CitationPicker {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
             .key_context("CitationPicker")
-            .w(rems(40.))
             .child(self.picker.clone())
     }
 }
