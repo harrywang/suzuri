@@ -236,7 +236,10 @@ jobs:
       # from a newer libgcc_s their runner image carries; this runner's GCC 11
       # has no such symbol, so the link fails. Appending compiler-rt's
       # builtins archive resolves it statically, adding no runtime dependency
-      # to the tarball. bundle-linux keeps whatever RUSTFLAGS it inherits.
+      # to the tarball. bundle-linux refuses an inherited RUSTFLAGS, because
+      # that would replace the repository's target rustflags (the lld link
+      # arg for aarch64) instead of adding to them, so the flag goes into the
+      # user-level cargo config, which cargo merges with .cargo/config.toml.
       # LLVM 19 specifically: apt.llvm.org's 18 packages for jammy were built
       # without the SME routines, so the nm check below guards the version.
       - name: Provide SME helpers from compiler-rt
@@ -252,7 +255,12 @@ jobs:
             exit 1
           fi
           echo "Linking with ${builtins}"
-          echo "RUSTFLAGS=-C link-arg=${builtins}" >> "$GITHUB_ENV"
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          mkdir -p "${cargo_home}"
+          cat >> "${cargo_home}/config.toml" <<EOF
+          [target.aarch64-unknown-linux-gnu]
+          rustflags = ["-C", "link-arg=${builtins}"]
+          EOF
 
       - uses: Swatinem/rust-cache@v2
         with:
