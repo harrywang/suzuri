@@ -5242,7 +5242,6 @@ fn render_references_block(
             .unwrap_or(block_cx.max_width);
         let text_width = (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
             .max(gpui::px(200.));
-        let hanging_indent = block_cx.em_width * 2.;
         div()
             .pl(gutter_width)
             .w(block_cx.max_width)
@@ -5262,13 +5261,11 @@ fn render_references_block(
                     .pb_2()
                     .child(heading.clone()),
             )
-            .children(items.iter().map(|(_, text)| {
-                div()
-                    .ml(hanging_indent)
-                    .w(text_width - hanging_indent)
-                    .pb_1()
-                    .child(text.clone())
-            }))
+            .children(
+                items
+                    .iter()
+                    .map(|(_, text)| div().w(text_width).pb_1().child(text.clone())),
+            )
             .into_any_element()
     })
 }
