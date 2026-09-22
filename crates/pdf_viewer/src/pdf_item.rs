@@ -72,9 +72,15 @@ impl PdfItem {
     }
 }
 
-pub fn is_pdf_file(path: &ProjectPath) -> bool {
-    path.path
-        .extension()
+/// Whether `path` names a PDF.
+///
+/// Takes the absolute path rather than the `ProjectPath`: a file opened
+/// without a folder gets a worktree of its own whose single entry has an
+/// *empty* relative path, so the extension only exists on the worktree root.
+/// Testing the relative path left such a file to Zed's binary-file fallback
+/// ("Binary files are not supported") instead of this viewer.
+pub fn is_pdf_path(path: &Path) -> bool {
+    path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
 }
 
@@ -248,12 +254,14 @@ impl ProjectItem for PdfItem {
         path: &ProjectPath,
         cx: &mut App,
     ) -> Option<Task<Result<Entity<Self>>>> {
-        if !is_pdf_file(path) {
+        let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
+        // `absolutize` rather than a join: the relative path is empty for a
+        // single-file worktree, and joining it appends a separator, leaving a
+        // path (`/dir/doc.pdf/`) that cannot be read.
+        let abs_path = worktree.read(cx).absolutize(&path.path);
+        if !is_pdf_path(&abs_path) {
             return None;
         }
-
-        let worktree = project.read(cx).worktree_for_id(path.worktree_id, cx)?;
-        let abs_path = worktree.read(cx).abs_path().join(path.path.as_std_path());
         let project_path = path.clone();
         let load = load_pdf(project, &project_path, abs_path.clone(), cx);
         let project = project.clone();
@@ -606,5 +614,87 @@ mod remote_tests {
             "the error should name the file: {error:#}"
         );
         assert!(scratch_copies().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod single_file_worktree_tests {
+    //! Opening a PDF without a folder — `zed paper.pdf`, or Finder's "Open
+    //! With" — gives the file a worktree of its own, and the path relative to
+    //! that worktree is empty. Matching on the relative path therefore missed
+    //! the extension, and the document fell through to Zed's binary-file
+    //! fallback instead of this viewer.
+    use super::*;
+    use fs::FakeFs;
+    use gpui::TestAppContext;
+    use project::Project;
+    use serde_json::json;
+
+    async fn single_file_project(cx: &mut TestAppContext) -> Entity<Project> {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            let client = client::Client::new(
+                Arc::new(clock::FakeSystemClock::new()),
+                http_client::FakeHttpClient::with_404_response(),
+                cx,
+            );
+            Project::init(&client, cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            util::path!("/dir"),
+            json!({ "doc.pdf": "%PDF-1.7\nbody\nstartxref\n1\n%%EOF\n" }),
+        )
+        .await;
+        Project::test(fs, [util::path!("/dir/doc.pdf").as_ref()], cx).await
+    }
+
+    fn only_entry(project: &Entity<Project>, cx: &mut TestAppContext) -> ProjectPath {
+        project.read_with(cx, |project, cx| {
+            let worktree = project.worktrees(cx).next().expect("a worktree");
+            let worktree = worktree.read(cx);
+            let entry = worktree.entries(true, 0).next().expect("an entry");
+            ProjectPath {
+                worktree_id: worktree.id(),
+                path: entry.path.clone(),
+            }
+        })
+    }
+
+    #[gpui::test]
+    async fn a_pdf_opened_without_a_folder_still_opens_in_the_viewer(cx: &mut TestAppContext) {
+        let project = single_file_project(cx).await;
+        let project_path = only_entry(&project, cx);
+        assert_eq!(
+            project_path.path.as_std_path(),
+            std::path::Path::new(""),
+            "a single-file worktree's entry is the worktree root, so its \
+             relative path carries no file name"
+        );
+
+        let absolutized = project.read_with(cx, |project, cx| {
+            project
+                .worktree_for_id(project_path.worktree_id, cx)
+                .expect("the worktree")
+                .read(cx)
+                .absolutize(&project_path.path)
+        });
+        assert_eq!(
+            absolutized,
+            std::path::Path::new(util::path!("/dir/doc.pdf")).to_path_buf(),
+            "joining the empty relative path would leave a trailing separator, \
+             and a path ending in one cannot be read"
+        );
+
+        // Only that the viewer claims the file: the bytes are read straight
+        // from the filesystem rather than through the project's `Fs`, so the
+        // load itself cannot run against `FakeFs`.
+        assert!(
+            cx.update(|cx| PdfItem::try_open(&project, &project_path, cx))
+                .is_some(),
+            "the viewer must claim a PDF that has no folder around it"
+        );
     }
 }

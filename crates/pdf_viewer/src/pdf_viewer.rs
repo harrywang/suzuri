@@ -14,7 +14,7 @@ mod toolbar;
 
 use hayro::vello_cpu::color::palette::css::WHITE;
 
-pub use pdf_item::{PdfItem, is_pdf_file};
+pub use pdf_item::{PdfItem, is_pdf_path};
 pub use toolbar::PdfViewToolbarControls;
 
 use std::collections::{HashMap, HashSet};
