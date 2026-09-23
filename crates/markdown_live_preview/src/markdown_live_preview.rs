@@ -854,6 +854,11 @@ enum InlineKind {
         destination: LinkDestination,
         label: SharedString,
     },
+    /// A citation group (`[@key, p. 3; @other]` or a bare `@key`) rendered as
+    /// the note's CSL style's in-text form, `(Vaswani et al., 2017, p. 3)` or
+    /// `[1]`. The whole group is concealed; touching it hands back the
+    /// source with its key chips.
+    Citation { rendered: SharedString },
     /// A LaTeX formula (`$x$` or `$$x$$`), rendered as a typeset image.
     ///
     /// Rendering is asynchronous, so the placeholder reads whatever the shared
@@ -1175,7 +1180,7 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
 
     let markers = if enabled && !editor.read_only(cx) {
         extract_markers(editor, cx).map(|mut markers| {
-            attach_references_block(&mut markers, editor, cx);
+            attach_citation_rendering(&mut markers, editor, cx);
             Arc::new(markers)
         })
     } else {
@@ -1529,6 +1534,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             | InlineKind::Checkbox { .. }
             | InlineKind::Footnote { .. }
             | InlineKind::Link { .. }
+            | InlineKind::Citation { .. }
             | InlineKind::Math { .. } => &marker.range,
         };
         let span = reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
@@ -2503,6 +2509,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         // The label stands in for the link in the display text, so soft
         // wrapping and the cursor's column math see the width that is drawn.
         InlineKind::Link { label, .. } => Some(placeholder_display_text(label)),
+        InlineKind::Citation { rendered } => Some(placeholder_display_text(rendered)),
         InlineKind::Bullet
         | InlineKind::Checkbox { .. }
         | InlineKind::Footnote { .. }
@@ -2572,6 +2579,23 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                     .on_click(move |_, window, cx| {
                         open_link(&editor, &destination, window, cx);
                     })
+                    .into_any_element()
+            })
+        }
+        InlineKind::Citation { rendered } => {
+            let rendered = rendered.clone();
+            Arc::new(move |_, _, cx: &mut App| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                let colors = cx.theme().colors();
+                // The same chip the key carries in source, so a rendered
+                // citation and a revealed one read as the same object.
+                div()
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(theme_settings.buffer_font_size(cx))
+                    .text_color(colors.text)
+                    .bg(colors.editor_document_highlight_read_background)
+                    .rounded_sm()
+                    .child(rendered.clone())
                     .into_any_element()
             })
         }
@@ -2692,6 +2716,13 @@ fn marker_content_key(kind: &InlineKind) -> u64 {
             let mut hasher = collections::FxHasher::default();
             label.hash(&mut hasher);
             4 + hasher.finish()
+        }
+        // A style change re-renders every group over unchanged ranges.
+        InlineKind::Citation { rendered } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            rendered.hash(&mut hasher);
+            6 + hasher.finish()
         }
         // Both take part: the label is what is drawn, the destination is
         // what a click opens, and either can change over an unchanged range.
@@ -8058,14 +8089,15 @@ fn is_references_heading(title: &str) -> bool {
     )
 }
 
-/// Swaps the reference-list heading for a block that also carries the
-/// rendered entries of every cited work, in the note's CSL style (the
-/// frontmatter `csl:` key, else APA). Nothing changes when the note cites
-/// nothing the library can render.
-fn attach_references_block(markers: &mut MarkerSet, editor: &Editor, cx: &mut App) {
-    let Some(heading) = markers.references_heading.clone() else {
+/// Renders the note's citations in its CSL style (the frontmatter `csl:`
+/// key, else APA): every group whose keys all resolve becomes a concealed
+/// span drawn as the in-text form, and the reference-list heading, when the
+/// note has one, becomes a block that also lists the cited works. One pass
+/// renders both so numbered styles agree between marks and list.
+fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut App) {
+    if markers.citation_groups.is_empty() && markers.bare_citations.is_empty() {
         return;
-    };
+    }
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let head_end = MultiBufferOffset(snapshot.len().0.min(FRONTMATTER_SCAN_BYTES));
     let head: String = snapshot
@@ -8076,33 +8108,90 @@ fn attach_references_block(markers: &mut MarkerSet, editor: &Editor, cx: &mut Ap
     let Some(style) = citations::style_named(&style_name) else {
         return;
     };
-    let mut cited = markers
-        .citations
-        .iter()
-        .chain(&markers.bare_citations)
-        .map(|range| {
-            let text: String = snapshot.text_for_range(range.clone()).collect();
-            let key = text.strip_prefix('@').unwrap_or(&text).to_string();
-            (range.start.to_offset(&snapshot), key)
-        })
-        .collect::<Vec<_>>();
-    cited.sort_by_key(|(offset, _)| *offset);
-    let mut keys: Vec<String> = Vec::new();
-    for (_, key) in cited {
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
     let bibliography = Bibliography::global(cx);
     let bibliography = bibliography.read(cx);
-    let entries = keys
+
+    // Every group in document order, bracketed and bare alike.
+    let mut groups: Vec<(Range<Anchor>, bool)> = markers
+        .citation_groups
         .iter()
-        .filter_map(|key| bibliography.entry_for_rendering(key))
-        .collect::<Vec<_>>();
-    if entries.is_empty() {
+        .map(|range| (range.clone(), true))
+        .chain(
+            markers
+                .bare_citations
+                .iter()
+                .map(|range| (range.clone(), false)),
+        )
+        .collect();
+    groups.sort_by_key(|(range, _)| range.start.to_offset(&snapshot));
+
+    // A group renders when its keys all resolve and its syntax has a slot in
+    // the renderer; otherwise its chips stay as they are.
+    let parsed: Vec<(Range<Anchor>, Option<Vec<citation_group::Item>>)> = groups
+        .into_iter()
+        .map(|(range, bracketed)| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let items = citation_group::parse(&text, bracketed).filter(|items| {
+                items
+                    .iter()
+                    .all(|item| bibliography.entry_for_rendering(&item.key).is_some())
+            });
+            (range, items)
+        })
+        .collect();
+    let cite_groups: Vec<Vec<citations::CiteItem<'_>>> = parsed
+        .iter()
+        .filter_map(|(_, items)| items.as_ref())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(citations::CiteItem {
+                        entry: bibliography.entry_for_rendering(&item.key)?,
+                        locator: item.locator.clone(),
+                        form: item.form,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if cite_groups.is_empty() {
         return;
     }
-    let items = citations::render_bibliography(&entries, &style)
+    let rendered = citations::render_document(&cite_groups, &style);
+
+    let mut rendered_citations = rendered.citations.into_iter();
+    for (range, items) in &parsed {
+        if items.is_none() {
+            continue;
+        }
+        let Some(text) = rendered_citations.next() else {
+            break;
+        };
+        let start = range.start.to_offset(&snapshot);
+        let end = range.end.to_offset(&snapshot);
+        // The group's own bracket concealments would nest inside this one.
+        markers.inline.retain(|marker| {
+            let marker_start = marker.range.start.to_offset(&snapshot);
+            let marker_end = marker.range.end.to_offset(&snapshot);
+            !(start <= marker_start && marker_end <= end)
+        });
+        markers.inline.push(InlineMarker {
+            range: range.clone(),
+            kind: InlineKind::Citation {
+                rendered: SharedString::from(text),
+            },
+        });
+    }
+
+    let Some(heading) = markers.references_heading.clone() else {
+        return;
+    };
+    if rendered.bibliography.is_empty() {
+        return;
+    }
+    let items = rendered
+        .bibliography
         .into_iter()
         .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
         .collect::<Vec<_>>();
@@ -8113,6 +8202,74 @@ fn attach_references_block(markers: &mut MarkerSet, editor: &Editor, cx: &mut Ap
     {
         marker.height_estimate = 2 + items.len() as u32 * 2;
         marker.kind = BlockRenderKind::References { items };
+    }
+}
+
+/// Reading a pandoc citation group into its items.
+mod citation_group {
+    pub struct Item {
+        pub key: String,
+        pub locator: Option<(citations::Locator, String)>,
+        pub form: citations::CiteForm,
+    }
+
+    /// `[@a, p. 3; -@b]` or a bare `@a`. `None` when any part is not
+    /// `[-]@key[, locator]`, e.g. a prefix like `[see @a]`, which the
+    /// renderer has no slot for.
+    pub fn parse(text: &str, bracketed: bool) -> Option<Vec<Item>> {
+        let inner = if bracketed {
+            text.strip_prefix('[')?.strip_suffix(']')?
+        } else {
+            text
+        };
+        let mut items = Vec::new();
+        for part in inner.split(';') {
+            let part = part.trim();
+            let (form, rest) = match part.strip_prefix('-') {
+                Some(rest) => (citations::CiteForm::YearOnly, rest),
+                None if bracketed => (citations::CiteForm::Normal, part),
+                None => (citations::CiteForm::Prose, part),
+            };
+            let rest = rest.strip_prefix('@')?;
+            let key_end = rest
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            '_' | ':'
+                                | '.'
+                                | '#'
+                                | '$'
+                                | '%'
+                                | '&'
+                                | '-'
+                                | '+'
+                                | '?'
+                                | '<'
+                                | '>'
+                                | '~'
+                                | '/'
+                        ))
+                })
+                .unwrap_or(rest.len());
+            let key = rest[..key_end].trim_end_matches([
+                ':', '.', '#', '$', '%', '&', '+', '?', '<', '>', '~', '/', '-',
+            ]);
+            if key.is_empty() {
+                return None;
+            }
+            let locator = match citations::parse_cite_suffix(&rest[key.len()..]) {
+                citations::CiteSuffix::None => None,
+                citations::CiteSuffix::Locator(kind, value) => Some((kind, value)),
+                citations::CiteSuffix::Unsupported => return None,
+            };
+            items.push(Item {
+                key: key.to_string(),
+                locator,
+                form,
+            });
+        }
+        (!items.is_empty()).then_some(items)
     }
 }
 

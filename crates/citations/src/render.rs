@@ -10,10 +10,12 @@ use std::{
 
 use hayagriva::{
     BibliographyDriver, BibliographyRequest, BufWriteFormat, CitationItem, CitationRequest,
-    ElemChildren, Entry,
+    CitePurpose, ElemChildren, Entry, LocatorPayload, SpecificLocator,
     archive::{ArchivedStyle, locales},
     citationberg::{IndependentStyle, Locale, Style},
 };
+
+pub use hayagriva::citationberg::taxonomy::Locator;
 
 /// The style used when a document names none.
 pub const DEFAULT_STYLE: &str = "apa";
@@ -123,6 +125,139 @@ pub fn render_bibliography(entries: &[&Entry], style: &CslStyle) -> Vec<(String,
             (item.key, text)
         })
         .collect()
+}
+
+/// One work inside a citation group, as the note cites it.
+pub struct CiteItem<'a> {
+    pub entry: &'a Entry,
+    /// `[@key, p. 3]` → `(Page, "3")`.
+    pub locator: Option<(Locator, String)>,
+    /// How the item reads: pandoc's `[-@key]` suppresses the author,
+    /// and a bare `@key` in running text names the author in prose.
+    pub form: CiteForm,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CiteForm {
+    Normal,
+    YearOnly,
+    Prose,
+}
+
+/// Everything a note's citations render to, from one pass, so numbered
+/// styles agree between the in-text marks and the reference list.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RenderedDocument {
+    /// One in-text citation per group, in the order given.
+    pub citations: Vec<String>,
+    /// The reference list as `(key, text)`, in the style's order.
+    pub bibliography: Vec<(String, String)>,
+}
+
+/// Renders every citation group of a note and its reference list in one
+/// pass. Groups must come in document order: numbered styles assign
+/// numbers by first citation.
+pub fn render_document(groups: &[Vec<CiteItem<'_>>], style: &CslStyle) -> RenderedDocument {
+    let locales = locale_files();
+    let mut driver = BibliographyDriver::new();
+    for group in groups {
+        let items = group
+            .iter()
+            .map(|item| {
+                let locator = item
+                    .locator
+                    .as_ref()
+                    .map(|(kind, value)| SpecificLocator(*kind, LocatorPayload::Str(value)));
+                let citation = CitationItem::with_locator(item.entry, locator);
+                match item.form {
+                    CiteForm::Normal => citation,
+                    CiteForm::YearOnly => citation.kind(CitePurpose::Year),
+                    CiteForm::Prose => citation.kind(CitePurpose::Prose),
+                }
+            })
+            .collect();
+        driver.citation(CitationRequest::from_items(items, &style.style, locales));
+    }
+    let rendered = driver.finish(BibliographyRequest::new(&style.style, None, locales));
+    let citations = rendered
+        .citations
+        .iter()
+        .zip(groups)
+        .map(|(citation, group)| {
+            let text = plain(&citation.citation);
+            // hayagriva drops the affixes for a year-only cite; pandoc keeps
+            // them, so `Vaswani et al. [-@key]` reads `Vaswani et al. (2017)`.
+            let year_only = group.iter().all(|item| item.form == CiteForm::YearOnly);
+            if year_only && !text.starts_with(['(', '[']) {
+                format!("({text})")
+            } else {
+                text
+            }
+        })
+        .collect();
+    let bibliography = match rendered.bibliography {
+        Some(bibliography) => bibliography
+            .items
+            .into_iter()
+            .map(|item| {
+                let mut text = String::new();
+                if let Some(first) = &item.first_field {
+                    first.write_buf(&mut text, BufWriteFormat::Plain).ok();
+                    text.push(' ');
+                }
+                item.content
+                    .write_buf(&mut text, BufWriteFormat::Plain)
+                    .ok();
+                (item.key, text)
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+    RenderedDocument {
+        citations,
+        bibliography,
+    }
+}
+
+/// What follows a key inside a citation group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CiteSuffix {
+    /// Nothing, or only punctuation and whitespace.
+    None,
+    /// A locator pandoc would recognize: `, p. 3`, `, pp. 3-4`, `, chap. 2`.
+    Locator(Locator, String),
+    /// Free text the renderer cannot place, e.g. `, emphasis added`.
+    Unsupported,
+}
+
+/// Parses the text after a cite key: `, p. 3` → a page locator.
+pub fn parse_cite_suffix(suffix: &str) -> CiteSuffix {
+    let trimmed = suffix.trim().trim_start_matches(',').trim();
+    if trimmed.is_empty() {
+        return CiteSuffix::None;
+    }
+    let (label, value) = match trimmed.split_once(|character: char| character.is_whitespace()) {
+        Some((label, value)) => (label, value.trim()),
+        None => return CiteSuffix::Unsupported,
+    };
+    let kind = match label.trim_end_matches('.').to_ascii_lowercase().as_str() {
+        "p" | "pp" | "page" | "pages" => Locator::Page,
+        "ch" | "chap" | "chapter" | "chapters" => Locator::Chapter,
+        "sec" | "section" | "sections" => Locator::Section,
+        "fig" | "figure" | "figures" => Locator::Figure,
+        "vol" | "volume" | "volumes" => Locator::Volume,
+        "no" | "number" | "issue" => Locator::Issue,
+        "para" | "paragraph" | "paragraphs" => Locator::Paragraph,
+        "n" | "note" | "notes" => Locator::Note,
+        "l" | "line" | "lines" => Locator::Line,
+        "table" => Locator::Table,
+        "pt" | "part" => Locator::Part,
+        _ => return CiteSuffix::Unsupported,
+    };
+    if value.is_empty() {
+        return CiteSuffix::Unsupported;
+    }
+    CiteSuffix::Locator(kind, value.to_string())
 }
 
 /// The style a document asks for in its frontmatter: `csl: ieee`, or
@@ -235,6 +370,83 @@ mod tests {
             "IEEE keeps citation order"
         );
         assert!(ieee_list[0].1.starts_with("[1]"), "{}", ieee_list[0].1);
+    }
+
+    #[test]
+    fn renders_a_document_in_one_pass() {
+        let library = library();
+        let vaswani = library.get("vaswani2017attention").unwrap();
+        let knuth = library.get("knuth1984texbook").unwrap();
+        let groups = vec![
+            vec![CiteItem {
+                entry: knuth,
+                locator: Some((Locator::Page, "12".into())),
+                form: CiteForm::Normal,
+            }],
+            vec![
+                CiteItem {
+                    entry: vaswani,
+                    locator: None,
+                    form: CiteForm::Normal,
+                },
+                CiteItem {
+                    entry: knuth,
+                    locator: None,
+                    form: CiteForm::Normal,
+                },
+            ],
+            vec![CiteItem {
+                entry: vaswani,
+                locator: None,
+                form: CiteForm::YearOnly,
+            }],
+            vec![CiteItem {
+                entry: vaswani,
+                locator: None,
+                form: CiteForm::Prose,
+            }],
+        ];
+        let apa = render_document(&groups, &style_named("apa").unwrap());
+        assert_eq!(
+            apa.citations,
+            [
+                "(Knuth, 1984, p. 12)",
+                "(Knuth, 1984; Vaswani et al., 2017)",
+                "(2017)",
+                "Vaswani et al. (2017)"
+            ]
+        );
+        assert_eq!(apa.bibliography.len(), 2);
+        let ieee = render_document(&groups, &style_named("ieee").unwrap());
+        assert_eq!(ieee.citations[0], "[1, p. 12]");
+        assert_eq!(
+            ieee.citations[1], "[1], [2]",
+            "numbers follow first citation, sorted within a group"
+        );
+        assert_eq!(ieee.bibliography[0].0, "knuth1984texbook");
+    }
+
+    #[test]
+    fn parses_pandoc_locators() {
+        assert_eq!(parse_cite_suffix(""), CiteSuffix::None);
+        assert_eq!(parse_cite_suffix(" , "), CiteSuffix::None);
+        assert_eq!(
+            parse_cite_suffix(", p. 3"),
+            CiteSuffix::Locator(Locator::Page, "3".into())
+        );
+        assert_eq!(
+            parse_cite_suffix(", pp. 3-4"),
+            CiteSuffix::Locator(Locator::Page, "3-4".into())
+        );
+        assert_eq!(
+            parse_cite_suffix(", chap. 2"),
+            CiteSuffix::Locator(Locator::Chapter, "2".into())
+        );
+        assert_eq!(
+            parse_cite_suffix(", emphasis added"),
+            CiteSuffix::Unsupported
+        );
+        assert_eq!(parse_cite_suffix(", p."), CiteSuffix::Unsupported);
     }
 
     #[test]

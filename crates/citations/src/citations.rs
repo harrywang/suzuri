@@ -25,7 +25,8 @@ pub use keys::{disambiguate, is_portable_key, mint_key};
 pub use library::{DEFAULT_LIBRARY_PATH, Merge, append_entry, merge_entry};
 pub use open_source::{OpenSource, source_for_cursor};
 pub use render::{
-    CslStyle, DEFAULT_STYLE, RenderedReference, document_style, render_bibliography,
+    CiteForm, CiteItem, CiteSuffix, CslStyle, DEFAULT_STYLE, Locator, RenderedDocument,
+    RenderedReference, document_style, parse_cite_suffix, render_bibliography, render_document,
     render_reference, style_named,
 };
 pub use zotero::{DEFAULT_BASE_URL, ZoteroClient, ZoteroError, ZoteroItem, ZoteroStatus};

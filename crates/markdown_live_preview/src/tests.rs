@@ -5785,3 +5785,71 @@ async fn test_inline_code_is_styled_like_the_preview(cx: &mut TestAppContext) {
     styled.sort();
     assert_eq!(styled, vec!["a `nested` one", "refs/refs.bib"]);
 }
+
+/// Citation groups whose keys resolve render as the note's style's in-text
+/// form; a group the renderer has no slot for (a prefix) or one with an
+/// unresolved key keeps its chips.
+#[gpui::test]
+async fn test_citations_render_in_the_document_style(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                concat!(
+                    "---\ncsl: apa\n---\n\n",
+                    "As shown in [@smith2020, p. 3] and again [-@smith2020]. ",
+                    "Bare @smith2020 agrees. ",
+                    "Prefixed [see @smith2020] and unknown [@nope2020] stay.\n",
+                ),
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let display = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor.display_text(cx).replace('\u{200b}', "")
+        })
+    };
+    let text = display(cx);
+    assert!(
+        text.contains(
+            "As shown in (Smith, 2020, p. 3) and again (2020). Bare Smith (2020) agrees."
+        ),
+        "rendered in APA: {text:?}"
+    );
+    assert!(
+        text.contains("Prefixed see @smith2020 and unknown @nope2020 stay."),
+        "unsupported and unresolved groups keep their chips: {text}"
+    );
+
+    // Switching the style in the frontmatter re-renders every group.
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &concat!(
+            "---\ncsl: ieee\n---\n\n",
+            "As shown in [@smith2020, p. 3] and again [-@smith2020]. ",
+            "Bare @smith2020 agrees. ",
+            "Prefixed [see @smith2020] and unknown [@nope2020] stay.\n",
+        )
+        .into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in [1, p. 3]"),
+        "rendered in IEEE after the style change: {text}"
+    );
+}
