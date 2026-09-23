@@ -3577,7 +3577,7 @@ async fn test_references_heading_lists_the_cited_works(cx: &mut TestAppContext) 
                 .expect("live preview addon");
             let markers = addon.markers.clone().expect("markers are extracted");
             markers.blocks.iter().find_map(|block| match &block.kind {
-                BlockRenderKind::References { items } => Some(items.clone()),
+                BlockRenderKind::References { items, .. } => Some(items.clone()),
                 _ => None,
             })
         })
@@ -5852,4 +5852,48 @@ async fn test_citations_render_in_the_document_style(cx: &mut TestAppContext) {
         text.contains("As shown in [1, p. 3]"),
         "rendered in IEEE after the style change: {text}"
     );
+}
+
+/// A `csl:` name that is not bundled must not take the rendering down with
+/// it: APA stands in, and the References block says which name failed.
+#[gpui::test]
+async fn test_an_unknown_style_falls_back_to_apa_and_says_so(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: apaa\n---\n\nAs shown in [@smith2020].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let text = editor.update(cx, |editor, cx| {
+        editor.display_text(cx).replace('\u{200b}', "")
+    });
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in for the unknown style: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .expect("the References heading becomes a references block");
+    let note = note.expect("the block carries a note about the unknown style");
+    assert!(note.contains("\"apaa\"") && note.contains("APA"), "{note}");
 }

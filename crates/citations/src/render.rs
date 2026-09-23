@@ -58,6 +58,29 @@ pub fn style_named(name: &str) -> Option<Arc<CslStyle>> {
     Some(style)
 }
 
+/// The style a note asked for, or APA when the name is not bundled, in
+/// which case the unknown name comes back too so the UI can say so instead
+/// of silently dropping every rendering.
+pub fn style_or_default(name: &str) -> Option<(Arc<CslStyle>, Option<String>)> {
+    if let Some(style) = style_named(name) {
+        return Some((style, None));
+    }
+    style_named(DEFAULT_STYLE).map(|style| (style, Some(name.trim().to_string())))
+}
+
+/// Every name a bundled style answers to (`apa` as well as
+/// `american-psychological-association`), sorted, for messages that suggest
+/// what to type.
+pub fn style_names() -> Vec<&'static str> {
+    let mut names = ArchivedStyle::all()
+        .iter()
+        .flat_map(|style| style.names().iter().copied())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedReference {
     /// The in-text form, e.g. `(Vaswani et al., 2017)`.
@@ -447,6 +470,22 @@ mod tests {
             CiteSuffix::Unsupported
         );
         assert_eq!(parse_cite_suffix(", p."), CiteSuffix::Unsupported);
+    }
+
+    #[test]
+    fn unknown_styles_fall_back_to_apa_and_say_so() {
+        let (style, unknown) = style_or_default("apaa").unwrap();
+        assert_eq!(style.name, "apa");
+        assert_eq!(unknown.as_deref(), Some("apaa"));
+        let (style, unknown) = style_or_default("ieee").unwrap();
+        assert_eq!(style.name, "ieee");
+        assert_eq!(unknown, None);
+        let names = style_names();
+        assert!(
+            names.contains(&"apa") && names.contains(&"ieee"),
+            "{names:?}"
+        );
+        assert!(names.len() > 50);
     }
 
     #[test]

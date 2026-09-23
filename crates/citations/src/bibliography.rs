@@ -595,11 +595,15 @@ impl CitationSemanticsProvider {
                 .collect();
             let style_name =
                 crate::document_style(&head).unwrap_or_else(|| crate::DEFAULT_STYLE.to_string());
-            let style = crate::style_named(&style_name)?;
+            let (style, unknown) = crate::style_or_default(&style_name)?;
             let rendered = crate::render_reference(entry, &style)?;
+            let style_note = match unknown {
+                Some(name) => format!("{} (csl: \"{name}\" is not a bundled style)", style.name),
+                None => style.name.clone(),
+            };
             Some(format!(
                 "{}\n\n**In text:** {}\n\n*{}*",
-                rendered.reference, rendered.citation, style.name
+                rendered.reference, rendered.citation, style_note
             ))
         });
         rendered.or_else(|| bibliography.resolve(key)?.reference_markdown())

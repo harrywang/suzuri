@@ -27,7 +27,7 @@ pub use open_source::{OpenSource, source_for_cursor};
 pub use render::{
     CiteForm, CiteItem, CiteSuffix, CslStyle, DEFAULT_STYLE, Locator, RenderedDocument,
     RenderedReference, document_style, parse_cite_suffix, render_bibliography, render_document,
-    render_reference, style_named,
+    render_reference, style_named, style_names, style_or_default,
 };
 pub use zotero::{DEFAULT_BASE_URL, ZoteroClient, ZoteroError, ZoteroItem, ZoteroStatus};
 

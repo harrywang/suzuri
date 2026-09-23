@@ -936,6 +936,9 @@ enum BlockRenderKind {
     /// the note's CSL style. Each item is `(key, rendered text)`.
     References {
         items: Vec<(SharedString, SharedString)>,
+        /// A line under the list, e.g. that the frontmatter names a style
+        /// that is not bundled and APA is showing instead.
+        note: Option<SharedString>,
     },
     /// Display math (`$$...$$` alone on its lines), rendered as a centered
     /// typeset formula. Unlike other blocks, revealing its source does not
@@ -1653,10 +1656,14 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         }
         // The reuse check below compares sources, so the rendered entries
         // ride along: a newly cited work or a style change re-renders.
-        if let BlockRenderKind::References { items } = &marker.kind {
+        if let BlockRenderKind::References { items, note } = &marker.kind {
             for (_, text) in items {
                 source.push('\n');
                 source.push_str(text);
+            }
+            if let Some(note) = note {
+                source.push('\n');
+                source.push_str(note);
             }
         }
         let embed = match &marker.kind {
@@ -1877,11 +1884,12 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 marker.range.clone(),
                 marker.indent_columns,
             ),
-            BlockRenderKind::References { items } => render_references_block(
+            BlockRenderKind::References { items, note } => render_references_block(
                 weak_editor.clone(),
                 marker.range.clone(),
                 plain_heading_text(source.lines().next().unwrap_or_default()),
                 items.clone(),
+                note.clone(),
                 marker.indent_columns,
             ),
             BlockRenderKind::Frontmatter => {
@@ -5250,13 +5258,16 @@ fn render_references_block(
     range: Range<Anchor>,
     heading: String,
     items: Vec<(SharedString, SharedString)>,
+    note: Option<SharedString>,
     indent_columns: u32,
 ) -> RenderBlock {
     let heading = SharedString::from(heading);
     Arc::new(move |block_cx| {
         let editor = editor.clone();
         let start = range.start;
+        let note = note.clone();
         let text_color = block_cx.app.theme().colors().text;
+        let warning_color = block_cx.app.theme().status().warning;
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
         // `max_width` includes the editor's horizontal scroll range (see the
@@ -5297,6 +5308,15 @@ fn render_references_block(
                     .iter()
                     .map(|(_, text)| div().w(text_width).pb_1().child(text.clone())),
             )
+            .when_some(note, |this, note| {
+                this.child(
+                    div()
+                        .w(text_width)
+                        .pt_1()
+                        .text_color(warning_color)
+                        .child(note),
+                )
+            })
             .into_any_element()
     })
 }
@@ -8105,7 +8125,7 @@ fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut 
         .collect();
     let style_name =
         citations::document_style(&head).unwrap_or_else(|| citations::DEFAULT_STYLE.to_string());
-    let Some(style) = citations::style_named(&style_name) else {
+    let Some((style, unknown_style)) = citations::style_or_default(&style_name) else {
         return;
     };
     let bibliography = Bibliography::global(cx);
@@ -8195,13 +8215,29 @@ fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut 
         .into_iter()
         .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
         .collect::<Vec<_>>();
+    let note = unknown_style.map(|name| {
+        let suggestions = [
+            "apa",
+            "ieee",
+            "chicago-author-date",
+            "mla",
+            "harvard-cite-them-right",
+        ]
+        .into_iter()
+        .filter(|known| citations::style_named(known).is_some())
+        .collect::<Vec<_>>()
+        .join(", ");
+        SharedString::from(format!(
+            "csl: \"{name}\" is not a bundled style, so this is APA. Try {suggestions}, …"
+        ))
+    });
     if let Some(marker) = markers
         .blocks
         .iter_mut()
         .find(|block| block.range == heading)
     {
-        marker.height_estimate = 2 + items.len() as u32 * 2;
-        marker.kind = BlockRenderKind::References { items };
+        marker.height_estimate = 2 + items.len() as u32 * 2 + u32::from(note.is_some());
+        marker.kind = BlockRenderKind::References { items, note };
     }
 }
 
