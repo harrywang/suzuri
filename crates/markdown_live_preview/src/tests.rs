@@ -5986,4 +5986,34 @@ async fn test_a_csl_file_in_the_project_drives_rendering(cx: &mut TestAppContext
         note.contains("nowhere.csl") && note.contains("not found"),
         "{note}"
     );
+
+    // A dependent style, the common shape of a journal's file, renders with
+    // the parent it points at when that file sits beside it.
+    fs.insert_file(
+        "/vault/journal.csl",
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<style xmlns=\"http://purl.org/net/xbiblio/csl\" version=\"1.0\" default-locale=\"en-US\">\n",
+            "  <info><title>Journal</title><id>http://example.com/styles/journal</id>\n",
+            "    <link href=\"http://example.com/styles/test-numeric\" rel=\"independent-parent\"/>\n",
+            "    <updated>2024-01-01T00:00:00+00:00</updated></info>\n",
+            "</style>\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: journal.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in ⟨1⟩."),
+        "the dependent style renders through its parent file: {text:?}"
+    );
 }

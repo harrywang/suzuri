@@ -343,17 +343,46 @@ pub fn document_style(text: &str) -> Option<String> {
     }
 }
 
-/// Parses a CSL file's XML into a style ready to render with.
-pub fn style_from_xml(name: impl Into<String>, xml: &str) -> Result<Arc<CslStyle>, String> {
+/// What a CSL file turned out to hold.
+#[derive(Debug, Clone)]
+pub enum ParsedStyle {
+    Independent(Arc<CslStyle>),
+    /// A journal style that only points at a parent, by the parent's name
+    /// (`american-marketing-association`); most styles in the repository
+    /// are this kind.
+    Dependent {
+        parent: String,
+    },
+}
+
+/// Parses a CSL file's XML.
+pub fn parse_style_xml(name: impl Into<String>, xml: &str) -> Result<ParsedStyle, String> {
     match Style::from_xml(xml) {
-        Ok(Style::Independent(style)) => Ok(Arc::new(CslStyle {
+        Ok(Style::Independent(style)) => Ok(ParsedStyle::Independent(Arc::new(CslStyle {
             name: name.into(),
             style,
-        })),
-        Ok(Style::Dependent(_)) => {
-            Err("is a dependent style, one that only points at a parent style".to_string())
+        }))),
+        Ok(Style::Dependent(style)) => {
+            let href = style.parent_link.href.trim_end_matches('/');
+            let parent = href.rsplit('/').next().unwrap_or(href).to_string();
+            if parent.is_empty() {
+                return Err("is a dependent style with no parent link".to_string());
+            }
+            Ok(ParsedStyle::Dependent { parent })
         }
         Err(error) => Err(format!("could not be parsed: {error}")),
+    }
+}
+
+/// Parses a CSL file's XML into a style ready to render with; a dependent
+/// style is an error here, callers that can follow the parent use
+/// [`parse_style_xml`].
+pub fn style_from_xml(name: impl Into<String>, xml: &str) -> Result<Arc<CslStyle>, String> {
+    match parse_style_xml(name, xml)? {
+        ParsedStyle::Independent(style) => Ok(style),
+        ParsedStyle::Dependent { parent } => {
+            Err(format!("is a dependent style that points at \"{parent}\""))
+        }
     }
 }
 
@@ -362,6 +391,8 @@ pub fn style_from_xml(name: impl Into<String>, xml: &str) -> Result<Arc<CslStyle
 pub enum StyleFileState {
     Loading,
     Ready(Arc<CslStyle>),
+    /// The file points at a parent style by name; resolve that next.
+    Dependent(String),
     Missing,
     Failed(String),
 }
@@ -430,8 +461,11 @@ impl StyleFiles {
             let state = match fs.load(&path).await {
                 Ok(xml) => {
                     cx.background_spawn(async move {
-                        match style_from_xml(name, &xml) {
-                            Ok(style) => StyleFileState::Ready(style),
+                        match parse_style_xml(name, &xml) {
+                            Ok(ParsedStyle::Independent(style)) => StyleFileState::Ready(style),
+                            Ok(ParsedStyle::Dependent { parent }) => {
+                                StyleFileState::Dependent(parent)
+                            }
                             Err(problem) => StyleFileState::Failed(problem),
                         }
                     })
@@ -512,6 +546,12 @@ fn fallback_for_file(relative: &str, reason: &str) -> Option<ResolvedStyle> {
     })
 }
 
+fn missing_parent(parent: &str) -> String {
+    format!(
+        "depends on the \"{parent}\" style; download https://www.zotero.org/styles/{parent} as {parent}.csl beside it"
+    )
+}
+
 /// The absolute paths a `csl:` file value may mean, in the order to try:
 /// as written when absolute, else under each of `search_dirs` (the note's
 /// folder first, then the project root).
@@ -550,12 +590,43 @@ pub fn resolve_style(
             let mut failure: Option<String> = None;
             let mut loading = false;
             for candidate in style_file_candidates(relative, search_dirs) {
-                match StyleFiles::lookup(&files, candidate, fs.clone(), cx) {
+                match StyleFiles::lookup(&files, candidate.clone(), fs.clone(), cx) {
                     StyleFileState::Ready(style) => {
                         return Some(ResolvedStyle {
                             style,
                             problem: None,
                         });
+                    }
+                    StyleFileState::Dependent(parent) => {
+                        // The parent is a bundled style, or a file beside
+                        // the dependent one.
+                        if let Some(style) = style_named(&parent) {
+                            return Some(ResolvedStyle {
+                                style,
+                                problem: None,
+                            });
+                        }
+                        let beside = candidate
+                            .parent()
+                            .unwrap_or(Path::new(""))
+                            .join(format!("{parent}.csl"));
+                        match StyleFiles::lookup(&files, beside, fs.clone(), cx) {
+                            StyleFileState::Ready(style) => {
+                                return Some(ResolvedStyle {
+                                    style,
+                                    problem: None,
+                                });
+                            }
+                            StyleFileState::Loading => loading = true,
+                            StyleFileState::Failed(problem) => {
+                                failure.get_or_insert(format!(
+                                    "depends on \"{parent}\", whose file {problem}"
+                                ));
+                            }
+                            StyleFileState::Dependent(_) | StyleFileState::Missing => {
+                                failure.get_or_insert(missing_parent(&parent));
+                            }
+                        }
                     }
                     StyleFileState::Loading => loading = true,
                     StyleFileState::Failed(problem) => {
@@ -597,16 +668,47 @@ pub fn resolve_style_readonly(
             let mut failure: Option<String> = None;
             let mut missing = 0;
             let candidates = style_file_candidates(relative, search_dirs);
-            for candidate in &candidates {
-                let state = files
+            let state_of = |path: &Path| {
+                files
                     .as_ref()
-                    .and_then(|files| files.read(cx).state(candidate).cloned());
-                match state {
+                    .and_then(|files| files.read(cx).state(path).cloned())
+            };
+            for candidate in &candidates {
+                match state_of(candidate) {
                     Some(StyleFileState::Ready(style)) => {
                         return Some(ResolvedStyle {
                             style,
                             problem: None,
                         });
+                    }
+                    Some(StyleFileState::Dependent(parent)) => {
+                        if let Some(style) = style_named(&parent) {
+                            return Some(ResolvedStyle {
+                                style,
+                                problem: None,
+                            });
+                        }
+                        let beside = candidate
+                            .parent()
+                            .unwrap_or(Path::new(""))
+                            .join(format!("{parent}.csl"));
+                        match state_of(&beside) {
+                            Some(StyleFileState::Ready(style)) => {
+                                return Some(ResolvedStyle {
+                                    style,
+                                    problem: None,
+                                });
+                            }
+                            Some(StyleFileState::Missing) | Some(StyleFileState::Dependent(_)) => {
+                                failure.get_or_insert(missing_parent(&parent));
+                            }
+                            Some(StyleFileState::Failed(problem)) => {
+                                failure.get_or_insert(format!(
+                                    "depends on \"{parent}\", whose file {problem}"
+                                ));
+                            }
+                            Some(StyleFileState::Loading) | None => {}
+                        }
                     }
                     Some(StyleFileState::Failed(problem)) => {
                         failure.get_or_insert(problem);
@@ -840,6 +942,28 @@ mod tests {
             rendered.reference
         );
         assert!(style_from_xml("x", "<style>").is_err());
+    }
+
+    #[test]
+    fn reads_a_dependent_style_as_its_parent() {
+        let dependent = r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" version="1.0" default-locale="en-US">
+  <info>
+    <title>Journal of Marketing</title>
+    <id>http://www.zotero.org/styles/journal-of-marketing</id>
+    <link href="http://www.zotero.org/styles/journal-of-marketing" rel="self"/>
+    <link href="http://www.zotero.org/styles/american-marketing-association" rel="independent-parent"/>
+    <updated>2014-05-20T02:44:14+00:00</updated>
+  </info>
+</style>"#;
+        match parse_style_xml("journal-of-marketing", dependent) {
+            Ok(ParsedStyle::Dependent { parent }) => {
+                assert_eq!(parent, "american-marketing-association")
+            }
+            other => panic!("expected a dependent style, got {other:?}"),
+        }
+        let error = style_from_xml("journal-of-marketing", dependent).unwrap_err();
+        assert!(error.contains("american-marketing-association"), "{error}");
     }
 
     #[test]
