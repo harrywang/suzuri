@@ -2,6 +2,7 @@ use anyhow::{Context as _, Result};
 use futures::{
     AsyncBufReadExt as _, StreamExt as _,
     channel::mpsc::{self},
+    future::Either,
     io::BufReader,
 };
 use gpui::{App, Entity, EntityId, Task, Window};
@@ -13,11 +14,14 @@ use project::Fs;
 use runtimelib::dirs;
 use smol::net::TcpListener;
 use std::{
+    collections::VecDeque,
     env,
     fmt::Debug,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::PathBuf,
+    pin::pin,
     sync::Arc,
+    time::Duration,
 };
 
 use uuid::Uuid;
@@ -155,42 +159,13 @@ impl NativeRunningKernel {
                 std::process::Stdio::piped(),
             )?;
 
-            let session_id = Uuid::new_v4().to_string();
-
-            let iopub_socket =
-                runtimelib::create_client_iopub_connection(&connection_info, "", &session_id)
-                    .await?;
-            let control_socket =
-                runtimelib::create_client_control_connection(&connection_info, &session_id).await?;
-
-            let peer_identity = runtimelib::peer_identity_for_session(&session_id)?;
-            let shell_socket = runtimelib::create_client_shell_connection_with_identity(
-                &connection_info,
-                &session_id,
-                peer_identity.clone(),
-            )
-            .await?;
-            let stdin_socket = runtimelib::create_client_stdin_connection_with_identity(
-                &connection_info,
-                &session_id,
-                peer_identity,
-            )
-            .await?;
-
-            let (request_tx, stdin_tx) = start_kernel_tasks(
-                session.clone(),
-                iopub_socket,
-                shell_socket,
-                control_socket,
-                stdin_socket,
-                cx,
-            );
-
             let stderr = process.stderr.take();
             let stdout = process.stdout.take();
 
-            cx.spawn(async move |_cx| {
-                use futures::future::Either;
+            // Returns the last lines of stderr once the kernel's output closes, so
+            // a kernel that dies during startup can say why.
+            let output_task = cx.spawn(async move |_cx| {
+                const RECENT_STDERR_LINES: usize = 20;
 
                 let stderr_lines = match stderr {
                     Some(s) => Either::Left(
@@ -209,11 +184,77 @@ impl NativeRunningKernel {
                     None => Either::Right(futures::stream::empty()),
                 };
                 let mut lines = futures::stream::select(stderr_lines, stdout_lines);
+                let mut recent_stderr = VecDeque::new();
                 while let Some((level, Ok(line))) = lines.next().await {
                     log::log!(level, "kernel: {}", line);
+                    if level == log::Level::Error {
+                        if recent_stderr.len() == RECENT_STDERR_LINES {
+                            recent_stderr.pop_front();
+                        }
+                        recent_stderr.push_back(line);
+                    }
                 }
-            })
-            .detach();
+                recent_stderr
+            });
+
+            let session_id = Uuid::new_v4().to_string();
+
+            let connect = async {
+                let iopub_socket =
+                    runtimelib::create_client_iopub_connection(&connection_info, "", &session_id)
+                        .await?;
+                let control_socket =
+                    runtimelib::create_client_control_connection(&connection_info, &session_id)
+                        .await?;
+
+                let peer_identity = runtimelib::peer_identity_for_session(&session_id)?;
+                let shell_socket = runtimelib::create_client_shell_connection_with_identity(
+                    &connection_info,
+                    &session_id,
+                    peer_identity.clone(),
+                )
+                .await?;
+                let stdin_socket = runtimelib::create_client_stdin_connection_with_identity(
+                    &connection_info,
+                    &session_id,
+                    peer_identity,
+                )
+                .await?;
+                anyhow::Ok((iopub_socket, control_socket, shell_socket, stdin_socket))
+            };
+
+            // Connecting retries until the kernel listens, so a kernel that exits
+            // during startup (say, an interpreter without ipykernel) would leave
+            // the launch pending forever.
+            let exited = process.status();
+            let (iopub_socket, control_socket, shell_socket, stdin_socket) =
+                match futures::future::select(pin!(connect), pin!(exited)).await {
+                    Either::Left((sockets, _)) => sockets?,
+                    Either::Right((status, _)) => {
+                        let status = match status {
+                            Ok(status) => status.to_string(),
+                            Err(err) => err.to_string(),
+                        };
+                        // Output closes once the process is gone; the timer covers a
+                        // child process that inherited the pipe and keeps it open.
+                        let timeout = cx.background_executor().timer(Duration::from_secs(1));
+                        let stderr = match futures::future::select(output_task, timeout).await {
+                            Either::Left((recent_stderr, _)) => Vec::from(recent_stderr).join("\n"),
+                            Either::Right(_) => String::new(),
+                        };
+                        anyhow::bail!("the kernel exited during startup ({status})\n{stderr}");
+                    }
+                };
+            output_task.detach();
+
+            let (request_tx, stdin_tx) = start_kernel_tasks(
+                session.clone(),
+                iopub_socket,
+                shell_socket,
+                control_socket,
+                stdin_socket,
+                cx,
+            );
 
             let status = process.status();
 
