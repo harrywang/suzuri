@@ -13,6 +13,7 @@ path = "src/markdown_live_preview.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono.workspace = true
 citations.workspace = true
 clock.workspace = true
 collections.workspace = true
