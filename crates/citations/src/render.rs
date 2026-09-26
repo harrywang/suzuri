@@ -543,7 +543,7 @@ pub fn resolve_bundled(name: &str) -> Option<ResolvedStyle> {
     let (style, unknown) = style_or_default(name)?;
     let problem = unknown.map(|name| {
         StyleProblem::with_style_list(format!(
-            "csl: \"{name}\" is not a bundled style, so this is APA. Try {}, …",
+            "csl: \"{name}\" is not a bundled style. APA is used instead; try {}, …",
             bundled_suggestions()
         ))
     });
@@ -573,7 +573,9 @@ fn fallback_for_file(relative: &str, problem: StyleProblem) -> Option<ResolvedSt
 /// The file `relative` cannot be used because it `reason`s, e.g. "was not
 /// found" or "could not be parsed: …".
 fn file_problem(relative: &str, reason: &str) -> StyleProblem {
-    StyleProblem::with_style_list(format!("csl: \"{relative}\" {reason}, so this is APA."))
+    StyleProblem::with_style_list(format!(
+        "csl: \"{relative}\" {reason}. APA is used instead."
+    ))
 }
 
 /// The file `relative` is a dependent style whose parent is neither bundled
@@ -582,7 +584,7 @@ fn file_problem(relative: &str, reason: &str) -> StyleProblem {
 fn missing_parent(relative: &str, parent: &str) -> StyleProblem {
     StyleProblem {
         message: format!(
-            "csl: \"{relative}\" depends on the \"{parent}\" style, which is neither bundled nor beside it, so this is APA. Save the download as {parent}.csl next to it."
+            "csl: \"{relative}\" depends on the \"{parent}\" style, which is neither bundled nor beside it. APA is used instead; save the download as {parent}.csl next to it."
         ),
         link_label: format!("Download {parent}.csl"),
         url: format!("https://www.zotero.org/styles/{parent}"),
