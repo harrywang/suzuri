@@ -1159,9 +1159,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Execute all cells", &RunAll, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(RunAll), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.run_cells(window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 Self::render_notebook_control(
@@ -1174,9 +1176,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Clear all outputs", &ClearOutputs, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ClearOutputs), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.clear_outputs(window, cx);
+                                    },
+                                )),
                             ),
                     )
                     .child(
@@ -1191,9 +1195,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Move cell up", &MoveCellUp, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(MoveCellUp), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.move_cell_up(window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 Self::render_notebook_control(
@@ -1205,9 +1211,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Move cell down", &MoveCellDown, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(MoveCellDown), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.move_cell_down(window, cx);
+                                    },
+                                )),
                             ),
                     )
                     .child(
@@ -1222,9 +1230,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Add markdown block", &AddMarkdownBlock, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(AddMarkdownBlock), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.add_markdown_block(window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 Self::render_notebook_control(
@@ -1236,9 +1246,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Add code block", &AddCodeBlock, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(AddCodeBlock), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.add_code_block(window, cx);
+                                    },
+                                )),
                             ),
                     )
                     .child(
@@ -1253,9 +1265,11 @@ impl NotebookEditor {
                             .tooltip(move |window, cx| {
                                 Tooltip::for_action("Delete cell", &DeleteCell, cx)
                             })
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DeleteCell), cx);
-                            }),
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.delete_cell(window, cx);
+                                },
+                            )),
                         ),
                     ),
             )
