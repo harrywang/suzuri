@@ -5342,11 +5342,18 @@ fn render_references_block(
                     .pb_2()
                     .child(heading.clone()),
             )
-            .children(
-                items
-                    .iter()
-                    .map(|(_, text)| div().w(text_width).pb_1().child(text.clone())),
-            )
+            // Entries wrap at the body's line height and sit one body line
+            // apart, like paragraphs, so a long author list still reads as
+            // one work and the next entry starts visibly.
+            .children(items.iter().enumerate().map(|(index, (_, text))| {
+                div()
+                    .w(text_width)
+                    .line_height(block_cx.line_height)
+                    .when(index + 1 < items.len(), |this| {
+                        this.pb(block_cx.line_height)
+                    })
+                    .child(text.clone())
+            }))
             .when_some(note, |this, note| {
                 let url = note.url.clone();
                 this.child(
@@ -8293,7 +8300,7 @@ fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut 
         .iter_mut()
         .find(|block| block.range == heading)
     {
-        marker.height_estimate = 2 + items.len() as u32 * 2 + u32::from(note.is_some());
+        marker.height_estimate = 2 + items.len() as u32 * 3 + u32::from(note.is_some());
         marker.kind = BlockRenderKind::References { items, note };
     }
 }
