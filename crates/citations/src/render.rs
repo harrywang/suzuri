@@ -512,7 +512,7 @@ pub struct StyleProblem {
 
 /// The documentation page listing the bundled style names and where to
 /// find `.csl` files for the rest.
-pub const STYLE_LIST_URL: &str = "https://docs.suzuri.ai/docs/writing/citations#choosing-a-style";
+pub const STYLE_LIST_URL: &str = "https://docs.suzuri.ai/writing/citations#choosing-a-style";
 
 impl StyleProblem {
     fn with_style_list(message: String) -> Self {
