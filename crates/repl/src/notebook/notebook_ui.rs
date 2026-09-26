@@ -1,6 +1,10 @@
 #![allow(unused, dead_code)]
 use std::future::Future;
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use client::proto::ViewId;
@@ -468,6 +472,32 @@ impl NotebookEditor {
         cx.notify();
     }
 
+    // SUZURI: the notebook's directory. `absolutize` joins with the worktree's own path style,
+    // so the result is also valid on the remote side for SSH and WSL kernels. A notebook opened
+    // on its own is a single-file worktree whose root is the notebook itself.
+    fn kernel_working_directory(&self, cx: &App) -> PathBuf {
+        let project_path = &self.notebook_item.read(cx).project_path;
+        let Some(worktree) = self
+            .project
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)
+        else {
+            return std::env::temp_dir();
+        };
+        let worktree = worktree.read(cx);
+        if worktree.is_single_file() {
+            return worktree
+                .abs_path()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+        }
+        match project_path.path.parent() {
+            Some(notebook_directory) => worktree.absolutize(notebook_directory),
+            None => worktree.abs_path().to_path_buf(),
+        }
+    }
+
     fn launch_kernel_with_spec(
         &mut self,
         spec: KernelSpecification,
@@ -475,12 +505,10 @@ impl NotebookEditor {
         cx: &mut Context<Self>,
     ) {
         let entity_id = cx.entity_id();
-        let working_directory = self
-            .project
-            .read(cx)
-            .worktree_for_id(self.worktree_id, cx)
-            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-            .unwrap_or_else(std::env::temp_dir);
+        // SUZURI: start the kernel in the notebook's own directory, as Jupyter and VS Code
+        // do, so relative paths like `pd.read_csv("train.csv")` resolve next to the notebook
+        // rather than at the worktree root.
+        let working_directory = self.kernel_working_directory(cx);
         let fs = self.project.read(cx).fs().clone();
         let view = cx.entity();
 
@@ -2811,6 +2839,106 @@ mod tests {
         notebook_item.read_with(cx, |item, _| {
             assert_eq!(item.notebook.cells.len(), 1);
         });
+    }
+
+    /// Relative paths in a cell, like `pd.read_csv("train.csv")`, must resolve
+    /// next to the notebook, as they do in Jupyter and VS Code, not at the
+    /// worktree root.
+    #[gpui::test]
+    async fn suzuri_kernel_starts_in_the_notebook_directory(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/course"),
+            json!({
+                "lectures": {
+                    "09-decision-tree": {
+                        "basics.ipynb": NOTEBOOK_WITH_ONE_CODE_CELL,
+                        "train.csv": "",
+                    },
+                },
+                "top.ipynb": NOTEBOOK_WITH_ONE_CODE_CELL,
+            }),
+        )
+        .await;
+        cx.update(|cx| ReplStore::init(fs.clone(), cx));
+
+        let cases = [
+            (
+                path!("/course"),
+                "lectures/09-decision-tree/basics.ipynb",
+                path!("/course/lectures/09-decision-tree"),
+            ),
+            (path!("/course"), "top.ipynb", path!("/course")),
+            (
+                path!("/course/lectures/09-decision-tree/basics.ipynb"),
+                "",
+                path!("/course/lectures/09-decision-tree"),
+            ),
+        ];
+
+        for (project_root, notebook_path, expected_directory) in cases {
+            let project = Project::test(fs.clone(), [project_root.as_ref()], cx).await;
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project.worktrees(cx).next().unwrap().read(cx).id()
+            });
+
+            // Launching the kernel must fail harmlessly instead of spawning a real
+            // interpreter.
+            let missing_interpreter = path!("/nonexistent/python3");
+            let broken_spec = KernelSpecification::Jupyter(LocalKernelSpecification {
+                name: "python3".to_string(),
+                path: PathBuf::from(missing_interpreter),
+                kernelspec: JupyterKernelspec {
+                    argv: vec![missing_interpreter.to_string()],
+                    display_name: "Python 3".to_string(),
+                    language: "python".to_string(),
+                    interrupt_mode: None,
+                    metadata: None,
+                    env: None,
+                },
+            });
+            cx.update(|cx| {
+                ReplStore::global(cx).update(cx, |store, cx| {
+                    store.set_active_kernelspec(worktree_id, broken_spec, cx);
+                })
+            });
+
+            let notebook_item = cx
+                .update(|cx| {
+                    NotebookItem::try_open(
+                        &project,
+                        &ProjectPath {
+                            worktree_id,
+                            path: rel_path(notebook_path).into(),
+                        },
+                        cx,
+                    )
+                    .expect("ipynb files should be openable as notebooks")
+                })
+                .await
+                .expect("notebook should parse");
+
+            let window_cx = cx.add_empty_window();
+            window_cx.executor().allow_parking();
+            let editor = window_cx.update(|window, cx| {
+                cx.new(|cx| NotebookEditor::new(project.clone(), notebook_item, window, cx))
+            });
+
+            let working_directory =
+                window_cx.update(|_, cx| editor.read(cx).kernel_working_directory(cx));
+            assert_eq!(
+                working_directory,
+                PathBuf::from(expected_directory),
+                "kernel directory for {notebook_path:?} in {project_root:?}"
+            );
+        }
     }
 
     /// Notebooks must be saved through the project rather than through the
