@@ -5895,7 +5895,12 @@ async fn test_an_unknown_style_falls_back_to_apa_and_says_so(cx: &mut TestAppCon
         })
         .expect("the References heading becomes a references block");
     let note = note.expect("the block carries a note about the unknown style");
-    assert!(note.contains("\"apaa\"") && note.contains("APA"), "{note}");
+    assert!(
+        note.text.contains("\"apaa\"") && note.text.contains("APA"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.url.as_ref(), citations::STYLE_LIST_URL);
 }
 
 /// `csl:` may point at a `.csl` file in the project; it loads through the
@@ -5983,9 +5988,11 @@ async fn test_a_csl_file_in_the_project_drives_rendering(cx: &mut TestAppContext
         .flatten()
         .expect("the References block notes the missing file");
     assert!(
-        note.contains("nowhere.csl") && note.contains("not found"),
-        "{note}"
+        note.text.contains("nowhere.csl") && note.text.contains("not found"),
+        "{}",
+        note.text
     );
+    assert_eq!(note.url.as_ref(), citations::STYLE_LIST_URL);
 
     // A dependent style, the common shape of a journal's file, renders with
     // the parent it points at when that file sits beside it.
@@ -6015,5 +6022,58 @@ async fn test_a_csl_file_in_the_project_drives_rendering(cx: &mut TestAppContext
     assert!(
         text.contains("As shown in ⟨1⟩."),
         "the dependent style renders through its parent file: {text:?}"
+    );
+
+    // A dependent style whose parent is neither bundled nor beside it falls
+    // back to APA, and the note links to the parent's download.
+    fs.insert_file(
+        "/vault/orphan.csl",
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<style xmlns=\"http://purl.org/net/xbiblio/csl\" version=\"1.0\" default-locale=\"en-US\">\n",
+            "  <info><title>Orphan</title><id>http://example.com/styles/orphan</id>\n",
+            "    <link href=\"http://www.zotero.org/styles/some-society\" rel=\"independent-parent\"/>\n",
+            "    <updated>2024-01-01T00:00:00+00:00</updated></info>\n",
+            "</style>\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: orphan.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in for the orphaned dependent style: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .flatten()
+        .expect("the References block notes the missing parent");
+    assert!(
+        note.text.contains("\"some-society\"") && note.text.contains("some-society.csl"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.link_label.as_ref(), "Download some-society.csl");
+    assert_eq!(
+        note.url.as_ref(),
+        "https://www.zotero.org/styles/some-society"
     );
 }

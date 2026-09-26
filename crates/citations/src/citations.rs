@@ -26,10 +26,11 @@ pub use library::{DEFAULT_LIBRARY_PATH, Merge, append_entry, merge_entry};
 pub use open_source::{OpenSource, source_for_cursor};
 pub use render::{
     CiteForm, CiteItem, CiteSuffix, CslStyle, DEFAULT_STYLE, Locator, ParsedStyle,
-    RenderedDocument, RenderedReference, ResolvedStyle, StyleFileState, StyleFiles, StyleSource,
-    document_style, document_style_source, parse_cite_suffix, render_bibliography, render_document,
-    render_reference, resolve_bundled, resolve_style, resolve_style_readonly,
-    style_file_candidates, style_from_xml, style_named, style_names, style_or_default,
+    RenderedDocument, RenderedReference, ResolvedStyle, STYLE_LIST_URL, StyleFileState, StyleFiles,
+    StyleProblem, StyleSource, document_style, document_style_source, parse_cite_suffix,
+    render_bibliography, render_document, render_reference, resolve_bundled, resolve_style,
+    resolve_style_readonly, style_file_candidates, style_from_xml, style_named, style_names,
+    style_or_default,
 };
 
 /// The folders a note's relative paths (a `csl:` file) resolve against: the

@@ -497,7 +497,31 @@ impl StyleFiles {
 #[derive(Debug, Clone)]
 pub struct ResolvedStyle {
     pub style: Arc<CslStyle>,
-    pub problem: Option<String>,
+    pub problem: Option<StyleProblem>,
+}
+
+/// Why a note is not rendering in the style its frontmatter names, with
+/// somewhere to go to fix it: the documented style list, or the download
+/// for a dependent style's missing parent.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StyleProblem {
+    pub message: String,
+    pub link_label: String,
+    pub url: String,
+}
+
+/// The documentation page listing the bundled style names and where to
+/// find `.csl` files for the rest.
+pub const STYLE_LIST_URL: &str = "https://docs.suzuri.ai/docs/writing/citations#choosing-a-style";
+
+impl StyleProblem {
+    fn with_style_list(message: String) -> Self {
+        StyleProblem {
+            message,
+            link_label: "See the style list".to_string(),
+            url: STYLE_LIST_URL.to_string(),
+        }
+    }
 }
 
 fn bundled_suggestions() -> String {
@@ -518,18 +542,18 @@ fn bundled_suggestions() -> String {
 pub fn resolve_bundled(name: &str) -> Option<ResolvedStyle> {
     let (style, unknown) = style_or_default(name)?;
     let problem = unknown.map(|name| {
-        format!(
+        StyleProblem::with_style_list(format!(
             "csl: \"{name}\" is not a bundled style, so this is APA. Try {}, …",
             bundled_suggestions()
-        )
+        ))
     });
     Some(ResolvedStyle { style, problem })
 }
 
 /// What to render with when a `.csl` file cannot be used: the bundled style
 /// of the same name when there is one (`styles/ieee.csl` → `ieee`), else APA
-/// with a note saying why.
-fn fallback_for_file(relative: &str, reason: &str) -> Option<ResolvedStyle> {
+/// with `problem` explaining why.
+fn fallback_for_file(relative: &str, problem: StyleProblem) -> Option<ResolvedStyle> {
     let stem = Path::new(relative)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
@@ -542,14 +566,27 @@ fn fallback_for_file(relative: &str, reason: &str) -> Option<ResolvedStyle> {
     }
     style_named(DEFAULT_STYLE).map(|style| ResolvedStyle {
         style,
-        problem: Some(format!("csl: \"{relative}\" {reason}, so this is APA.")),
+        problem: Some(problem),
     })
 }
 
-fn missing_parent(parent: &str) -> String {
-    format!(
-        "depends on the \"{parent}\" style; download https://www.zotero.org/styles/{parent} as {parent}.csl beside it"
-    )
+/// The file `relative` cannot be used because it `reason`s, e.g. "was not
+/// found" or "could not be parsed: …".
+fn file_problem(relative: &str, reason: &str) -> StyleProblem {
+    StyleProblem::with_style_list(format!("csl: \"{relative}\" {reason}, so this is APA."))
+}
+
+/// The file `relative` is a dependent style whose parent is neither bundled
+/// nor beside it. The link fetches the parent from the Zotero Style
+/// Repository, which serves the `.csl` file itself.
+fn missing_parent(relative: &str, parent: &str) -> StyleProblem {
+    StyleProblem {
+        message: format!(
+            "csl: \"{relative}\" depends on the \"{parent}\" style, which is neither bundled nor beside it, so this is APA. Save the download as {parent}.csl next to it."
+        ),
+        link_label: format!("Download {parent}.csl"),
+        url: format!("https://www.zotero.org/styles/{parent}"),
+    }
 }
 
 /// The absolute paths a `csl:` file value may mean, in the order to try:
@@ -587,7 +624,7 @@ pub fn resolve_style(
         Some(StyleSource::Bundled(name)) => resolve_bundled(name),
         Some(StyleSource::File(relative)) => {
             let files = StyleFiles::global(cx);
-            let mut failure: Option<String> = None;
+            let mut failure: Option<StyleProblem> = None;
             let mut loading = false;
             for candidate in style_file_candidates(relative, search_dirs) {
                 match StyleFiles::lookup(&files, candidate.clone(), fs.clone(), cx) {
@@ -619,18 +656,19 @@ pub fn resolve_style(
                             }
                             StyleFileState::Loading => loading = true,
                             StyleFileState::Failed(problem) => {
-                                failure.get_or_insert(format!(
-                                    "depends on \"{parent}\", whose file {problem}"
+                                failure.get_or_insert(file_problem(
+                                    relative,
+                                    &format!("depends on \"{parent}\", whose file {problem}"),
                                 ));
                             }
                             StyleFileState::Dependent(_) | StyleFileState::Missing => {
-                                failure.get_or_insert(missing_parent(&parent));
+                                failure.get_or_insert(missing_parent(relative, &parent));
                             }
                         }
                     }
                     StyleFileState::Loading => loading = true,
                     StyleFileState::Failed(problem) => {
-                        failure.get_or_insert(problem);
+                        failure.get_or_insert(file_problem(relative, &problem));
                     }
                     StyleFileState::Missing => {}
                 }
@@ -641,10 +679,10 @@ pub fn resolve_style(
                     problem: None,
                 });
             }
-            match failure {
-                Some(problem) => fallback_for_file(relative, &problem),
-                None => fallback_for_file(relative, "was not found"),
-            }
+            fallback_for_file(
+                relative,
+                failure.unwrap_or_else(|| file_problem(relative, "was not found")),
+            )
         }
     }
 }
@@ -665,7 +703,7 @@ pub fn resolve_style_readonly(
         Some(StyleSource::Bundled(name)) => resolve_bundled(name),
         Some(StyleSource::File(relative)) => {
             let files = StyleFiles::try_global(cx);
-            let mut failure: Option<String> = None;
+            let mut failure: Option<StyleProblem> = None;
             let mut missing = 0;
             let candidates = style_file_candidates(relative, search_dirs);
             let state_of = |path: &Path| {
@@ -700,28 +738,29 @@ pub fn resolve_style_readonly(
                                 });
                             }
                             Some(StyleFileState::Missing) | Some(StyleFileState::Dependent(_)) => {
-                                failure.get_or_insert(missing_parent(&parent));
+                                failure.get_or_insert(missing_parent(relative, &parent));
                             }
                             Some(StyleFileState::Failed(problem)) => {
-                                failure.get_or_insert(format!(
-                                    "depends on \"{parent}\", whose file {problem}"
+                                failure.get_or_insert(file_problem(
+                                    relative,
+                                    &format!("depends on \"{parent}\", whose file {problem}"),
                                 ));
                             }
                             Some(StyleFileState::Loading) | None => {}
                         }
                     }
                     Some(StyleFileState::Failed(problem)) => {
-                        failure.get_or_insert(problem);
+                        failure.get_or_insert(file_problem(relative, &problem));
                     }
                     Some(StyleFileState::Missing) => missing += 1,
                     Some(StyleFileState::Loading) | None => {}
                 }
             }
             if let Some(problem) = failure {
-                return fallback_for_file(relative, &problem);
+                return fallback_for_file(relative, problem);
             }
             if missing == candidates.len() && !candidates.is_empty() {
-                return fallback_for_file(relative, "was not found");
+                return fallback_for_file(relative, file_problem(relative, "was not found"));
             }
             style_named(DEFAULT_STYLE).map(|style| ResolvedStyle {
                 style,

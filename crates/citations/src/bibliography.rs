@@ -599,7 +599,10 @@ impl CitationSemanticsProvider {
             let style = resolved.style;
             let rendered = crate::render_reference(entry, &style)?;
             let style_note = match resolved.problem {
-                Some(problem) => format!("{} ({problem})", style.name),
+                Some(problem) => format!(
+                    "{} ({} [{}]({}))",
+                    style.name, problem.message, problem.link_label, problem.url
+                ),
                 None => style.name.clone(),
             };
             Some(format!(

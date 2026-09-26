@@ -918,6 +918,14 @@ struct BlockMarker {
     indent_columns: u32,
 }
 
+/// The warning under a References list, with a link to what fixes it.
+#[derive(Clone, PartialEq)]
+struct ReferencesNote {
+    text: SharedString,
+    link_label: SharedString,
+    url: SharedString,
+}
+
 #[derive(Clone, PartialEq)]
 enum BlockRenderKind {
     /// Rendered through `MarkdownElement`.
@@ -966,7 +974,7 @@ enum BlockRenderKind {
         items: Vec<(SharedString, SharedString)>,
         /// A line under the list, e.g. that the frontmatter names a style
         /// that is not bundled and APA is showing instead.
-        note: Option<SharedString>,
+        note: Option<ReferencesNote>,
     },
     /// Display math (`$$...$$` alone on its lines), rendered as a centered
     /// typeset formula. Unlike other blocks, revealing its source does not
@@ -1691,7 +1699,9 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             }
             if let Some(note) = note {
                 source.push('\n');
-                source.push_str(note);
+                source.push_str(&note.text);
+                source.push('\n');
+                source.push_str(&note.url);
             }
         }
         let embed = match &marker.kind {
@@ -5286,7 +5296,7 @@ fn render_references_block(
     range: Range<Anchor>,
     heading: String,
     items: Vec<(SharedString, SharedString)>,
-    note: Option<SharedString>,
+    note: Option<ReferencesNote>,
     indent_columns: u32,
 ) -> RenderBlock {
     let heading = SharedString::from(heading);
@@ -5295,6 +5305,7 @@ fn render_references_block(
         let start = range.start;
         let note = note.clone();
         let text_color = block_cx.app.theme().colors().text;
+        let link_color = block_cx.app.theme().colors().text_accent;
         let warning_color = block_cx.app.theme().status().warning;
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
@@ -5337,12 +5348,28 @@ fn render_references_block(
                     .map(|(_, text)| div().w(text_width).pb_1().child(text.clone())),
             )
             .when_some(note, |this, note| {
+                let url = note.url.clone();
                 this.child(
                     div()
                         .w(text_width)
                         .pt_1()
+                        .flex()
+                        .flex_col()
+                        .items_start()
                         .text_color(warning_color)
-                        .child(note),
+                        .child(note.text)
+                        .child(
+                            div()
+                                .id("mdlp-references-note-link")
+                                .cursor_pointer()
+                                .text_color(link_color)
+                                .underline()
+                                .child(note.link_label)
+                                // The block above reveals the heading's source
+                                // on mouse down; the link must not.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        ),
                 )
             })
             .into_any_element()
@@ -8256,7 +8283,11 @@ fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut 
         .into_iter()
         .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
         .collect::<Vec<_>>();
-    let note = style_problem.map(SharedString::from);
+    let note = style_problem.map(|problem| ReferencesNote {
+        text: SharedString::from(problem.message),
+        link_label: SharedString::from(problem.link_label),
+        url: SharedString::from(problem.url),
+    });
     if let Some(marker) = markers
         .blocks
         .iter_mut()
