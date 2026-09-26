@@ -25,6 +25,7 @@ use project::{
     Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource, Project,
     lsp_store::CompletionDocumentation,
 };
+use settings::Settings as _;
 use util::ResultExt as _;
 
 /// One entry parsed out of a `.bib` file, reduced to the fields the citation
@@ -81,6 +82,11 @@ pub struct Bibliography {
     /// Parsed entries per absolute `.bib` path. A file that fails to parse
     /// holds an empty list, which also serves as its tombstone on deletion.
     files: HashMap<PathBuf, Vec<BibEntry>>,
+    /// The same files parsed by hayagriva, for rendering formatted
+    /// citations. Kept apart from `files` because hayagriva's parser is the
+    /// stricter of the two: an entry it rejects still resolves and completes,
+    /// it just falls back to the plain card.
+    libraries: HashMap<PathBuf, hayagriva::Library>,
     /// Every key across `files`. The highlight pass resolves each citation
     /// in a note on every keystroke, so membership has to be O(1) rather
     /// than a scan over what may be a Zotero-sized library.
@@ -101,6 +107,7 @@ impl Bibliography {
         }
         let bibliography = cx.new(|_| Bibliography {
             files: HashMap::default(),
+            libraries: HashMap::default(),
             keys: HashSet::default(),
             scanned_projects: HashSet::default(),
         });
@@ -118,6 +125,11 @@ impl Bibliography {
 
     pub fn resolve(&self, key: &str) -> Option<&BibEntry> {
         self.entries().find(|entry| entry.key.as_ref() == key)
+    }
+
+    /// The full entry, for rendering in a CSL style.
+    pub fn entry_for_rendering(&self, key: &str) -> Option<&hayagriva::Entry> {
+        self.libraries.values().find_map(|library| library.get(key))
     }
 
     fn rebuild_keys(&mut self) {
@@ -146,6 +158,7 @@ impl Bibliography {
         if !newly_seen {
             return;
         }
+        let library = crate::CitationsSettings::get_global(cx).library.clone();
         let mut paths = Vec::new();
         for worktree in project.read(cx).worktrees(cx) {
             let worktree = worktree.read(cx);
@@ -157,6 +170,13 @@ impl Bibliography {
                 {
                     paths.push(worktree.absolutize(&entry.path));
                 }
+            }
+            // The walk above skips gitignored entries, and a vault that
+            // ignores `refs/` for its PDFs would lose its library with them.
+            // The configured library is loaded by path regardless.
+            let configured = worktree.abs_path().join(&library);
+            if !paths.contains(&configured) {
+                paths.push(configured);
             }
         }
         Self::reload_paths(bibliography, project, paths, cx);
@@ -179,15 +199,21 @@ impl Bibliography {
         cx.spawn(async move |cx| {
             let mut results = Vec::with_capacity(paths.len());
             for path in paths {
-                let entries = match fs.load(&path).await {
-                    Ok(source) => cx.background_spawn(async move { parse_bib(&source) }).await,
-                    Err(_) => Vec::new(),
+                let (entries, library) = match fs.load(&path).await {
+                    Ok(source) => {
+                        cx.background_spawn(
+                            async move { (parse_bib(&source), parse_library(&source)) },
+                        )
+                        .await
+                    }
+                    Err(_) => (Vec::new(), hayagriva::Library::new()),
                 };
-                results.push((path, entries));
+                results.push((path, entries, library));
             }
             bibliography.update(cx, |bibliography, cx| {
-                for (path, entries) in results {
-                    bibliography.files.insert(path, entries);
+                for (path, entries, library) in results {
+                    bibliography.files.insert(path.clone(), entries);
+                    bibliography.libraries.insert(path, library);
                 }
                 bibliography.rebuild_keys();
                 cx.notify();
@@ -198,6 +224,7 @@ impl Bibliography {
 
     pub fn remove_path(bibliography: &Entity<Bibliography>, path: &Path, cx: &mut App) {
         bibliography.update(cx, |bibliography, cx| {
+            bibliography.libraries.remove(path);
             if bibliography.files.remove(path).is_some() {
                 bibliography.rebuild_keys();
                 cx.notify();
@@ -258,6 +285,19 @@ fn parse_bib(source: &str) -> Vec<BibEntry> {
         .collect()
 }
 
+/// The same source through hayagriva, for CSL rendering. Its parser rejects
+/// a few things `biblatex` tolerates, in which case the file simply has no
+/// rendered form and hover falls back to the plain card.
+fn parse_library(source: &str) -> hayagriva::Library {
+    match hayagriva::io::from_biblatex_str(source) {
+        Ok(library) => library,
+        Err(errors) => {
+            log::warn!("citations: hayagriva could not read the library: {errors:?}");
+            hayagriva::Library::new()
+        }
+    }
+}
+
 /// `.bib` titles often carry the file's own line wrapping; a completion
 /// menu wants them on one line.
 fn collapse_whitespace(text: &str) -> String {
@@ -266,7 +306,7 @@ fn collapse_whitespace(text: &str) -> String {
 
 /// First run of four consecutive digits, so both `2024` and `2024-03-01`
 /// (BibLaTeX `date`) yield a year.
-fn first_year(value: &str) -> Option<String> {
+pub(crate) fn first_year(value: &str) -> Option<String> {
     let bytes = value.as_bytes();
     let mut run_start = None;
     for (index, byte) in bytes.iter().enumerate() {
@@ -322,7 +362,7 @@ fn citation_boundary(before_at: Option<char>) -> bool {
     }
 }
 
-pub(crate) fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize> {
+pub fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize> {
     let mut walked = 0;
     let mut characters = buffer.reversed_chars_at(offset);
     loop {
@@ -341,7 +381,7 @@ pub(crate) fn citation_key_start(buffer: &Buffer, offset: usize) -> Option<usize
 /// The citation key containing `offset`, if any: its full range including
 /// the `@`, plus the key text without it. Bracketed and bare citations look
 /// identical from here — an `@` after a boundary followed by key characters.
-pub(crate) fn citation_key_at(
+pub fn citation_key_at(
     buffer: &Buffer,
     offset: usize,
 ) -> Option<(std::ops::Range<usize>, SharedString)> {
@@ -543,6 +583,40 @@ impl CitationSemanticsProvider {
     }
 }
 
+impl CitationSemanticsProvider {
+    /// The reference rendered in the document's CSL style, with its in-text
+    /// form; the plain title/author/year card when the entry cannot be
+    /// rendered.
+    fn hover_markdown(&self, buffer: &Buffer, key: &str, cx: &App) -> Option<String> {
+        let bibliography = self.bibliography.read(cx);
+        let rendered = bibliography.entry_for_rendering(key).and_then(|entry| {
+            let head: String = buffer
+                .text_for_range(0..buffer.len().min(FRONTMATTER_SCAN_BYTES))
+                .collect();
+            let source = crate::document_style_source(&head);
+            let search_dirs = crate::style_search_dirs(buffer, cx);
+            let resolved = crate::resolve_style_readonly(source.as_ref(), &search_dirs, cx)?;
+            let style = resolved.style;
+            let rendered = crate::render_reference(entry, &style)?;
+            let style_note = match resolved.problem {
+                Some(problem) => format!(
+                    "{} ({} [{}]({}))",
+                    style.name, problem.message, problem.link_label, problem.url
+                ),
+                None => style.name.clone(),
+            };
+            Some(format!(
+                "{}\n\n**In text:** {}\n\n*{}*",
+                rendered.reference, rendered.citation, style_note
+            ))
+        });
+        rendered.or_else(|| bibliography.resolve(key)?.reference_markdown())
+    }
+}
+
+/// How much of a buffer's head is scanned for a frontmatter `csl:` key.
+const FRONTMATTER_SCAN_BYTES: usize = 4096;
+
 impl SemanticsProvider for CitationSemanticsProvider {
     fn hover(
         &self,
@@ -555,8 +629,7 @@ impl SemanticsProvider for CitationSemanticsProvider {
             if buffer_is_markdown(buffer_ref) {
                 let offset = position.to_offset(buffer_ref);
                 if let Some((range, key)) = citation_key_at(buffer_ref, offset)
-                    && let Some(entry) = self.bibliography.read(cx).resolve(&key)
-                    && let Some(markdown) = entry.reference_markdown()
+                    && let Some(markdown) = self.hover_markdown(buffer_ref, &key, cx)
                 {
                     let range =
                         buffer_ref.anchor_before(range.start)..buffer_ref.anchor_after(range.end);
@@ -739,5 +812,44 @@ mod bibliography_tests {
         assert_eq!(first_year("about 1984, maybe"), Some("1984".to_string()));
         assert_eq!(first_year("no digits"), None);
         assert_eq!(first_year("123"), None);
+    }
+}
+
+#[cfg(test)]
+mod ignored_library_tests {
+    use super::*;
+    use gpui::TestAppContext;
+    use project::{FakeFs, Project};
+    use serde_json::json;
+    use settings::SettingsStore;
+
+    #[gpui::test]
+    async fn a_gitignored_library_is_still_indexed(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            "/vault",
+            json!({
+                ".gitignore": "refs/\n",
+                "Note.md": "[@hidden2020]",
+                "refs": {
+                    "refs.bib": "@article{hidden2020,\n  title = {Hidden},\n  date = {2020},\n}\n"
+                }
+            }),
+        )
+        .await;
+        let project = Project::test(fs.clone(), ["/vault".as_ref()], cx).await;
+        cx.run_until_parked();
+        let bibliography = cx.update(Bibliography::global);
+        cx.update(|cx| Bibliography::ensure_project(&bibliography, &project, cx));
+        cx.run_until_parked();
+        assert!(
+            bibliography.read_with(cx, |bibliography, _| bibliography
+                .contains_key("hidden2020")),
+            "the configured library resolves even when git ignores its folder"
+        );
     }
 }

@@ -59,8 +59,7 @@ struct LivePreviewFoldTag;
 const MARKDOWN: &str = "Markdown";
 const MARKDOWN_INLINE: &str = "Markdown-Inline";
 
-mod bibliography;
-pub use bibliography::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
+pub use citations::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MarkdownHeadingStyle {
@@ -422,13 +421,17 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     if let Some(project) = editor.project().cloned() {
         let bibliography = Bibliography::global(cx);
         Bibliography::ensure_project(&bibliography, &project, cx);
-        // Restyle citations when a `.bib` finishes parsing, so keys resolve
-        // (or stop resolving) without waiting for the next edit.
+        // Recompute when a `.bib` finishes parsing, so keys resolve (or stop
+        // resolving) and the reference list re-renders without waiting for
+        // the next edit.
         subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
-            let markers = editor
-                .addon::<LivePreviewAddon>()
-                .and_then(|addon| addon.markers.clone());
-            apply_emphasis_highlights(editor, markers.as_deref(), cx);
+            recompute(editor, cx);
+        }));
+        // A `.csl` file a note points at loads asynchronously; rendering
+        // switches from APA to it the moment it arrives.
+        let style_files = citations::StyleFiles::global(cx);
+        subscriptions.push(cx.observe(&style_files, |editor, _, cx| {
+            recompute(editor, cx);
         }));
         editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
             project.clone(),
@@ -452,14 +455,30 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                 let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
                     return;
                 };
-                let (changed_images, changed_notes, note_created, changed_bibs, removed_bibs) = {
+                let (
+                    changed_images,
+                    changed_notes,
+                    note_created,
+                    changed_bibs,
+                    removed_bibs,
+                    changed_styles,
+                ) = {
                     let worktree = worktree.read(cx);
                     let mut images = Vec::new();
                     let mut notes = Vec::new();
                     let mut created = false;
                     let mut bibs = Vec::new();
                     let mut removed_bibs = Vec::new();
+                    let mut styles = Vec::new();
                     for (path, _, change) in changes.iter() {
+                        // A style file edited or dropped in is read again
+                        // on the next render.
+                        if path.extension().is_some_and(|extension| extension == "csl")
+                            && *change != PathChange::Loaded
+                        {
+                            styles.push(worktree.absolutize(path));
+                            continue;
+                        }
                         // Unlike images and notes below, `.bib` files do want
                         // the initial scan's `Loaded`: a worktree that
                         // finishes scanning after the editor opened is how its
@@ -496,11 +515,17 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                             notes.push(absolute);
                         }
                     }
-                    (images, notes, created, bibs, removed_bibs)
+                    (images, notes, created, bibs, removed_bibs, styles)
                 };
 
                 if !changed_bibs.is_empty() {
                     Bibliography::reload_paths(&bibliography, project, changed_bibs, cx);
+                }
+                if !changed_styles.is_empty() {
+                    let style_files = citations::StyleFiles::global(cx);
+                    for path in changed_styles {
+                        citations::StyleFiles::forget(&style_files, &path, cx);
+                    }
                 }
                 for path in removed_bibs {
                     Bibliography::remove_path(&bibliography, &path, cx);
@@ -774,6 +799,9 @@ impl Addon for LivePreviewAddon {
 struct MarkerSet {
     inline: Vec<InlineMarker>,
     blocks: Vec<BlockMarker>,
+    /// The heading block that names the reference list, when the note has
+    /// one; `attach_references_block` turns it into the rendered list.
+    references_heading: Option<Range<Anchor>>,
     /// Ranges that get an always-on strikethrough text decoration: themes
     /// color `~~struck~~` spans but do not apply the actual line-through, and
     /// with the delimiters hidden there would otherwise be no visual cue.
@@ -814,6 +842,9 @@ struct MarkerSet {
     /// other inline constructs a tag has no syntax to hide: the `#` is part
     /// of the tag's name, so it is styled in place rather than concealed.
     tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -851,6 +882,11 @@ enum InlineKind {
         destination: LinkDestination,
         label: SharedString,
     },
+    /// A citation group (`[@key, p. 3; @other]` or a bare `@key`) rendered as
+    /// the note's CSL style's in-text form, `(Vaswani et al., 2017, p. 3)` or
+    /// `[1]`. The whole group is concealed; touching it hands back the
+    /// source with its key chips.
+    Citation { rendered: SharedString },
     /// A LaTeX formula (`$x$` or `$$x$$`), rendered as a typeset image.
     ///
     /// Rendering is asynchronous, so the placeholder reads whatever the shared
@@ -880,6 +916,14 @@ struct BlockMarker {
     /// Leading-whitespace columns of the first line, so nested widgets (e.g.
     /// a code block inside a list item) keep their indentation.
     indent_columns: u32,
+}
+
+/// The warning under a References list, with a link to what fixes it.
+#[derive(Clone, PartialEq)]
+struct ReferencesNote {
+    text: SharedString,
+    link_label: SharedString,
+    url: SharedString,
 }
 
 #[derive(Clone, PartialEq)]
@@ -922,6 +966,15 @@ enum BlockRenderKind {
         kind: CalloutKind,
         title: String,
         collapse: Option<bool>,
+    },
+    /// A `References` (or `Bibliography`) heading, rendered together with the
+    /// reference-list entries for every work the note cites, formatted in
+    /// the note's CSL style. Each item is `(key, rendered text)`.
+    References {
+        items: Vec<(SharedString, SharedString)>,
+        /// A line under the list, e.g. that the frontmatter names a style
+        /// that is not bundled and APA is showing instead.
+        note: Option<ReferencesNote>,
     },
     /// Display math (`$$...$$` alone on its lines), rendered as a centered
     /// typeset formula. Unlike other blocks, revealing its source does not
@@ -1165,7 +1218,10 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
     let enabled = is_enabled(addon, cx);
 
     let markers = if enabled && !editor.read_only(cx) {
-        extract_markers(editor, cx).map(Arc::new)
+        extract_markers(editor, cx).map(|mut markers| {
+            attach_citation_rendering(&mut markers, editor, cx);
+            Arc::new(markers)
+        })
     } else {
         None
     };
@@ -1191,6 +1247,7 @@ const CITATION: usize = 6;
 const HIGHLIGHT: usize = 7;
 const TAG: usize = 8;
 const CITATION_UNKNOWN: usize = 9;
+const CODE: usize = 10;
 const HEADING_STYLE_BASE: usize = 100;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
@@ -1216,6 +1273,8 @@ fn apply_emphasis_highlights(
     // works in one.
     let highlight_background = cx.theme().status().warning.opacity(0.28);
     let tag_background = cx.theme().status().info_background;
+    // Same pill the markdown preview draws for inline code.
+    let code_background = cx.theme().colors().editor_foreground.opacity(0.08);
     let error_color = cx.theme().status().error;
 
     // A cite key that resolves to no `.bib` entry is the kind of silent error
@@ -1353,6 +1412,15 @@ fn apply_emphasis_highlights(
                 color: Some(accent_color),
                 background_color: Some(tag_background),
                 font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            CODE,
+            markers.map(|markers| markers.code.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                background_color: Some(code_background),
                 ..Default::default()
             },
         ),
@@ -1505,6 +1573,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             | InlineKind::Checkbox { .. }
             | InlineKind::Footnote { .. }
             | InlineKind::Link { .. }
+            | InlineKind::Citation { .. }
             | InlineKind::Math { .. } => &marker.range,
         };
         let span = reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
@@ -1620,6 +1689,20 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         {
             source.push_str("\n\n");
             source.push_str(&markers.definitions);
+        }
+        // The reuse check below compares sources, so the rendered entries
+        // ride along: a newly cited work or a style change re-renders.
+        if let BlockRenderKind::References { items, note } = &marker.kind {
+            for (_, text) in items {
+                source.push('\n');
+                source.push_str(text);
+            }
+            if let Some(note) = note {
+                source.push('\n');
+                source.push_str(&note.text);
+                source.push('\n');
+                source.push_str(&note.url);
+            }
         }
         let embed = match &marker.kind {
             BlockRenderKind::Embed { target, section } => {
@@ -1837,6 +1920,14 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             BlockRenderKind::Rule => render_rule_block(
                 weak_editor.clone(),
                 marker.range.clone(),
+                marker.indent_columns,
+            ),
+            BlockRenderKind::References { items, note } => render_references_block(
+                weak_editor.clone(),
+                marker.range.clone(),
+                plain_heading_text(source.lines().next().unwrap_or_default()),
+                items.clone(),
+                note.clone(),
                 marker.indent_columns,
             ),
             BlockRenderKind::Frontmatter => {
@@ -2464,6 +2555,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         // The label stands in for the link in the display text, so soft
         // wrapping and the cursor's column math see the width that is drawn.
         InlineKind::Link { label, .. } => Some(placeholder_display_text(label)),
+        InlineKind::Citation { rendered } => Some(placeholder_display_text(rendered)),
         InlineKind::Bullet
         | InlineKind::Checkbox { .. }
         | InlineKind::Footnote { .. }
@@ -2533,6 +2625,23 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                     .on_click(move |_, window, cx| {
                         open_link(&editor, &destination, window, cx);
                     })
+                    .into_any_element()
+            })
+        }
+        InlineKind::Citation { rendered } => {
+            let rendered = rendered.clone();
+            Arc::new(move |_, _, cx: &mut App| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                let colors = cx.theme().colors();
+                // The same chip the key carries in source, so a rendered
+                // citation and a revealed one read as the same object.
+                div()
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(theme_settings.buffer_font_size(cx))
+                    .text_color(colors.text)
+                    .bg(colors.editor_document_highlight_read_background)
+                    .rounded_sm()
+                    .child(rendered.clone())
                     .into_any_element()
             })
         }
@@ -2653,6 +2762,13 @@ fn marker_content_key(kind: &InlineKind) -> u64 {
             let mut hasher = collections::FxHasher::default();
             label.hash(&mut hasher);
             4 + hasher.finish()
+        }
+        // A style change re-renders every group over unchanged ranges.
+        InlineKind::Citation { rendered } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            rendered.hash(&mut hasher);
+            6 + hasher.finish()
         }
         // Both take part: the label is what is drawn, the destination is
         // what a click opens, and either can change over an unchanged range.
@@ -5175,6 +5291,100 @@ fn move_image_to_row(
     }
 }
 
+fn render_references_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    heading: String,
+    items: Vec<(SharedString, SharedString)>,
+    note: Option<ReferencesNote>,
+    indent_columns: u32,
+) -> RenderBlock {
+    let heading = SharedString::from(heading);
+    Arc::new(move |block_cx| {
+        let editor = editor.clone();
+        let start = range.start;
+        let note = note.clone();
+        let text_color = block_cx.app.theme().colors().text;
+        let link_color = block_cx.app.theme().colors().text_accent;
+        let warning_color = block_cx.app.theme().status().warning;
+        let entry_gap = theme_settings::ThemeSettings::get_global(block_cx.app)
+            .buffer_font_size(block_cx.app)
+            * 1.2;
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        // `max_width` includes the editor's horizontal scroll range (see the
+        // table block), so text wrapped to it runs past the viewport. Wrap
+        // to the visible width instead.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width);
+        let text_width = (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
+            .max(gpui::px(200.));
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .flex()
+            .flex_col()
+            .cursor_pointer()
+            .text_color(text_color)
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
+            .child(
+                div()
+                    .w(text_width)
+                    .text_xl()
+                    .font_weight(FontWeight::BOLD)
+                    .pb_2()
+                    .child(heading.clone()),
+            )
+            // Entries wrap at the body's line height and sit Typst's
+            // paragraph spacing (1.2em) apart: enough that the next work
+            // starts visibly after a long author list, less than the blank
+            // line between body paragraphs.
+            .children(items.iter().enumerate().map(|(index, (_, text))| {
+                div()
+                    .w(text_width)
+                    .line_height(block_cx.line_height)
+                    .when(index + 1 < items.len(), |this| this.pb(entry_gap))
+                    .child(text.clone())
+            }))
+            .when_some(note, |this, note| {
+                let url = note.url.clone();
+                this.child(
+                    div()
+                        .w(text_width)
+                        .pt_1()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .text_color(warning_color)
+                        .child(note.text)
+                        .child(
+                            div()
+                                .id("mdlp-references-note-link")
+                                .cursor_pointer()
+                                .text_color(link_color)
+                                .underline()
+                                .child(note.link_label)
+                                // The block above reveals the heading's source
+                                // on mouse down; the link must not.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        ),
+                )
+            })
+            .into_any_element()
+    })
+}
+
 fn render_rule_block(
     editor: WeakEntity<Editor>,
     range: Range<Anchor>,
@@ -6665,6 +6875,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         prose_regions: Vec::new(),
         code_spans: Vec::new(),
         last_table_end_row: None,
+        references_heading: None,
         inline: Vec::new(),
         blocks: Vec::new(),
         strikethrough: Vec::new(),
@@ -6679,6 +6890,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations: Vec::new(),
         highlights: Vec::new(),
         tags: Vec::new(),
+        code: Vec::new(),
     };
 
     for layer in buffer_snapshot.syntax_layers() {
@@ -6699,6 +6911,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     let Extraction {
         inline,
         mut blocks,
+        references_heading,
         strikethrough,
         italic,
         bold,
@@ -6711,6 +6924,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations,
         highlights,
         tags,
+        code,
         ..
     } = extraction;
 
@@ -6741,6 +6955,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     Some(MarkerSet {
         inline,
         blocks,
+        references_heading,
         strikethrough,
         italic,
         bold,
@@ -6753,6 +6968,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations,
         highlights,
         tags,
+        code,
     })
 }
 
@@ -6768,6 +6984,7 @@ struct Extraction<'a> {
     last_table_end_row: Option<u32>,
     inline: Vec<InlineMarker>,
     blocks: Vec<BlockMarker>,
+    references_heading: Option<Range<Anchor>>,
     strikethrough: Vec<Range<Anchor>>,
     italic: Vec<Range<Anchor>>,
     bold: Vec<Range<Anchor>>,
@@ -6780,6 +6997,9 @@ struct Extraction<'a> {
     bare_citations: Vec<Range<Anchor>>,
     highlights: Vec<Range<Anchor>>,
     tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
 }
 
 impl Extraction<'_> {
@@ -6902,6 +7122,23 @@ impl Extraction<'_> {
         (start_row, end_row)
     }
 
+    /// Remembers the heading block just pushed when it names the reference
+    /// list. The last such heading wins, matching where a reference list
+    /// sits in a manuscript.
+    fn note_references_heading(&mut self, node: tree_sitter::Node) {
+        let title = self
+            .text
+            .get(node.byte_range())
+            .and_then(|text| text.lines().next())
+            .map(plain_heading_text)
+            .unwrap_or_default();
+        if is_references_heading(&title)
+            && let Some(block) = self.blocks.last()
+        {
+            self.references_heading = Some(block.range.clone());
+        }
+    }
+
     fn push_block_rows(
         &mut self,
         start_row: u32,
@@ -6936,10 +7173,12 @@ impl Extraction<'_> {
                     let (start_row, end_row) = self.node_rows(node);
                     let level = heading_level(node) as u8;
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
+                    self.note_references_heading(node);
                 }
                 "setext_heading" => {
                     let (start_row, end_row) = self.node_rows(node);
                     self.push_block_rows(start_row, end_row, 2, BlockRenderKind::Markdown);
+                    self.note_references_heading(node);
                 }
                 "thematic_break" => {
                     let (start_row, end_row) = self.node_rows(node);
@@ -7146,13 +7385,24 @@ impl Extraction<'_> {
                 }
                 "code_span" => {
                     self.code_spans.push(node.byte_range());
+                    let mut content = node.byte_range();
                     for index in 0..node.child_count() {
                         let Some(child) = node.child(index) else {
                             continue;
                         };
                         if child.kind() == "code_span_delimiter" {
-                            self.hide(child.byte_range(), node.byte_range());
+                            let delimiter = child.byte_range();
+                            if delimiter.start == content.start {
+                                content.start = delimiter.end;
+                            } else {
+                                content.end = content.end.min(delimiter.start);
+                            }
+                            self.hide(delimiter, node.byte_range());
                         }
+                    }
+                    if content.start < content.end {
+                        let range = self.anchor_range(content);
+                        self.code.push(range);
                     }
                 }
                 "inline_link" | "full_reference_link" | "collapsed_reference_link" => {
@@ -7906,6 +8156,227 @@ fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::N
         }
     }
 }
+
+/// A heading line's plain title: `## References ##` → `References`.
+fn plain_heading_text(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('#')
+        .trim_end_matches('#')
+        .trim()
+        .to_string()
+}
+
+fn is_references_heading(title: &str) -> bool {
+    matches!(
+        title.trim().to_ascii_lowercase().as_str(),
+        "references" | "bibliography" | "works cited" | "reference list"
+    )
+}
+
+/// Renders the note's citations in its CSL style (the frontmatter `csl:`
+/// key, else APA): every group whose keys all resolve becomes a concealed
+/// span drawn as the in-text form, and the reference-list heading, when the
+/// note has one, becomes a block that also lists the cited works. One pass
+/// renders both so numbered styles agree between marks and list.
+fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut App) {
+    if markers.citation_groups.is_empty() && markers.bare_citations.is_empty() {
+        return;
+    }
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let head_end = MultiBufferOffset(snapshot.len().0.min(FRONTMATTER_SCAN_BYTES));
+    let head: String = snapshot
+        .text_for_range(MultiBufferOffset(0)..head_end)
+        .collect();
+    let source = citations::document_style_source(&head);
+    let search_dirs = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .map(|buffer| citations::style_search_dirs(buffer.read(cx), cx))
+        .unwrap_or_default();
+    let Some(fs) = editor
+        .project()
+        .map(|project| project.read(cx).fs().clone())
+    else {
+        return;
+    };
+    let Some(resolved) = citations::resolve_style(source.as_ref(), &search_dirs, fs, cx) else {
+        return;
+    };
+    let style = resolved.style;
+    let style_problem = resolved.problem;
+    let bibliography = Bibliography::global(cx);
+    let bibliography = bibliography.read(cx);
+
+    // Every group in document order, bracketed and bare alike.
+    let mut groups: Vec<(Range<Anchor>, bool)> = markers
+        .citation_groups
+        .iter()
+        .map(|range| (range.clone(), true))
+        .chain(
+            markers
+                .bare_citations
+                .iter()
+                .map(|range| (range.clone(), false)),
+        )
+        .collect();
+    groups.sort_by_key(|(range, _)| range.start.to_offset(&snapshot));
+
+    // A group renders when its keys all resolve and its syntax has a slot in
+    // the renderer; otherwise its chips stay as they are.
+    let parsed: Vec<(Range<Anchor>, Option<Vec<citation_group::Item>>)> = groups
+        .into_iter()
+        .map(|(range, bracketed)| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let items = citation_group::parse(&text, bracketed).filter(|items| {
+                items
+                    .iter()
+                    .all(|item| bibliography.entry_for_rendering(&item.key).is_some())
+            });
+            (range, items)
+        })
+        .collect();
+    let cite_groups: Vec<Vec<citations::CiteItem<'_>>> = parsed
+        .iter()
+        .filter_map(|(_, items)| items.as_ref())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(citations::CiteItem {
+                        entry: bibliography.entry_for_rendering(&item.key)?,
+                        locator: item.locator.clone(),
+                        form: item.form,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if cite_groups.is_empty() {
+        return;
+    }
+    let rendered = citations::render_document(&cite_groups, &style);
+
+    let mut rendered_citations = rendered.citations.into_iter();
+    for (range, items) in &parsed {
+        if items.is_none() {
+            continue;
+        }
+        let Some(text) = rendered_citations.next() else {
+            break;
+        };
+        let start = range.start.to_offset(&snapshot);
+        let end = range.end.to_offset(&snapshot);
+        // The group's own bracket concealments would nest inside this one.
+        markers.inline.retain(|marker| {
+            let marker_start = marker.range.start.to_offset(&snapshot);
+            let marker_end = marker.range.end.to_offset(&snapshot);
+            !(start <= marker_start && marker_end <= end)
+        });
+        markers.inline.push(InlineMarker {
+            range: range.clone(),
+            kind: InlineKind::Citation {
+                rendered: SharedString::from(text),
+            },
+        });
+    }
+
+    let Some(heading) = markers.references_heading.clone() else {
+        return;
+    };
+    if rendered.bibliography.is_empty() {
+        return;
+    }
+    let items = rendered
+        .bibliography
+        .into_iter()
+        .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
+        .collect::<Vec<_>>();
+    let note = style_problem.map(|problem| ReferencesNote {
+        text: SharedString::from(problem.message),
+        link_label: SharedString::from(problem.link_label),
+        url: SharedString::from(problem.url),
+    });
+    if let Some(marker) = markers
+        .blocks
+        .iter_mut()
+        .find(|block| block.range == heading)
+    {
+        marker.height_estimate = 2 + items.len() as u32 * 3 + u32::from(note.is_some());
+        marker.kind = BlockRenderKind::References { items, note };
+    }
+}
+
+/// Reading a pandoc citation group into its items.
+mod citation_group {
+    pub struct Item {
+        pub key: String,
+        pub locator: Option<(citations::Locator, String)>,
+        pub form: citations::CiteForm,
+    }
+
+    /// `[@a, p. 3; -@b]` or a bare `@a`. `None` when any part is not
+    /// `[-]@key[, locator]`, e.g. a prefix like `[see @a]`, which the
+    /// renderer has no slot for.
+    pub fn parse(text: &str, bracketed: bool) -> Option<Vec<Item>> {
+        let inner = if bracketed {
+            text.strip_prefix('[')?.strip_suffix(']')?
+        } else {
+            text
+        };
+        let mut items = Vec::new();
+        for part in inner.split(';') {
+            let part = part.trim();
+            let (form, rest) = match part.strip_prefix('-') {
+                Some(rest) => (citations::CiteForm::YearOnly, rest),
+                None if bracketed => (citations::CiteForm::Normal, part),
+                None => (citations::CiteForm::Prose, part),
+            };
+            let rest = rest.strip_prefix('@')?;
+            let key_end = rest
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            '_' | ':'
+                                | '.'
+                                | '#'
+                                | '$'
+                                | '%'
+                                | '&'
+                                | '-'
+                                | '+'
+                                | '?'
+                                | '<'
+                                | '>'
+                                | '~'
+                                | '/'
+                        ))
+                })
+                .unwrap_or(rest.len());
+            let key = rest[..key_end].trim_end_matches([
+                ':', '.', '#', '$', '%', '&', '+', '?', '<', '>', '~', '/', '-',
+            ]);
+            if key.is_empty() {
+                return None;
+            }
+            let locator = match citations::parse_cite_suffix(&rest[key.len()..]) {
+                citations::CiteSuffix::None => None,
+                citations::CiteSuffix::Locator(kind, value) => Some((kind, value)),
+                citations::CiteSuffix::Unsupported => return None,
+            };
+            items.push(Item {
+                key: key.to_string(),
+                locator,
+                form,
+            });
+        }
+        (!items.is_empty()).then_some(items)
+    }
+}
+
+/// How much of the buffer's head is scanned for a frontmatter `csl:` key.
+const FRONTMATTER_SCAN_BYTES: usize = 4096;
 
 fn heading_level(node: tree_sitter::Node) -> u32 {
     for index in 0..node.child_count() {

@@ -57,6 +57,8 @@
   {
     "context": "Editor",
     "bindings": {
+      "ctrl-alt-c": "citations::InsertCitation", // SUZURI
+      "ctrl-alt-o": "citations::OpenSource", // SUZURI
       "escape": "editor::Cancel",
       "shift-backspace": "editor::Backspace",
       "backspace": "editor::Backspace",

@@ -3546,6 +3546,54 @@ fn highlighted_texts(
 }
 
 #[gpui::test]
+async fn test_references_heading_lists_the_cited_works(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: apa\n---\n\nAs shown in [@vaswani2017attention].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                concat!(
+                    "@article{vaswani2017attention,\n  title = {Attention Is All You Need},\n",
+                    "  author = {Vaswani, Ashish and Shazeer, Noam},\n  date = {2017},\n",
+                    "  journaltitle = {NeurIPS},\n}\n",
+                    "@book{uncited1984,\n  title = {Not Cited},\n  author = {Nobody, Ann},\n",
+                    "  date = {1984},\n}\n"
+                ),
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let items = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { items, .. } => Some(items.clone()),
+                _ => None,
+            })
+        })
+        .expect("the References heading becomes a references block");
+    assert_eq!(items.len(), 1, "only cited works are listed: {items:?}");
+    assert_eq!(items[0].0.as_ref(), "vaswani2017attention");
+    assert!(
+        items[0]
+            .1
+            .starts_with("Vaswani, A., & Shazeer, N. (2017). Attention Is All You Need."),
+        "{}",
+        items[0].1
+    );
+}
+
+#[gpui::test]
 async fn test_cite_keys_resolve_against_the_vault_bibliography(cx: &mut TestAppContext) {
     use project::Fs as _;
 
@@ -3906,9 +3954,12 @@ async fn test_hovering_a_cite_key_shows_the_reference_card(cx: &mut TestAppConte
         .and_then(|hover| hover.contents.first())
         .map(|block| block.text.clone())
         .unwrap_or_default();
+    // The card is the reference rendered in the note's CSL style (APA when
+    // the frontmatter names none), plus its in-text form.
     assert!(
-        text.contains("A Study of Things") && text.contains("Jane Smith") && text.contains("2020"),
-        "hover card should carry the reference, got {text:?}"
+        text.contains("Smith, J. (2020). A Study of Things.")
+            && text.contains("**In text:** (Smith, 2020)"),
+        "hover card should carry the rendered reference, got {text:?}"
     );
 
     // On the email's lookalike key: no card (the request delegates).
@@ -4071,8 +4122,7 @@ async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) 
     ];
     for (text, expected) in cases {
         let buffer = cx.new(|cx| language::Buffer::local(*text, cx));
-        let start =
-            cx.update(|cx| crate::bibliography::citation_key_start(buffer.read(cx), text.len()));
+        let start = cx.update(|cx| citations::citation_key_start(buffer.read(cx), text.len()));
         assert_eq!(start, *expected, "context detection for {text:?}");
     }
 }
@@ -5672,5 +5722,358 @@ fn test_math_svg_rasterizes_to_a_nonempty_alpha_mask(cx: &mut gpui::TestAppConte
     assert!(
         covered * 100 / total >= 5,
         "only {covered}/{total} pixels carry alpha; the formula would paint blank"
+    );
+}
+
+/// Concealments carry a zero-width space so the fold keeps a display column
+/// (`fold_map.rs`), and Zed flags such characters as hidden Unicode by
+/// swapping in a visible glyph. That pass must skip placeholder chunks, or
+/// every concealed backtick and asterisk leaves a mark behind.
+#[gpui::test]
+async fn test_concealment_placeholders_are_not_flagged_as_hidden_characters(
+    cx: &mut TestAppContext,
+) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nuse `code` and **bold** here\n");
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("use code and bold here"));
+
+    let flagged = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let style = editor::EditorStyle::default();
+        let rows = editor::display_map::DisplayRow(0)..editor::display_map::DisplayRow(2);
+        snapshot
+            .display_snapshot
+            .highlighted_chunks(
+                rows,
+                language::LanguageAwareStyling {
+                    tree_sitter: true,
+                    diagnostics: false,
+                },
+                &style,
+            )
+            .filter(|chunk| {
+                matches!(
+                    chunk.replacement,
+                    Some(editor::display_map::ChunkReplacement::Str(_))
+                )
+            })
+            .map(|chunk| chunk.text.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        flagged,
+        Vec::<String>::new(),
+        "concealed markers must not surface the hidden-character glyph"
+    );
+}
+
+/// Inline code reads like the markdown preview's pill: the content between
+/// the backticks carries the `CODE` highlight (plain text color on a faint
+/// background), and the backticks themselves are concealed, not styled.
+#[gpui::test]
+async fn test_inline_code_is_styled_like_the_preview(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nread `refs/refs.bib` and ``a `nested` one`` here\n");
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text()
+            .contains("read refs/refs.bib and a `nested` one here")
+    );
+    let editor = cx.editor.clone();
+    let mut styled = highlighted_texts(&editor, CODE, &mut cx);
+    styled.sort();
+    assert_eq!(styled, vec!["a `nested` one", "refs/refs.bib"]);
+}
+
+/// Citation groups whose keys resolve render as the note's style's in-text
+/// form; a group the renderer has no slot for (a prefix) or one with an
+/// unresolved key keeps its chips.
+#[gpui::test]
+async fn test_citations_render_in_the_document_style(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                concat!(
+                    "---\ncsl: apa\n---\n\n",
+                    "As shown in [@smith2020, p. 3] and again [-@smith2020]. ",
+                    "Bare @smith2020 agrees. ",
+                    "Prefixed [see @smith2020] and unknown [@nope2020] stay.\n",
+                ),
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let display = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor.display_text(cx).replace('\u{200b}', "")
+        })
+    };
+    let text = display(cx);
+    assert!(
+        text.contains(
+            "As shown in (Smith, 2020, p. 3) and again (2020). Bare Smith (2020) agrees."
+        ),
+        "rendered in APA: {text:?}"
+    );
+    assert!(
+        text.contains("Prefixed see @smith2020 and unknown @nope2020 stay."),
+        "unsupported and unresolved groups keep their chips: {text}"
+    );
+
+    // Switching the style in the frontmatter re-renders every group.
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &concat!(
+            "---\ncsl: ieee\n---\n\n",
+            "As shown in [@smith2020, p. 3] and again [-@smith2020]. ",
+            "Bare @smith2020 agrees. ",
+            "Prefixed [see @smith2020] and unknown [@nope2020] stay.\n",
+        )
+        .into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in [1, p. 3]"),
+        "rendered in IEEE after the style change: {text}"
+    );
+}
+
+/// A `csl:` name that is not bundled must not take the rendering down with
+/// it: APA stands in, and the References block says which name failed.
+#[gpui::test]
+async fn test_an_unknown_style_falls_back_to_apa_and_says_so(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: apaa\n---\n\nAs shown in [@smith2020].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let text = editor.update(cx, |editor, cx| {
+        editor.display_text(cx).replace('\u{200b}', "")
+    });
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in for the unknown style: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .expect("the References heading becomes a references block");
+    let note = note.expect("the block carries a note about the unknown style");
+    assert!(
+        note.text.contains("\"apaa\"") && note.text.contains("APA"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.url.as_ref(), citations::STYLE_LIST_URL);
+}
+
+/// `csl:` may point at a `.csl` file in the project; it loads through the
+/// project's filesystem and rendering switches to it when it arrives. A file
+/// that is not there falls back to APA and says so.
+#[gpui::test]
+async fn test_a_csl_file_in_the_project_drives_rendering(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    const TEST_NUMERIC_CSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <title>Test Numeric</title>
+    <id>http://example.com/styles/test-numeric</id>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout prefix="⟨" suffix="⟩" delimiter=", ">
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <layout>
+      <text variable="citation-number" prefix="⟨" suffix="⟩ "/>
+      <names variable="author"><name/></names>
+      <text variable="title" prefix=". "/>
+    </layout>
+  </bibliography>
+</style>"#;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: test-numeric.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+            ("test-numeric.csl", TEST_NUMERIC_CSL),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let display = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor.display_text(cx).replace('\u{200b}', "")
+        })
+    };
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in ⟨1⟩."),
+        "the project's own style renders the citation: {text:?}"
+    );
+
+    // Pointing at a file that is not there falls back to APA and says so.
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: nowhere.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .flatten()
+        .expect("the References block notes the missing file");
+    assert!(
+        note.text.contains("nowhere.csl") && note.text.contains("not found"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.url.as_ref(), citations::STYLE_LIST_URL);
+
+    // A dependent style, the common shape of a journal's file, renders with
+    // the parent it points at when that file sits beside it.
+    fs.insert_file(
+        "/vault/journal.csl",
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<style xmlns=\"http://purl.org/net/xbiblio/csl\" version=\"1.0\" default-locale=\"en-US\">\n",
+            "  <info><title>Journal</title><id>http://example.com/styles/journal</id>\n",
+            "    <link href=\"http://example.com/styles/test-numeric\" rel=\"independent-parent\"/>\n",
+            "    <updated>2024-01-01T00:00:00+00:00</updated></info>\n",
+            "</style>\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: journal.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in ⟨1⟩."),
+        "the dependent style renders through its parent file: {text:?}"
+    );
+
+    // A dependent style whose parent is neither bundled nor beside it falls
+    // back to APA, and the note links to the parent's download.
+    fs.insert_file(
+        "/vault/orphan.csl",
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<style xmlns=\"http://purl.org/net/xbiblio/csl\" version=\"1.0\" default-locale=\"en-US\">\n",
+            "  <info><title>Orphan</title><id>http://example.com/styles/orphan</id>\n",
+            "    <link href=\"http://www.zotero.org/styles/some-society\" rel=\"independent-parent\"/>\n",
+            "    <updated>2024-01-01T00:00:00+00:00</updated></info>\n",
+            "</style>\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: orphan.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in for the orphaned dependent style: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .flatten()
+        .expect("the References block notes the missing parent");
+    assert!(
+        note.text.contains("\"some-society\"") && note.text.contains("some-society.csl"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.link_label.as_ref(), "Download some-society.csl");
+    assert_eq!(
+        note.url.as_ref(),
+        "https://www.zotero.org/styles/some-society"
     );
 }
