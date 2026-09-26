@@ -5307,6 +5307,9 @@ fn render_references_block(
         let text_color = block_cx.app.theme().colors().text;
         let link_color = block_cx.app.theme().colors().text_accent;
         let warning_color = block_cx.app.theme().status().warning;
+        let entry_gap = theme_settings::ThemeSettings::get_global(block_cx.app)
+            .buffer_font_size(block_cx.app)
+            * 1.2;
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
         // `max_width` includes the editor's horizontal scroll range (see the
@@ -5342,16 +5345,15 @@ fn render_references_block(
                     .pb_2()
                     .child(heading.clone()),
             )
-            // Entries wrap at the body's line height and sit one body line
-            // apart, like paragraphs, so a long author list still reads as
-            // one work and the next entry starts visibly.
+            // Entries wrap at the body's line height and sit Typst's
+            // paragraph spacing (1.2em) apart: enough that the next work
+            // starts visibly after a long author list, less than the blank
+            // line between body paragraphs.
             .children(items.iter().enumerate().map(|(index, (_, text))| {
                 div()
                     .w(text_width)
                     .line_height(block_cx.line_height)
-                    .when(index + 1 < items.len(), |this| {
-                        this.pb(block_cx.line_height)
-                    })
+                    .when(index + 1 < items.len(), |this| this.pb(entry_gap))
                     .child(text.clone())
             }))
             .when_some(note, |this, note| {
