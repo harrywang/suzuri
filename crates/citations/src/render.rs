@@ -5,8 +5,12 @@
 
 use std::{
     collections::HashMap,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
+
+use fs::Fs;
+use gpui::{App, AppContext as _, Entity, Global};
 
 use hayagriva::{
     BibliographyDriver, BibliographyRequest, BufWriteFormat, CitationItem, CitationRequest,
@@ -283,10 +287,18 @@ pub fn parse_cite_suffix(suffix: &str) -> CiteSuffix {
     CiteSuffix::Locator(kind, value.to_string())
 }
 
-/// The style a document asks for in its frontmatter: `csl: ieee`, or
-/// pandoc's `csl: ieee.csl`, or `citation-style: ieee`. Only the leading
-/// frontmatter block is read.
-pub fn document_style(text: &str) -> Option<String> {
+/// What a note's `csl:` value names: a bundled style by name, or a `.csl`
+/// file by path (anything ending in `.csl` or containing a separator),
+/// resolved against the note's folder and then the project root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StyleSource {
+    Bundled(String),
+    File(String),
+}
+
+/// The `csl:` (or `citation-style:`) value in a document's leading
+/// frontmatter, as written, minus quotes.
+pub fn document_style_source(text: &str) -> Option<StyleSource> {
     let mut lines = text.lines();
     let opener = lines.next()?.trim();
     if opener != "---" && opener != "+++" {
@@ -305,18 +317,316 @@ pub fn document_style(text: &str) -> Option<String> {
         }
         let value = value
             .trim()
-            .trim_matches(|character| character == '"' || character == '\'');
-        let name = value
-            .rsplit('/')
-            .next()
-            .unwrap_or(value)
-            .trim_end_matches(".csl")
+            .trim_matches(|character| character == '"' || character == '\'')
             .trim();
-        if !name.is_empty() {
-            return Some(name.to_string());
+        if value.is_empty() {
+            return None;
         }
+        let is_file = value.ends_with(".csl") || value.contains('/') || value.contains('\\');
+        return Some(if is_file {
+            StyleSource::File(value.to_string())
+        } else {
+            StyleSource::Bundled(value.to_string())
+        });
     }
     None
+}
+
+/// The bundled-style name a document's frontmatter implies: the name itself,
+/// or a file's stem (`styles/ieee.csl` → `ieee`).
+pub fn document_style(text: &str) -> Option<String> {
+    match document_style_source(text)? {
+        StyleSource::Bundled(name) => Some(name),
+        StyleSource::File(path) => Path::new(&path)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned()),
+    }
+}
+
+/// Parses a CSL file's XML into a style ready to render with.
+pub fn style_from_xml(name: impl Into<String>, xml: &str) -> Result<Arc<CslStyle>, String> {
+    match Style::from_xml(xml) {
+        Ok(Style::Independent(style)) => Ok(Arc::new(CslStyle {
+            name: name.into(),
+            style,
+        })),
+        Ok(Style::Dependent(_)) => {
+            Err("is a dependent style, one that only points at a parent style".to_string())
+        }
+        Err(error) => Err(format!("could not be parsed: {error}")),
+    }
+}
+
+/// What is known about one `.csl` file a note points at.
+#[derive(Debug, Clone)]
+pub enum StyleFileState {
+    Loading,
+    Ready(Arc<CslStyle>),
+    Missing,
+    Failed(String),
+}
+
+impl std::fmt::Debug for CslStyle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CslStyle")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+/// The `.csl` files notes point at, loaded through the project's filesystem
+/// so they work in every kind of worktree. Loading is asynchronous: a lookup
+/// that starts a load answers `Loading`, and the entity notifies when the
+/// file arrives so live preview can recompute.
+pub struct StyleFiles {
+    states: HashMap<PathBuf, StyleFileState>,
+}
+
+struct GlobalStyleFiles(Entity<StyleFiles>);
+
+impl Global for GlobalStyleFiles {}
+
+impl StyleFiles {
+    pub fn global(cx: &mut App) -> Entity<StyleFiles> {
+        if let Some(global) = cx.try_global::<GlobalStyleFiles>() {
+            return global.0.clone();
+        }
+        let files = cx.new(|_| StyleFiles {
+            states: HashMap::new(),
+        });
+        cx.set_global(GlobalStyleFiles(files.clone()));
+        files
+    }
+
+    pub fn try_global(cx: &App) -> Option<Entity<StyleFiles>> {
+        cx.try_global::<GlobalStyleFiles>()
+            .map(|global| global.0.clone())
+    }
+
+    pub fn state(&self, path: &Path) -> Option<&StyleFileState> {
+        self.states.get(path)
+    }
+
+    /// The state of `path`, starting its load the first time it is asked for.
+    pub fn lookup(
+        this: &Entity<StyleFiles>,
+        path: PathBuf,
+        fs: Arc<dyn Fs>,
+        cx: &mut App,
+    ) -> StyleFileState {
+        if let Some(state) = this.read(cx).states.get(&path) {
+            return state.clone();
+        }
+        this.update(cx, |files, _| {
+            files.states.insert(path.clone(), StyleFileState::Loading);
+        });
+        let files = this.clone();
+        cx.spawn(async move |cx| {
+            let name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let state = match fs.load(&path).await {
+                Ok(xml) => {
+                    cx.background_spawn(async move {
+                        match style_from_xml(name, &xml) {
+                            Ok(style) => StyleFileState::Ready(style),
+                            Err(problem) => StyleFileState::Failed(problem),
+                        }
+                    })
+                    .await
+                }
+                Err(_) => StyleFileState::Missing,
+            };
+            files.update(cx, |files, cx| {
+                files.states.insert(path, state);
+                cx.notify();
+            });
+        })
+        .detach();
+        StyleFileState::Loading
+    }
+
+    /// Drops what is known about `path`, so the next lookup reads it again.
+    pub fn forget(this: &Entity<StyleFiles>, path: &Path, cx: &mut App) {
+        this.update(cx, |files, cx| {
+            if files.states.remove(path).is_some() {
+                cx.notify();
+            }
+        });
+    }
+}
+
+/// The style a note renders with, plus a problem to show when it is not the
+/// one the note asked for.
+#[derive(Debug, Clone)]
+pub struct ResolvedStyle {
+    pub style: Arc<CslStyle>,
+    pub problem: Option<String>,
+}
+
+fn bundled_suggestions() -> String {
+    [
+        "apa",
+        "ieee",
+        "chicago-author-date",
+        "mla",
+        "harvard-cite-them-right",
+    ]
+    .into_iter()
+    .filter(|known| style_named(known).is_some())
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// A bundled style by name, or APA with a note when the name is unknown.
+pub fn resolve_bundled(name: &str) -> Option<ResolvedStyle> {
+    let (style, unknown) = style_or_default(name)?;
+    let problem = unknown.map(|name| {
+        format!(
+            "csl: \"{name}\" is not a bundled style, so this is APA. Try {}, …",
+            bundled_suggestions()
+        )
+    });
+    Some(ResolvedStyle { style, problem })
+}
+
+/// What to render with when a `.csl` file cannot be used: the bundled style
+/// of the same name when there is one (`styles/ieee.csl` → `ieee`), else APA
+/// with a note saying why.
+fn fallback_for_file(relative: &str, reason: &str) -> Option<ResolvedStyle> {
+    let stem = Path::new(relative)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if let Some(style) = style_named(&stem) {
+        return Some(ResolvedStyle {
+            style,
+            problem: None,
+        });
+    }
+    style_named(DEFAULT_STYLE).map(|style| ResolvedStyle {
+        style,
+        problem: Some(format!("csl: \"{relative}\" {reason}, so this is APA.")),
+    })
+}
+
+/// The absolute paths a `csl:` file value may mean, in the order to try:
+/// as written when absolute, else under each of `search_dirs` (the note's
+/// folder first, then the project root).
+pub fn style_file_candidates(relative: &str, search_dirs: &[PathBuf]) -> Vec<PathBuf> {
+    let path = Path::new(relative);
+    if path.is_absolute() {
+        return vec![path.to_path_buf()];
+    }
+    let mut candidates = Vec::new();
+    for directory in search_dirs {
+        let candidate = directory.join(path);
+        if !candidates.contains(&candidate) {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+/// Resolves a note's style, loading a `.csl` file it points at through
+/// `fs` when it is not yet known. While a file loads the note renders in APA
+/// without a note; the cache notifies when the file arrives.
+pub fn resolve_style(
+    source: Option<&StyleSource>,
+    search_dirs: &[PathBuf],
+    fs: Arc<dyn Fs>,
+    cx: &mut App,
+) -> Option<ResolvedStyle> {
+    match source {
+        None => style_named(DEFAULT_STYLE).map(|style| ResolvedStyle {
+            style,
+            problem: None,
+        }),
+        Some(StyleSource::Bundled(name)) => resolve_bundled(name),
+        Some(StyleSource::File(relative)) => {
+            let files = StyleFiles::global(cx);
+            let mut failure: Option<String> = None;
+            let mut loading = false;
+            for candidate in style_file_candidates(relative, search_dirs) {
+                match StyleFiles::lookup(&files, candidate, fs.clone(), cx) {
+                    StyleFileState::Ready(style) => {
+                        return Some(ResolvedStyle {
+                            style,
+                            problem: None,
+                        });
+                    }
+                    StyleFileState::Loading => loading = true,
+                    StyleFileState::Failed(problem) => {
+                        failure.get_or_insert(problem);
+                    }
+                    StyleFileState::Missing => {}
+                }
+            }
+            if loading {
+                return style_named(DEFAULT_STYLE).map(|style| ResolvedStyle {
+                    style,
+                    problem: None,
+                });
+            }
+            match failure {
+                Some(problem) => fallback_for_file(relative, &problem),
+                None => fallback_for_file(relative, "was not found"),
+            }
+        }
+    }
+}
+
+/// [`resolve_style`] without the ability to start a load, for callers that
+/// only hold `&App` (the hover card). A file no one has loaded yet resolves
+/// as still loading.
+pub fn resolve_style_readonly(
+    source: Option<&StyleSource>,
+    search_dirs: &[PathBuf],
+    cx: &App,
+) -> Option<ResolvedStyle> {
+    match source {
+        None => style_named(DEFAULT_STYLE).map(|style| ResolvedStyle {
+            style,
+            problem: None,
+        }),
+        Some(StyleSource::Bundled(name)) => resolve_bundled(name),
+        Some(StyleSource::File(relative)) => {
+            let files = StyleFiles::try_global(cx);
+            let mut failure: Option<String> = None;
+            let mut missing = 0;
+            let candidates = style_file_candidates(relative, search_dirs);
+            for candidate in &candidates {
+                let state = files
+                    .as_ref()
+                    .and_then(|files| files.read(cx).state(candidate).cloned());
+                match state {
+                    Some(StyleFileState::Ready(style)) => {
+                        return Some(ResolvedStyle {
+                            style,
+                            problem: None,
+                        });
+                    }
+                    Some(StyleFileState::Failed(problem)) => {
+                        failure.get_or_insert(problem);
+                    }
+                    Some(StyleFileState::Missing) => missing += 1,
+                    Some(StyleFileState::Loading) | None => {}
+                }
+            }
+            if let Some(problem) = failure {
+                return fallback_for_file(relative, &problem);
+            }
+            if missing == candidates.len() && !candidates.is_empty() {
+                return fallback_for_file(relative, "was not found");
+            }
+            style_named(DEFAULT_STYLE).map(|style| ResolvedStyle {
+                style,
+                problem: None,
+            })
+        }
+    }
 }
 
 fn plain(children: &ElemChildren) -> String {
@@ -493,6 +803,73 @@ mod tests {
         assert!(style_named("no-such-style").is_none());
         assert!(style_named("APA.csl").is_some());
         assert_eq!(style_named("ieee").unwrap().name, "ieee");
+    }
+
+    pub(crate) const TEST_NUMERIC_CSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <title>Test Numeric</title>
+    <id>http://example.com/styles/test-numeric</id>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout prefix="⟨" suffix="⟩" delimiter=", ">
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <layout>
+      <text variable="citation-number" prefix="⟨" suffix="⟩ "/>
+      <names variable="author"><name/></names>
+      <text variable="title" prefix=". "/>
+    </layout>
+  </bibliography>
+</style>"#;
+
+    #[test]
+    fn parses_a_csl_file_and_renders_with_it() {
+        let style = style_from_xml("test-numeric", TEST_NUMERIC_CSL).expect("a valid style");
+        assert_eq!(style.name, "test-numeric");
+        let library = library();
+        let entry = library.get("knuth1984texbook").unwrap();
+        let rendered = render_reference(entry, &style).unwrap();
+        assert_eq!(rendered.citation, "⟨1⟩");
+        assert!(
+            rendered.reference.starts_with("⟨1⟩") && rendered.reference.contains("Knuth"),
+            "{}",
+            rendered.reference
+        );
+        assert!(style_from_xml("x", "<style>").is_err());
+    }
+
+    #[test]
+    fn tells_bundled_names_from_files() {
+        assert_eq!(
+            document_style_source("---\ncsl: ieee\n---\n"),
+            Some(StyleSource::Bundled("ieee".into()))
+        );
+        assert_eq!(
+            document_style_source("---\ncsl: styles/journal.csl\n---\n"),
+            Some(StyleSource::File("styles/journal.csl".into()))
+        );
+        assert_eq!(
+            document_style_source("---\ncsl: \"journal.csl\"\n---\n"),
+            Some(StyleSource::File("journal.csl".into()))
+        );
+        assert_eq!(
+            style_file_candidates(
+                "styles/j.csl",
+                &[PathBuf::from("/v/notes"), PathBuf::from("/v")]
+            ),
+            [
+                PathBuf::from("/v/notes/styles/j.csl"),
+                PathBuf::from("/v/styles/j.csl")
+            ]
+        );
+        assert_eq!(
+            style_file_candidates("/abs/j.csl", &[PathBuf::from("/v")]),
+            [PathBuf::from("/abs/j.csl")]
+        );
     }
 
     #[test]

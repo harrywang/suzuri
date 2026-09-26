@@ -427,6 +427,12 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
             recompute(editor, cx);
         }));
+        // A `.csl` file a note points at loads asynchronously; rendering
+        // switches from APA to it the moment it arrives.
+        let style_files = citations::StyleFiles::global(cx);
+        subscriptions.push(cx.observe(&style_files, |editor, _, cx| {
+            recompute(editor, cx);
+        }));
         editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
             project.clone(),
             cx,
@@ -449,14 +455,30 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                 let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
                     return;
                 };
-                let (changed_images, changed_notes, note_created, changed_bibs, removed_bibs) = {
+                let (
+                    changed_images,
+                    changed_notes,
+                    note_created,
+                    changed_bibs,
+                    removed_bibs,
+                    changed_styles,
+                ) = {
                     let worktree = worktree.read(cx);
                     let mut images = Vec::new();
                     let mut notes = Vec::new();
                     let mut created = false;
                     let mut bibs = Vec::new();
                     let mut removed_bibs = Vec::new();
+                    let mut styles = Vec::new();
                     for (path, _, change) in changes.iter() {
+                        // A style file edited or dropped in is read again
+                        // on the next render.
+                        if path.extension().is_some_and(|extension| extension == "csl")
+                            && *change != PathChange::Loaded
+                        {
+                            styles.push(worktree.absolutize(path));
+                            continue;
+                        }
                         // Unlike images and notes below, `.bib` files do want
                         // the initial scan's `Loaded`: a worktree that
                         // finishes scanning after the editor opened is how its
@@ -493,11 +515,17 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                             notes.push(absolute);
                         }
                     }
-                    (images, notes, created, bibs, removed_bibs)
+                    (images, notes, created, bibs, removed_bibs, styles)
                 };
 
                 if !changed_bibs.is_empty() {
                     Bibliography::reload_paths(&bibliography, project, changed_bibs, cx);
+                }
+                if !changed_styles.is_empty() {
+                    let style_files = citations::StyleFiles::global(cx);
+                    for path in changed_styles {
+                        citations::StyleFiles::forget(&style_files, &path, cx);
+                    }
                 }
                 for path in removed_bibs {
                     Bibliography::remove_path(&bibliography, &path, cx);
@@ -8123,11 +8151,24 @@ fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut 
     let head: String = snapshot
         .text_for_range(MultiBufferOffset(0)..head_end)
         .collect();
-    let style_name =
-        citations::document_style(&head).unwrap_or_else(|| citations::DEFAULT_STYLE.to_string());
-    let Some((style, unknown_style)) = citations::style_or_default(&style_name) else {
+    let source = citations::document_style_source(&head);
+    let search_dirs = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .map(|buffer| citations::style_search_dirs(buffer.read(cx), cx))
+        .unwrap_or_default();
+    let Some(fs) = editor
+        .project()
+        .map(|project| project.read(cx).fs().clone())
+    else {
         return;
     };
+    let Some(resolved) = citations::resolve_style(source.as_ref(), &search_dirs, fs, cx) else {
+        return;
+    };
+    let style = resolved.style;
+    let style_problem = resolved.problem;
     let bibliography = Bibliography::global(cx);
     let bibliography = bibliography.read(cx);
 
@@ -8215,22 +8256,7 @@ fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut 
         .into_iter()
         .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
         .collect::<Vec<_>>();
-    let note = unknown_style.map(|name| {
-        let suggestions = [
-            "apa",
-            "ieee",
-            "chicago-author-date",
-            "mla",
-            "harvard-cite-them-right",
-        ]
-        .into_iter()
-        .filter(|known| citations::style_named(known).is_some())
-        .collect::<Vec<_>>()
-        .join(", ");
-        SharedString::from(format!(
-            "csl: \"{name}\" is not a bundled style, so this is APA. Try {suggestions}, …"
-        ))
-    });
+    let note = style_problem.map(SharedString::from);
     if let Some(marker) = markers
         .blocks
         .iter_mut()

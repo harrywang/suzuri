@@ -5897,3 +5897,93 @@ async fn test_an_unknown_style_falls_back_to_apa_and_says_so(cx: &mut TestAppCon
     let note = note.expect("the block carries a note about the unknown style");
     assert!(note.contains("\"apaa\"") && note.contains("APA"), "{note}");
 }
+
+/// `csl:` may point at a `.csl` file in the project; it loads through the
+/// project's filesystem and rendering switches to it when it arrives. A file
+/// that is not there falls back to APA and says so.
+#[gpui::test]
+async fn test_a_csl_file_in_the_project_drives_rendering(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    const TEST_NUMERIC_CSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <title>Test Numeric</title>
+    <id>http://example.com/styles/test-numeric</id>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout prefix="⟨" suffix="⟩" delimiter=", ">
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <layout>
+      <text variable="citation-number" prefix="⟨" suffix="⟩ "/>
+      <names variable="author"><name/></names>
+      <text variable="title" prefix=". "/>
+    </layout>
+  </bibliography>
+</style>"#;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: test-numeric.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+            ("test-numeric.csl", TEST_NUMERIC_CSL),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let display = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor.display_text(cx).replace('\u{200b}', "")
+        })
+    };
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in ⟨1⟩."),
+        "the project's own style renders the citation: {text:?}"
+    );
+
+    // Pointing at a file that is not there falls back to APA and says so.
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: nowhere.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .flatten()
+        .expect("the References block notes the missing file");
+    assert!(
+        note.contains("nowhere.csl") && note.contains("not found"),
+        "{note}"
+    );
+}

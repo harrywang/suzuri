@@ -593,12 +593,13 @@ impl CitationSemanticsProvider {
             let head: String = buffer
                 .text_for_range(0..buffer.len().min(FRONTMATTER_SCAN_BYTES))
                 .collect();
-            let style_name =
-                crate::document_style(&head).unwrap_or_else(|| crate::DEFAULT_STYLE.to_string());
-            let (style, unknown) = crate::style_or_default(&style_name)?;
+            let source = crate::document_style_source(&head);
+            let search_dirs = crate::style_search_dirs(buffer, cx);
+            let resolved = crate::resolve_style_readonly(source.as_ref(), &search_dirs, cx)?;
+            let style = resolved.style;
             let rendered = crate::render_reference(entry, &style)?;
-            let style_note = match unknown {
-                Some(name) => format!("{} (csl: \"{name}\" is not a bundled style)", style.name),
+            let style_note = match resolved.problem {
+                Some(problem) => format!("{} ({problem})", style.name),
                 None => style.name.clone(),
             };
             Some(format!(

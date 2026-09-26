@@ -26,9 +26,41 @@ pub use library::{DEFAULT_LIBRARY_PATH, Merge, append_entry, merge_entry};
 pub use open_source::{OpenSource, source_for_cursor};
 pub use render::{
     CiteForm, CiteItem, CiteSuffix, CslStyle, DEFAULT_STYLE, Locator, RenderedDocument,
-    RenderedReference, document_style, parse_cite_suffix, render_bibliography, render_document,
-    render_reference, style_named, style_names, style_or_default,
+    RenderedReference, ResolvedStyle, StyleFileState, StyleFiles, StyleSource, document_style,
+    document_style_source, parse_cite_suffix, render_bibliography, render_document,
+    render_reference, resolve_bundled, resolve_style, resolve_style_readonly,
+    style_file_candidates, style_from_xml, style_named, style_names, style_or_default,
 };
+
+/// The folders a note's relative paths (a `csl:` file) resolve against: the
+/// note's own folder, then its worktree root.
+pub fn style_search_dirs(buffer: &language::Buffer, cx: &gpui::App) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    let Some(file) = buffer.file() else {
+        return dirs;
+    };
+    let Some(local) = file.as_local() else {
+        return dirs;
+    };
+    let absolute = local.abs_path(cx);
+    if let Some(parent) = absolute.parent() {
+        dirs.push(parent.to_path_buf());
+    }
+    // The worktree root is the absolute path with the worktree-relative one
+    // peeled off.
+    let depth = file.path().components().count();
+    let mut root = absolute.as_path();
+    for _ in 0..depth {
+        match root.parent() {
+            Some(parent) => root = parent,
+            None => break,
+        }
+    }
+    if !dirs.iter().any(|dir| dir == root) {
+        dirs.push(root.to_path_buf());
+    }
+    dirs
+}
 pub use zotero::{DEFAULT_BASE_URL, ZoteroClient, ZoteroError, ZoteroItem, ZoteroStatus};
 
 pub(crate) const MARKDOWN: &str = "Markdown";
