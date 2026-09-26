@@ -6129,6 +6129,34 @@ fn parse_frontmatter_properties(source: &str) -> Vec<FrontmatterProperty> {
     properties
 }
 
+/// Shortens ISO 8601 timestamps for the Properties card. Tools that write
+/// frontmatter from JavaScript store a plain date as `new Date(..)
+/// .toISOString()`, i.e. midnight UTC, so that case shows as the date alone
+/// rather than shifting to the previous day in western timezones. The source
+/// text is untouched; editing the value still shows it verbatim.
+fn display_scalar_property(text: &str) -> String {
+    use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, Utc};
+
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(text) {
+        let utc = timestamp.with_timezone(&Utc);
+        if utc.time() == NaiveTime::MIN {
+            return utc.format("%Y-%m-%d").to_string();
+        }
+        return timestamp
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+    }
+    if let Ok(timestamp) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f") {
+        return if timestamp.time() == NaiveTime::MIN {
+            timestamp.format("%Y-%m-%d").to_string()
+        } else {
+            timestamp.format("%Y-%m-%d %H:%M").to_string()
+        };
+    }
+    text.to_string()
+}
+
 fn unquote(value: &str) -> &str {
     for quote in ['"', '\''] {
         if let Some(inner) = value
@@ -6575,7 +6603,7 @@ fn render_frontmatter_block(
                                 if text.is_empty() {
                                     this.text_color(colors.text_muted).child("Empty")
                                 } else {
-                                    this.child(SharedString::from(text.clone()))
+                                    this.child(SharedString::from(display_scalar_property(text)))
                                 }
                             })
                             .on_mouse_down(MouseButton::Left, move |_, window, cx| {

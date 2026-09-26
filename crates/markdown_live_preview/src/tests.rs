@@ -627,6 +627,34 @@ async fn test_frontmatter_renders_as_block(cx: &mut TestAppContext) {
 }
 
 #[test]
+fn test_frontmatter_timestamps_display_compactly() {
+    assert_eq!(
+        display_scalar_property("2026-09-26T00:00:00.000Z"),
+        "2026-09-26"
+    );
+    assert_eq!(display_scalar_property("2026-09-26T00:00:00"), "2026-09-26");
+    assert_eq!(
+        display_scalar_property("2026-09-26T14:30:15"),
+        "2026-09-26 14:30"
+    );
+    let with_offset = chrono::DateTime::parse_from_rfc3339("2026-09-26T14:30:00Z")
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .ok();
+    assert_eq!(
+        Some(display_scalar_property("2026-09-26T14:30:00Z")),
+        with_offset
+    );
+    assert_eq!(display_scalar_property("2026-09-26"), "2026-09-26");
+    assert_eq!(display_scalar_property("Some Note"), "Some Note");
+    assert_eq!(display_scalar_property("4.5"), "4.5");
+}
+
+#[test]
 fn test_parse_frontmatter_properties() {
     let source = indoc::indoc! {r#"
         ---
