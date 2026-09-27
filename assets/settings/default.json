@@ -157,6 +157,10 @@
     // Folder for attachments dropped onto a markdown buffer, relative to the
     // note's folder. An empty string stores attachments in the note's folder.
     "attachments_folder": "attachments",
+    // Whether to show a word count in the status bar for markdown notes.
+    // Frontmatter, code, math, cite keys and the reference list are not
+    // counted, the way a journal counts.
+    "word_count": true,
   },
   // Citation settings
   "citations": {

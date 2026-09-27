@@ -1400,6 +1400,12 @@ pub struct MarkdownLivePreviewSettingsContent {
     ///
     /// Default: "attachments"
     pub attachments_folder: Option<String>,
+    /// Whether to show a word count in the status bar for markdown notes.
+    /// Frontmatter, code, math, cite keys and the reference list are not
+    /// counted.
+    ///
+    /// Default: true
+    pub word_count: Option<bool>,
 }
 
 /// The settings for inserting citations from Zotero into the vault library.

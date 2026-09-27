@@ -785,6 +785,7 @@ fn main() {
         markdown_live_preview::init(cx);
         citations::init(cx);
         markdown_export::init(cx);
+        markdown_writing::init(cx);
         suzuri_recovery::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);

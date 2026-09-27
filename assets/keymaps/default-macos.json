@@ -649,6 +649,17 @@
       "cmd-shift-v": "markdown::OpenPreview",
     },
   },
+  // SUZURI: formatting shortcuts writers expect in a note. They win over
+  // Zed's cmd-b (toggle left dock) and cmd-i (signature help) only inside
+  // markdown editors.
+  {
+    "context": "Editor && extension == md",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-b": "markdown::ToggleBold",
+      "cmd-i": "markdown::ToggleItalic",
+    },
+  },
   {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,

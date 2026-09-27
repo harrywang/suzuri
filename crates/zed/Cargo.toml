@@ -168,6 +168,7 @@ markdown.workspace = true
 citations.workspace = true
 markdown_export.workspace = true
 markdown_live_preview.workspace = true
+markdown_writing.workspace = true
 markdown_preview.workspace = true
 menu.workspace = true
 migrator.workspace = true

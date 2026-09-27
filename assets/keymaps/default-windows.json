@@ -606,6 +606,17 @@
       "ctrl-shift-v": "markdown::OpenPreview",
     },
   },
+  // SUZURI: formatting shortcuts writers expect in a note, only inside
+  // markdown editors, and not in Vim's normal mode where ctrl-b and ctrl-i
+  // are motions.
+  {
+    "context": "Editor && extension == md && !VimControl",
+    "use_key_equivalents": true,
+    "bindings": {
+      "ctrl-b": "markdown::ToggleBold",
+      "ctrl-i": "markdown::ToggleItalic",
+    },
+  },
   {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,

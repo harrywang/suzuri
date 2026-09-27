@@ -140,6 +140,7 @@ members = [
     "crates/citations",
     "crates/markdown_export",
     "crates/markdown_live_preview",
+    "crates/markdown_writing",
     "crates/markdown_preview",
     "crates/math_render",
     "crates/menu",
@@ -416,6 +417,7 @@ markdown = { path = "crates/markdown" }
 citations = { path = "crates/citations" }
 markdown_export = { path = "crates/markdown_export" }
 markdown_live_preview = { path = "crates/markdown_live_preview" }
+markdown_writing = { path = "crates/markdown_writing" }
 markdown_preview = { path = "crates/markdown_preview" }
 math_render = { path = "crates/math_render" }
 menu = { path = "crates/menu" }
