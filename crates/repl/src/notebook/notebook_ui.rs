@@ -429,6 +429,17 @@ impl NotebookEditor {
             .as_ref()
             .map(|kernelspec| kernelspec.name.clone());
 
+        // A notebook that names no kernel has nothing to match, so skip waiting
+        // on discovery and show "Select Kernel" at once, as Jupyter and VS Code
+        // do. The refreshes still run so the picker opens populated.
+        if notebook_kernel_name.is_none() {
+            refresh_python.detach_and_log_err(cx);
+            refresh_jupyter.detach_and_log_err(cx);
+            self.kernel = Kernel::Shutdown;
+            cx.notify();
+            return;
+        }
+
         let pending_kernel = cx
             .spawn_in(window, async move |this, cx| {
                 let (python, jupyter) = futures::join!(refresh_python, refresh_jupyter);
@@ -645,7 +656,27 @@ impl NotebookEditor {
         }
     }
 
+    /// Opens the kernel picker when no kernel is chosen, returning whether it is
+    /// open. Until the picker has rendered once its handle cannot open it, and
+    /// the cell falls through to report that no kernel is selected.
+    fn prompt_for_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.kernel_specification.is_some()
+            || !matches!(self.kernel, Kernel::Shutdown | Kernel::ShuttingDown)
+        {
+            return false;
+        }
+        // Run All reaches here once per cell; showing again would rebuild the menu.
+        if !self.kernel_picker_handle.is_deployed() {
+            self.kernel_picker_handle.show(window, cx);
+        }
+        self.kernel_picker_handle.is_deployed()
+    }
+
     fn execute_cell(&mut self, cell_id: CellId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prompt_for_kernel(window, cx) {
+            return;
+        }
+
         let code = if let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id) {
             let editor = cell.read(cx).editor().clone();
             let buffer = editor.read(cx).buffer().read(cx);
@@ -716,6 +747,9 @@ impl NotebookEditor {
             }
             Kernel::ErroredLaunch(error) => format!("the kernel failed to launch: {error}"),
             Kernel::ShuttingDown | Kernel::Shutdown if self.kernel_specification.is_none() => {
+                // Reached by a cell queued while environments were still being
+                // discovered, which has already started executing.
+                self.prompt_for_kernel(window, cx);
                 "no kernel is selected: choose one from the kernel menu".to_string()
             }
             Kernel::ShuttingDown | Kernel::Shutdown => "the kernel is shut down".to_string(),
@@ -2165,42 +2199,23 @@ impl ProjectItem for NotebookEditor {
     }
 }
 
-/// The kernel a notebook starts with when none was chosen for it: the one picked
-/// for this worktree, then the project's own Python environment, then an installed
-/// Jupyter kernel with the name the notebook was saved with. Anything else is a
-/// guess at an interpreter that may lack ipykernel, which fails to start, so the
-/// notebook waits for the user to choose instead.
+/// The kernel a notebook starts with on open: the one named in its metadata,
+/// which is either the kernel it last ran on here (launching writes the kernel's
+/// name into the notebook) or an installed Jupyter kernel it was saved with.
+/// Anything else is a guess the user did not make. Starting the project's
+/// `.venv` for a notebook that says only the generic `python3`, as most tools
+/// write, ran code in an environment nobody chose, so the notebook waits on
+/// "Select Kernel" instead and running a cell opens the picker.
 fn default_kernel_specification(
     store: &ReplStore,
     worktree_id: WorktreeId,
     notebook_kernel_name: Option<&str>,
 ) -> Option<KernelSpecification> {
-    if let Some(selected) = store.selected_kernel(worktree_id) {
-        return Some(selected.clone());
-    }
-
-    let active_toolchain_path = store.active_python_toolchain_path(worktree_id);
-    let project_environments = store
-        .kernel_specifications_for_worktree(worktree_id)
-        .filter(|spec| spec.in_worktree() && spec.has_ipykernel())
-        .collect::<Vec<_>>();
-    let project_environment = project_environments
-        .iter()
-        .find(|spec| {
-            active_toolchain_path
-                .is_some_and(|active_path| spec.path().as_ref() == active_path.as_ref())
-        })
-        .or_else(|| project_environments.first());
-    if let Some(project_environment) = project_environment {
-        return Some((*project_environment).clone());
-    }
-
     let notebook_kernel_name = notebook_kernel_name?;
     store
-        .pure_jupyter_kernel_specifications()
-        .find(|spec| {
-            matches!(spec, KernelSpecification::Jupyter(jupyter) if jupyter.name == notebook_kernel_name)
-        })
+        .kernel_specifications_for_worktree(worktree_id)
+        .filter(|spec| spec.has_ipykernel())
+        .find(|spec| spec.name().as_ref() == notebook_kernel_name)
         .cloned()
 }
 
@@ -2319,6 +2334,22 @@ mod tests {
         ]
     }"#;
 
+    const NOTEBOOK_WITHOUT_A_KERNEL: &str = r#"{
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "cells": [
+            {
+                "cell_type": "code",
+                "id": "cell-one",
+                "metadata": {},
+                "execution_count": null,
+                "outputs": [],
+                "source": ["print('hello')"]
+            }
+        ]
+    }"#;
+
     /// Opens the one-cell notebook with a kernel whose interpreter doesn't exist,
     /// simulating a machine where Python isn't installed properly. The returned
     /// editor has already launched that kernel, so it is still starting and will
@@ -2345,15 +2376,17 @@ mod tests {
                 env: None,
             },
         });
-        open_test_notebook(Some(broken_spec), cx).await
+        open_test_notebook(NOTEBOOK_WITH_ONE_CODE_CELL, Some(broken_spec), cx).await
     }
 
-    /// Opens a one-cell notebook, with `selected_kernel` chosen for its worktree
-    /// through the same path the kernel picker uses.
-    async fn open_test_notebook(
-        selected_kernel: Option<KernelSpecification>,
-        cx: &mut TestAppContext,
-    ) -> (Entity<NotebookEditor>, &mut VisualTestContext) {
+    /// Opens a notebook and, when `chosen_kernel` is given, picks it through the
+    /// same call the kernel picker makes. Kernel discovery cannot be faked: it
+    /// runs the real `python` to find Jupyter's data directories.
+    async fn open_test_notebook<'a>(
+        notebook_json: &str,
+        chosen_kernel: Option<KernelSpecification>,
+        cx: &'a mut TestAppContext,
+    ) -> (Entity<NotebookEditor>, &'a mut VisualTestContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -2362,11 +2395,8 @@ mod tests {
         });
 
         let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/notebooks"),
-            json!({ "test.ipynb": NOTEBOOK_WITH_ONE_CODE_CELL }),
-        )
-        .await;
+        fs.insert_tree(path!("/notebooks"), json!({ "test.ipynb": notebook_json }))
+            .await;
 
         let project = Project::test(fs.clone(), [path!("/notebooks").as_ref()], cx).await;
         cx.update(|cx| ReplStore::init(fs.clone(), cx));
@@ -2374,14 +2404,6 @@ mod tests {
         let worktree_id = project.read_with(cx, |project, cx| {
             project.worktrees(cx).next().unwrap().read(cx).id()
         });
-
-        if let Some(selected_kernel) = selected_kernel {
-            cx.update(|cx| {
-                ReplStore::global(cx).update(cx, |store, cx| {
-                    store.set_active_kernelspec(worktree_id, selected_kernel, cx);
-                })
-            });
-        }
 
         let notebook_item = cx
             .update(|cx| {
@@ -2411,6 +2433,12 @@ mod tests {
         let editor = cx.update(|window, cx| {
             cx.new(|cx| NotebookEditor::new(project.clone(), notebook_item, window, cx))
         });
+
+        if let Some(chosen_kernel) = chosen_kernel {
+            editor.update_in(cx, |editor, window, cx| {
+                editor.change_kernel(chosen_kernel, window, cx);
+            });
+        }
 
         (editor, cx)
     }
@@ -2615,28 +2643,27 @@ mod tests {
         })
     }
 
-    /// Guessing an interpreter meant a bare `python3` from PATH, which usually
-    /// lacks ipykernel and failed to start. Only the project's own environment,
-    /// an explicit choice, or the Jupyter kernel the notebook names are safe.
+    /// Most tools save a notebook with the generic `python3`, which says nothing
+    /// about which environment to use. Starting the project's `.venv` or the
+    /// worktree's last pick for it ran code in an environment nobody chose.
     #[gpui::test]
-    fn test_default_kernel_prefers_the_project_environment(cx: &mut TestAppContext) {
+    fn test_default_kernel_does_not_guess_for_a_generic_name(cx: &mut TestAppContext) {
         let specs = vec![
             python_env("global", false, true),
-            python_env("project-without-ipykernel", true, false),
             python_env("project", true, true),
-            jupyter_kernel("python3"),
+            jupyter_kernel("other"),
         ];
+        let selected = python_env("project", true, true);
         assert_eq!(
-            default_kernel_name(specs, None, Some("python3"), cx).as_deref(),
-            Some("project")
+            default_kernel_name(specs, Some(selected), Some("python3"), cx),
+            None
         );
     }
 
     #[gpui::test]
-    fn test_default_kernel_falls_back_to_the_named_jupyter_kernel(cx: &mut TestAppContext) {
+    fn test_default_kernel_starts_the_named_jupyter_kernel(cx: &mut TestAppContext) {
         let specs = vec![
-            python_env("global", false, true),
-            python_env("project-without-ipykernel", true, false),
+            python_env("project", true, true),
             jupyter_kernel("other"),
             jupyter_kernel("course"),
         ];
@@ -2646,31 +2673,39 @@ mod tests {
         );
     }
 
+    /// Launching writes the kernel's name into the notebook, so a notebook run
+    /// here before reopens on the same environment.
     #[gpui::test]
-    fn test_default_kernel_is_none_rather_than_a_guess(cx: &mut TestAppContext) {
+    fn test_default_kernel_reopens_the_environment_it_last_ran_on(cx: &mut TestAppContext) {
         let specs = vec![
             python_env("global", false, true),
-            python_env("project-without-ipykernel", true, false),
-            jupyter_kernel("other"),
+            python_env("Python 3.14 (course; uv)", true, true),
         ];
-        assert_eq!(default_kernel_name(specs, None, Some("python3"), cx), None);
+        assert_eq!(
+            default_kernel_name(specs, None, Some("Python 3.14 (course; uv)"), cx).as_deref(),
+            Some("Python 3.14 (course; uv)")
+        );
+    }
+
+    /// An environment that has since lost ipykernel would fail to start.
+    #[gpui::test]
+    fn test_default_kernel_skips_a_named_environment_without_ipykernel(cx: &mut TestAppContext) {
+        let specs = vec![python_env("project", true, false)];
+        assert_eq!(default_kernel_name(specs, None, Some("project"), cx), None);
     }
 
     #[gpui::test]
-    fn test_default_kernel_keeps_the_selected_kernel(cx: &mut TestAppContext) {
-        let specs = vec![python_env("project", true, true)];
+    fn test_default_kernel_is_none_for_a_notebook_without_one(cx: &mut TestAppContext) {
+        let specs = vec![python_env("project", true, true), jupyter_kernel("python3")];
         let selected = python_env("global", false, true);
-        assert_eq!(
-            default_kernel_name(specs, Some(selected), None, cx).as_deref(),
-            Some("global")
-        );
+        assert_eq!(default_kernel_name(specs, Some(selected), None, cx), None);
     }
 
     /// With no suitable kernel, nothing is launched and the notebook says so,
     /// instead of starting a `python3` that could not run.
     #[gpui::test]
     async fn test_notebook_without_a_suitable_kernel_asks_for_one(cx: &mut TestAppContext) {
-        let (editor, cx) = open_test_notebook(None, cx).await;
+        let (editor, cx) = open_test_notebook(NOTEBOOK_WITH_ONE_CODE_CELL, None, cx).await;
 
         pending_kernel(&editor, cx).await;
         cx.run_until_parked();
@@ -2704,6 +2739,32 @@ mod tests {
                 }
                 other => panic!("expected a single error output, got: {other:?}"),
             }
+        });
+    }
+
+    /// A notebook saved without a kernel opens on "Select Kernel" at once, rather
+    /// than showing a kernel starting while environments are discovered.
+    #[gpui::test]
+    async fn test_notebook_saved_without_a_kernel_waits_for_a_choice(cx: &mut TestAppContext) {
+        let (editor, cx) = open_test_notebook(NOTEBOOK_WITHOUT_A_KERNEL, None, cx).await;
+
+        editor.read_with(cx, |editor, cx| {
+            assert!(
+                matches!(editor.kernel, Kernel::Shutdown),
+                "no kernel should be launched, instead status is: {}",
+                editor.kernel.status().to_string()
+            );
+            assert!(editor.kernel_specification.is_none());
+            assert!(
+                editor
+                    .notebook_item
+                    .read(cx)
+                    .notebook
+                    .metadata
+                    .kernelspec
+                    .is_none(),
+                "the notebook must not be stamped with a kernel the user did not choose"
+            );
         });
     }
 
