@@ -6,6 +6,9 @@ use settings::Settings;
 use terminal_view::terminal_panel;
 use zed_actions::{Quit, assistant, debug_panel, dev, git_panel, project_panel};
 
+// SUZURI: the fork's own menu lives in a fork-owned file.
+mod document_menu;
+
 pub fn app_menus(cx: &mut App) -> Vec<Menu> {
     let mut view_items = vec![
         MenuItem::action(
@@ -141,13 +144,7 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::separator(),
                 // SUZURI: exporting a markdown note to a document that leaves
                 // the editor.
-                MenuItem::submenu(Menu::new("Export").items([
-                    MenuItem::action("PDF", markdown_export::ExportToPdf),
-                    MenuItem::action("Word", markdown_export::ExportToDocx),
-                    MenuItem::action("HTML", markdown_export::ExportToHtml),
-                    MenuItem::action("LaTeX", markdown_export::ExportToLatex),
-                    MenuItem::action("EPUB", markdown_export::ExportToEpub),
-                ])),
+                document_menu::export_submenu(),
                 MenuItem::separator(),
                 MenuItem::action(
                     "Close Editor",
@@ -302,6 +299,8 @@ pub fn app_menus(cx: &mut App) -> Vec<Menu> {
                 MenuItem::action("Clear All Breakpoints", debugger_ui::ClearAllBreakpoints),
             ],
         },
+        // SUZURI: citations, previews and export for the current document.
+        document_menu::document_menu(),
         Menu {
             name: "Window".into(),
             disabled: false,

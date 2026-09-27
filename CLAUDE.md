@@ -35,6 +35,7 @@ The fork's own changes are small and additive:
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
+| Document menu (citations, previews, export) and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | In-app updates from GitHub releases (see "Cutting a release") | `crates/suzuri_update/`, `crates/auto_update/src/auto_update.rs` (`init`, `get_release_asset`, `release_notes_url`, the macOS and Linux installers), `crates/auto_update_ui/src/auto_update_ui.rs` (app name), `crates/release_channel/src/lib.rs` (`poll_for_updates`) |
 | Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
@@ -70,7 +71,12 @@ sets a 60s slow-timeout that terminates hung tests, serializes `db` tests, and g
 macOS with `Too many open files (os error 24)`.
 
 Other checks CI runs: `./script/prettier`, `./script/check-todos`, `./script/check-keymaps`.
-Docs are mdBook and must pass Prettier at 80 cols: `cd docs && npx prettier --write src/`.
+`docs/` is upstream Zed's mdBook (vendor; must pass Prettier at 80 cols:
+`cd docs && npx prettier --write src/`). **Suzuri's own user docs are not in this repo.**
+They live in [suzuri-docs](https://github.com/harrywang/suzuri-docs) (cloned at
+`../suzuri-docs`), MDX pages under `content/docs/` (`writing/`, `typesetting/`, `reading/`,
+`reference/keybindings.mdx`, `reference/settings.mdx`). A user-facing fork feature
+documents there, with its own PR in that repo.
 Visual regression tests: `cargo run -p zed --bin zed_visual_test_runner --features visual-tests`
 (prefix with `UPDATE_BASELINE=1` to re-record).
 
@@ -332,7 +338,7 @@ The chain is spread across crates and the compiler only catches part of it:
    missing field is a compile error here.
 4. `assets/settings/default.json` — the default value plus its user-facing comment.
 5. `crates/settings_ui/src/page_data.rs` if it should appear in the settings UI, and
-   `docs/src/reference/all-settings.md` if it should be documented.
+   `content/docs/reference/settings.mdx` in suzuri-docs if it should be documented.
 
 ## Cutting a release
 
