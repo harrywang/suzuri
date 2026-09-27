@@ -77,6 +77,10 @@ They live in [suzuri-docs](https://github.com/harrywang/suzuri-docs) (cloned at
 `../suzuri-docs`), MDX pages under `content/docs/` (`writing/`, `typesetting/`, `reading/`,
 `reference/keybindings.mdx`, `reference/settings.mdx`). A user-facing fork feature
 documents there, with its own PR in that repo.
+The suzuri.ai site ([suzuri.ai](https://github.com/harrywang/suzuri.ai), cloned at
+`../suzuri.ai`) shows screenshots of the app. Take them from the vaults in
+`../suzuri-testbed/screenshots/` with its `open.sh` and `capture.sh`, never from a
+personal folder, so a retake after a UI change matches the rest; its README lists the traps.
 Visual regression tests: `cargo run -p zed --bin zed_visual_test_runner --features visual-tests`
 (prefix with `UPDATE_BASELINE=1` to re-record).
 
