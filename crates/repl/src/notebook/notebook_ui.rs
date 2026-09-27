@@ -1797,6 +1797,8 @@ impl Render for NotebookEditor {
                     .w_full()
                     .h_full()
                     .gap_2()
+                    // SUZURI: keep the cell controls off the pane's right edge.
+                    .pr_2()
                     .child(
                         div()
                             .flex_1()
