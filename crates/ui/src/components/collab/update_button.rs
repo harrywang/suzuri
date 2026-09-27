@@ -99,24 +99,26 @@ impl UpdateButton {
         self
     }
 
+    // SUZURI: begin. The title bar's update button names the app Suzuri.
     pub fn checking() -> Self {
-        Self::new(IconName::LoadCircle, "Checking for Zed Updates…")
+        Self::new(IconName::LoadCircle, "Checking for Suzuri Updates…")
             .icon_animate(true)
             .disabled(true)
     }
 
     pub fn downloading(progress: Option<f32>) -> Self {
-        Self::new(IconName::Download, "Downloading Zed Update…")
+        Self::new(IconName::Download, "Downloading Suzuri Update…")
             .progress(progress)
             .disabled(true)
     }
 
     pub fn installing(version: impl Into<SharedString>) -> Self {
-        Self::new(IconName::LoadCircle, "Installing Zed Update…")
+        Self::new(IconName::LoadCircle, "Installing Suzuri Update…")
             .icon_animate(true)
             .tooltip(version)
             .disabled(true)
     }
+    // SUZURI: end
 
     pub fn up_to_date() -> Self {
         Self::new(IconName::Check, "Up to Date").disabled(true)
