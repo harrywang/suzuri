@@ -13,9 +13,9 @@ path = "src/markdown_export.rs"
 
 [dependencies]
 anyhow.workspace = true
+citations.workspace = true
 editor.workspace = true
 gpui.workspace = true
-hayagriva.workspace = true
 http_client.workspace = true
 paths.workspace = true
 project.workspace = true

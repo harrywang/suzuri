@@ -23,6 +23,12 @@
     },
   },
   {
+    "context": "CitationPicker || (CitationPicker > Picker > Editor) || (CitationPicker > Picker > menu)", // SUZURI
+    "bindings": {
+      "tab": "picker::MultiSelectNext",
+    },
+  },
+  {
     "context": "FileFinder || (FileFinder > Picker > Editor) || (FileFinder > Picker > menu)",
     "bindings": {
       "ctrl-shift-p": "file_finder::SelectPrevious",

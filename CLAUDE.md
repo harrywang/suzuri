@@ -29,6 +29,8 @@ The fork's own changes are small and additive:
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs`, `crates/editor/src/selections_collection.rs` |
 | Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
 | Native heading search reveal and Vim integration regressions | `crates/editor/src/editor.rs` (`selection_is_from_search`), `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
+| Optional plain block quote geometry | `crates/markdown/src/markdown.rs` (style overrides preserve shared renderer defaults) |
+| Editable preview navigation | `crates/editor/src/editor.rs` (`RowMotion`, `Addon::blocks_to_reveal_before`; the logic lives in the addon), `crates/vim/src/motion.rs`, `crates/vim/src/vim.rs` (Vim motions bypass editor actions) |
 | Markdown attachments: drag-and-drop and clipboard paste | `crates/editor/src/items.rs` |
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
@@ -148,12 +150,29 @@ with a `SUZURI:` tag so the next merge keeps it. Order the checks so drift surfa
 2. `cargo check -p zed -p editor -p project_panel` — the shared files the fork patches.
 3. `cargo nextest run -p markdown_live_preview -p pdf_viewer -p typeset_preview` — the
    contract tests catch semantic drift a clean compile hides.
-4. `cargo nextest run -p project_panel -p languages`. Note `undo_create_dirty_file` in
-   `project_panel` fails on a clean upstream tree too; verify by stashing before blaming a merge.
+4. `cargo nextest run -p project_panel -p languages`.
 5. Bundle and smoke-test the real app: live preview, a PDF, a Typst preview, the panel's
    refresh button. GUI behavior can also be verified without a human at the screen:
    `VisualTestAppContext` (see `crates/zed/src/visual_test_runner.rs`) renders offscreen
    with real Metal and captures screenshots without Screen Recording permission.
+
+### Tests the fork breaks permanently
+
+A full `cargo nextest run --workspace` fails in the same places on every merge. None of
+them mean the merge is broken, and all of them are the fork's own doing, so do not spend a
+merge chasing them:
+
+| Tests | Why |
+| --- | --- |
+| 11 save-prompt tests in `workspace` and `zed`, plus `project_panel tests::undo::undo_create_dirty_file` | The fork's `autosave` default in `assets/settings/default.json`. Tests load the shipped defaults, so buffers save themselves and upstream's tests never see the prompt they wait for. Setting `"autosave": "off"` in that file makes all twelve pass. |
+| `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer` and `typeset_preview`. |
+| `collab db_tests::*_postgres` (14) | Need a local Postgres; CI provisions one. |
+
+Anything *else* that fails is worth investigating. Before blaming the merge, check whether
+the fork has any delta on the files involved: `git diff $(git merge-base upstream/main main) main -- <path>`.
+A failure in a file with no fork delta is upstream's, and `undo_create_dirty_file` is the
+cautionary tale — it was recorded here as "fails on clean upstream too", which was wrong
+and sent a later session looking in the wrong place.
 
 Conflicts recur in the same handful of registration points (`Cargo.toml` members and paths,
 `crates/zed/src/main.rs` init calls, `crates/zed/src/zed.rs` toolbar block,
@@ -210,6 +229,45 @@ When carrying one:
 - If review reshapes the patch, the merge conflicts against your local copy — resolve by
   taking upstream's.
 
+## Keeping the vendor surface small
+
+When live preview needs the editor to behave differently, reach for these in order, and
+stop at the first that works:
+
+1. **Intercept from the addon.** `Editor::register_action` is upstream's own public API, and
+   a listener registered through it runs *before* the editor's built-in handler; calling
+   `cx.propagate()` passes the action on. Live preview already does this for `Paste`,
+   `Backspace`, `Delete`, `Newline`, and the vertical motions (`MoveUp`, `MoveDown`,
+   `SelectUp`, `SelectDown`). Zero vendor lines. `test_quote_arrow_navigation_uses_source_rows`
+   fails if that ordering ever changes upstream.
+2. **A hook, not the logic.** If no action exists to intercept (Vim's motions bypass editor
+   actions entirely), add the smallest generic hook to the vendor file, a trait method with a
+   default body plus a thin dispatcher, and keep the reasoning in the fork-owned crate.
+   `RowMotion` / `Addon::blocks_to_reveal_before` in `editor.rs` is the model: the addon
+   decides which blocks to reveal, the editor only removes them.
+3. **Logic in a vendor file** only when neither works, in one contiguous block.
+
+Prefer one contiguous `SUZURI: begin` ... `SUZURI: end` block over call sites sprinkled
+through a function Zed edits often: every separate hunk is a separate conflict.
+
+## `SUZURI:` markers
+
+A `SUZURI:` comment marks a deliberate fork change in one of Zed's files and says why, so
+that whoever resolves an upstream merge conflict there (Claude does these merges) knows the
+lines are intentional and what they are for.
+
+- A marker on its own covers **the next line or the next whole item** (a function, a struct,
+  a match arm in braces). That is unambiguous and needs no end marker.
+- When the change is **a run of lines inside a larger list that Zed owns** (dependencies in a
+  `Cargo.toml`, the settings sections list, struct fields, struct-literal fields), bracket it:
+  `// SUZURI: begin. <why>` ... `// SUZURI: end`. Without the end, nothing says where the
+  fork's part stops and Zed's resumes.
+- Do not tag a fix carried from an upstream PR; see "Carrying a fix locally" above.
+- Markers are an aid, not the record. Many older hunks carry none, and adding one to every
+  hunk would itself be conflict surface. The exact fork delta for any file is always
+  `git diff $(git merge-base upstream/main main) main -- <path>`; use it whenever a conflict
+  region has no marker to explain it.
+
 ## External contributions
 
 The vendor-hygiene rule applies to incoming PRs too: functional changes belong in
@@ -227,6 +285,9 @@ the local copy once a merge brings the patch back as vendor code, and clear the 
 | Kernel picker offered an `ipykernel` install for externally managed interpreters, where no installer can succeed, and the failure toast showed uv's trailing `hint:` instead of the reason | `crates/repl/src/kernels/mod.rs`, `crates/repl/src/repl_editor.rs`, `crates/repl/src/components/kernel_options.rs` | [zed#63086](https://github.com/zed-industries/zed/pull/63086) |
 | Kernel picker showed a stale Python environment list: it was scanned once when the notebook opened, so a `.venv` created afterwards never appeared until the tab was reopened. The picker now rescans on open and updates in place | `crates/repl/src/components/kernel_options.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/zed/src/zed/quick_action_bar/repl_menu.rs` | [zed#64170](https://github.com/zed-industries/zed/pull/64170) |
 | Kernel picker buried the project's own `.venv` among global interpreters (sorted by ipykernel presence, then name). Environments inside the worktree now sort first. The cherry-pick's test fixture gained `can_install_ipykernel` to compile against the #63086 carry; take upstream's version when either lands | `crates/repl/src/kernels/mod.rs`, `crates/repl/src/components/kernel_options.rs` | [zed#64187](https://github.com/zed-industries/zed/pull/64187) |
+| Notebook and REPL image outputs (matplotlib charts) kept their pixel width, capped only by `repl.max_columns`, so a pane narrower than the image clipped it on the right instead of scaling it down. Carried as suzuri#74, the same diff squash-merged | `crates/repl/src/outputs/image.rs` | [zed#64349](https://github.com/zed-industries/zed/pull/64349) |
+| Running a notebook cell while its kernel was still starting failed with "the kernel is still starting" and the request was dropped, so the cell never ran even once the kernel came up. The notebook now queues the request behind the launch task, a second copy of what `Session::execute` already does. **The PR was closed** (per-contributor PR limit), and the copy is exactly the duplication the redesign below removes, so it stays fork-local until then | `crates/repl/src/notebook/notebook_ui.rs` | [zed#64274](https://github.com/zed-industries/zed/pull/64274) (closed) |
+| Notebook kernels outlived their notebook: `start_kernel_tasks` held the session strongly from a detached task, so closing the tab could not drop the editor and the kernel's `Drop` never killed the process, and nothing killed it on quit either. **The PR was closed**: upstream wants kernel lifetime handled in one place rather than a second quit path bolted onto the notebook. The intended redesign moves the kernel lifecycle out of both `Session` and `NotebookEditor` into one UI-free entity that `ReplStore` tracks, to be proposed as a Zed Discussion before any code. When it lands, drop this row and #64274's and take upstream's files wholesale. The weak-handle half (`kernels/*.rs`) is design-neutral and can go upstream on its own | `crates/repl/src/kernels/mod.rs`, `native_kernel.rs`, `remote_kernels.rs`, `ssh_kernel.rs`, `wsl_kernel.rs`, `crates/repl/src/notebook/notebook_ui.rs` | [zed#64275](https://github.com/zed-industries/zed/pull/64275) (closed) |
 
 ## Jupyter notebooks (temporary fork delta)
 

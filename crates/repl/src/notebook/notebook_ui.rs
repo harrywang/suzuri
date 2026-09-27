@@ -1,6 +1,10 @@
 #![allow(unused, dead_code)]
 use std::future::Future;
-use std::{path::PathBuf, rc::Rc, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use client::proto::ViewId;
@@ -28,6 +32,7 @@ use super::{Cell, CellEvent, CellPosition, MarkdownCellEvent, RenderableCell};
 use nbformat::v4::CellId;
 use nbformat::v4::Metadata as NotebookMetadata;
 use serde_json;
+use util::ResultExt as _;
 use uuid::Uuid;
 
 use crate::components::{KernelPickerDelegate, KernelSelector};
@@ -228,16 +233,33 @@ impl NotebookEditor {
             execution_requests: HashMap::default(),
             kernel_picker_handle: PopoverMenuHandle::default(),
         };
-        editor.launch_kernel(window, cx);
+        editor.launch_default_kernel(window, cx);
         editor.refresh_language(cx);
-        Self::refresh_kernelspecs(&editor.project, editor.worktree_id, cx);
 
         cx.subscribe(&notebook_item, |this, _item, _event, cx| {
             this.refresh_language(cx);
         })
         .detach();
 
+        // A kernel is spawned into its own session, so nothing reaps it when Zed
+        // exits, and entities are not dropped on quit either, so the kernel's
+        // `Drop` never runs. Without this the kernel process outlives the app.
+        // `ReplStore` does the same for REPL sessions, which a notebook is not.
+        cx.on_app_quit(|editor, _cx| {
+            editor.shutdown_kernel();
+            std::future::ready(())
+        })
+        .detach();
+
         editor
+    }
+
+    fn shutdown_kernel(&mut self) {
+        if let Kernel::RunningKernel(mut kernel) =
+            std::mem::replace(&mut self.kernel, Kernel::Shutdown)
+        {
+            kernel.kill();
+        }
     }
 
     fn refresh_kernelspecs(project: &Entity<Project>, worktree_id: WorktreeId, cx: &mut App) {
@@ -388,35 +410,92 @@ impl NotebookEditor {
         })
     }
 
-    fn launch_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let spec = self.kernel_specification.clone().or_else(|| {
-            ReplStore::global(cx)
-                .read(cx)
-                .active_kernelspec(self.worktree_id, None, cx)
+    /// Waits for the worktree's Python environments to be discovered, then starts
+    /// the kernel `default_kernel_specification` picks. When it finds none, no
+    /// kernel is started and the user is asked to choose one.
+    fn launch_default_kernel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (refresh_python, refresh_jupyter) = ReplStore::global(cx).update(cx, |store, cx| {
+            (
+                store.refresh_python_kernelspecs(self.worktree_id, &self.project, cx),
+                store.refresh_kernelspecs(cx),
+            )
         });
+        let notebook_kernel_name = self
+            .notebook_item
+            .read(cx)
+            .notebook
+            .metadata
+            .kernelspec
+            .as_ref()
+            .map(|kernelspec| kernelspec.name.clone());
 
-        let spec = spec.unwrap_or_else(|| {
-            KernelSpecification::Jupyter(LocalKernelSpecification {
-                name: "python3".to_string(),
-                path: PathBuf::from("python3"),
-                kernelspec: JupyterKernelspec {
-                    argv: vec![
-                        "python3".to_string(),
-                        "-m".to_string(),
-                        "ipykernel_launcher".to_string(),
-                        "-f".to_string(),
-                        "{connection_file}".to_string(),
-                    ],
-                    display_name: "Python 3".to_string(),
-                    language: "python".to_string(),
-                    interrupt_mode: None,
-                    metadata: None,
-                    env: None,
-                },
+        let pending_kernel = cx
+            .spawn_in(window, async move |this, cx| {
+                let (python, jupyter) = futures::join!(refresh_python, refresh_jupyter);
+                python.log_err();
+                jupyter.log_err();
+
+                let launch = this
+                    .update_in(cx, |this, window, cx| {
+                        // The user picked a kernel while environments were loading.
+                        if this.kernel_specification.is_some() {
+                            return None;
+                        }
+                        let spec = default_kernel_specification(
+                            ReplStore::global(cx).read(cx),
+                            this.worktree_id,
+                            notebook_kernel_name.as_deref(),
+                        );
+                        let Some(spec) = spec else {
+                            this.kernel = Kernel::Shutdown;
+                            cx.notify();
+                            return None;
+                        };
+                        this.launch_kernel_with_spec(spec, window, cx);
+                        match &this.kernel {
+                            Kernel::StartingKernel(launch) => Some(launch.clone()),
+                            _ => None,
+                        }
+                    })
+                    .ok()
+                    .flatten();
+
+                // Cells queued behind this task should run against the launched
+                // kernel, not wake up while it is still starting.
+                if let Some(launch) = launch {
+                    launch.await;
+                }
             })
-        });
+            .shared();
 
-        self.launch_kernel_with_spec(spec, window, cx);
+        self.kernel = Kernel::StartingKernel(pending_kernel);
+        cx.notify();
+    }
+
+    // SUZURI: the notebook's directory. `absolutize` joins with the worktree's own path style,
+    // so the result is also valid on the remote side for SSH and WSL kernels. A notebook opened
+    // on its own is a single-file worktree whose root is the notebook itself.
+    fn kernel_working_directory(&self, cx: &App) -> PathBuf {
+        let project_path = &self.notebook_item.read(cx).project_path;
+        let Some(worktree) = self
+            .project
+            .read(cx)
+            .worktree_for_id(project_path.worktree_id, cx)
+        else {
+            return std::env::temp_dir();
+        };
+        let worktree = worktree.read(cx);
+        if worktree.is_single_file() {
+            return worktree
+                .abs_path()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(std::env::temp_dir);
+        }
+        match project_path.path.parent() {
+            Some(notebook_directory) => worktree.absolutize(notebook_directory),
+            None => worktree.abs_path().to_path_buf(),
+        }
     }
 
     fn launch_kernel_with_spec(
@@ -426,12 +505,10 @@ impl NotebookEditor {
         cx: &mut Context<Self>,
     ) {
         let entity_id = cx.entity_id();
-        let working_directory = self
-            .project
-            .read(cx)
-            .worktree_for_id(self.worktree_id, cx)
-            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-            .unwrap_or_else(std::env::temp_dir);
+        // SUZURI: start the kernel in the notebook's own directory, as Jupyter and VS Code
+        // do, so relative paths like `pd.read_csv("train.csv")` resolve next to the notebook
+        // rather than at the worktree root.
+        let working_directory = self.kernel_working_directory(cx);
         let fs = self.project.read(cx).fs().clone();
         let view = cx.entity();
 
@@ -585,37 +662,73 @@ impl NotebookEditor {
             ..Default::default()
         };
         let message: JupyterMessage = request.into();
-        let msg_id = message.header.msg_id.clone();
-
-        let send_result = match &mut self.kernel {
-            Kernel::RunningKernel(kernel) => kernel
-                .request_tx()
-                .try_send(message)
-                .map_err(|err| format!("failed to send execute request to kernel (the kernel process may have died): {err}")),
-            Kernel::StartingKernel(_) => Err("the kernel is still starting".to_string()),
-            Kernel::ErroredLaunch(error) => Err(format!("the kernel failed to launch: {error}")),
-            Kernel::ShuttingDown | Kernel::Shutdown => Err("the kernel is shut down".to_string()),
-            Kernel::Restarting => Err("the kernel is restarting".to_string()),
-        };
 
         if let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id) {
             cell.update(cx, |cell, cx| {
                 if cell.has_outputs() {
                     cell.clear_outputs();
                 }
-                if let Err(error) = &send_result {
-                    cell.show_kernel_error(error, window, cx);
-                } else {
-                    cell.start_execution();
-                }
+                cell.start_execution();
                 cx.notify();
             });
         }
 
-        if let Err(error) = send_result {
-            log::error!("notebook: cannot execute cell: {error}");
-        } else {
-            self.execution_requests.insert(msg_id, cell_id.clone());
+        self.send_execute_request(message, cell_id, window, cx);
+    }
+
+    /// A kernel takes seconds to come up, and a notebook is usually run the
+    /// moment it opens, so a request that arrives while the kernel is still
+    /// starting is held until the launch resolves rather than rejected. The
+    /// toolbar REPL queues the same way.
+    fn send_execute_request(
+        &mut self,
+        message: JupyterMessage,
+        cell_id: CellId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.cell_map.contains_key(&cell_id) {
+            return;
+        }
+
+        let msg_id = message.header.msg_id.clone();
+        let error = match &mut self.kernel {
+            Kernel::RunningKernel(kernel) => match kernel.request_tx().try_send(message) {
+                Ok(()) => {
+                    self.execution_requests.insert(msg_id, cell_id);
+                    return;
+                }
+                Err(err) => format!(
+                    "failed to send execute request to kernel (the kernel process may have died): {err}"
+                ),
+            },
+            Kernel::StartingKernel(pending_kernel) => {
+                let pending_kernel = pending_kernel.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    pending_kernel.await;
+                    this.update_in(cx, |editor, window, cx| {
+                        editor.send_execute_request(message, cell_id, window, cx);
+                    })
+                    .ok();
+                })
+                .detach();
+                return;
+            }
+            Kernel::ErroredLaunch(error) => format!("the kernel failed to launch: {error}"),
+            Kernel::ShuttingDown | Kernel::Shutdown if self.kernel_specification.is_none() => {
+                "no kernel is selected: choose one from the kernel menu".to_string()
+            }
+            Kernel::ShuttingDown | Kernel::Shutdown => "the kernel is shut down".to_string(),
+            Kernel::Restarting => "the kernel is restarting".to_string(),
+        };
+
+        log::error!("notebook: cannot execute cell: {error}");
+
+        if let Some(Cell::Code(cell)) = self.cell_map.get(&cell_id) {
+            cell.update(cx, |cell, cx| {
+                cell.show_kernel_error(&error, window, cx);
+                cx.notify();
+            });
         }
     }
 
@@ -1108,9 +1221,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Execute all cells", &RunAll, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(RunAll), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.run_cells(window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 Self::render_notebook_control(
@@ -1123,9 +1238,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Clear all outputs", &ClearOutputs, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(ClearOutputs), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.clear_outputs(window, cx);
+                                    },
+                                )),
                             ),
                     )
                     .child(
@@ -1140,9 +1257,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Move cell up", &MoveCellUp, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(MoveCellUp), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.move_cell_up(window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 Self::render_notebook_control(
@@ -1154,9 +1273,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Move cell down", &MoveCellDown, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(MoveCellDown), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.move_cell_down(window, cx);
+                                    },
+                                )),
                             ),
                     )
                     .child(
@@ -1171,9 +1292,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Add markdown block", &AddMarkdownBlock, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(AddMarkdownBlock), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.add_markdown_block(window, cx);
+                                    },
+                                )),
                             )
                             .child(
                                 Self::render_notebook_control(
@@ -1185,9 +1308,11 @@ impl NotebookEditor {
                                 .tooltip(move |window, cx| {
                                     Tooltip::for_action("Add code block", &AddCodeBlock, cx)
                                 })
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(Box::new(AddCodeBlock), cx);
-                                }),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.add_code_block(window, cx);
+                                    },
+                                )),
                             ),
                     )
                     .child(
@@ -1202,9 +1327,11 @@ impl NotebookEditor {
                             .tooltip(move |window, cx| {
                                 Tooltip::for_action("Delete cell", &DeleteCell, cx)
                             })
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(Box::new(DeleteCell), cx);
-                            }),
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.delete_cell(window, cx);
+                                },
+                            )),
                         ),
                     ),
             )
@@ -2038,6 +2165,45 @@ impl ProjectItem for NotebookEditor {
     }
 }
 
+/// The kernel a notebook starts with when none was chosen for it: the one picked
+/// for this worktree, then the project's own Python environment, then an installed
+/// Jupyter kernel with the name the notebook was saved with. Anything else is a
+/// guess at an interpreter that may lack ipykernel, which fails to start, so the
+/// notebook waits for the user to choose instead.
+fn default_kernel_specification(
+    store: &ReplStore,
+    worktree_id: WorktreeId,
+    notebook_kernel_name: Option<&str>,
+) -> Option<KernelSpecification> {
+    if let Some(selected) = store.selected_kernel(worktree_id) {
+        return Some(selected.clone());
+    }
+
+    let active_toolchain_path = store.active_python_toolchain_path(worktree_id);
+    let project_environments = store
+        .kernel_specifications_for_worktree(worktree_id)
+        .filter(|spec| spec.in_worktree() && spec.has_ipykernel())
+        .collect::<Vec<_>>();
+    let project_environment = project_environments
+        .iter()
+        .find(|spec| {
+            active_toolchain_path
+                .is_some_and(|active_path| spec.path().as_ref() == active_path.as_ref())
+        })
+        .or_else(|| project_environments.first());
+    if let Some(project_environment) = project_environment {
+        return Some((*project_environment).clone());
+    }
+
+    let notebook_kernel_name = notebook_kernel_name?;
+    store
+        .pure_jupyter_kernel_specifications()
+        .find(|spec| {
+            matches!(spec, KernelSpecification::Jupyter(jupyter) if jupyter.name == notebook_kernel_name)
+        })
+        .cloned()
+}
+
 impl KernelSession for NotebookEditor {
     fn route(&mut self, message: &JupyterMessage, window: &mut Window, cx: &mut Context<Self>) {
         // Handle kernel status updates (these are broadcast to all)
@@ -2082,7 +2248,9 @@ impl KernelSession for NotebookEditor {
 mod tests {
     use super::*;
     use feature_flags::FeatureFlag as _;
-    use gpui::TestAppContext;
+    use gpui::{TestAppContext, VisualTestContext};
+    use jupyter_protocol::{ExecutionState, KernelInfoReply};
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     // SUZURI: contract test. `init` only registers `NotebookEditor` as the handler for
     // `.ipynb` when this resolves true, and in a release build `enabled_for_all` is the
@@ -2151,11 +2319,41 @@ mod tests {
         ]
     }"#;
 
-    /// When the configured interpreter doesn't exist (e.g. Python isn't installed),
-    /// running a cell must not leave it stuck in the executing state. It should
-    /// instead surface the kernel launch error as an error output on the cell.
-    #[gpui::test]
-    async fn test_run_cell_with_missing_interpreter_shows_error(cx: &mut TestAppContext) {
+    /// Opens the one-cell notebook with a kernel whose interpreter doesn't exist,
+    /// simulating a machine where Python isn't installed properly. The returned
+    /// editor has already launched that kernel, so it is still starting and will
+    /// eventually fail.
+    async fn notebook_with_missing_interpreter(
+        cx: &mut TestAppContext,
+    ) -> (Entity<NotebookEditor>, &mut VisualTestContext) {
+        let missing_interpreter = path!("/nonexistent/python3");
+        let broken_spec = KernelSpecification::Jupyter(LocalKernelSpecification {
+            name: "python3".to_string(),
+            path: PathBuf::from(missing_interpreter),
+            kernelspec: JupyterKernelspec {
+                argv: vec![
+                    missing_interpreter.to_string(),
+                    "-m".to_string(),
+                    "ipykernel_launcher".to_string(),
+                    "-f".to_string(),
+                    "{connection_file}".to_string(),
+                ],
+                display_name: "Python 3".to_string(),
+                language: "python".to_string(),
+                interrupt_mode: None,
+                metadata: None,
+                env: None,
+            },
+        });
+        open_test_notebook(Some(broken_spec), cx).await
+    }
+
+    /// Opens a one-cell notebook, with `selected_kernel` chosen for its worktree
+    /// through the same path the kernel picker uses.
+    async fn open_test_notebook(
+        selected_kernel: Option<KernelSpecification>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<NotebookEditor>, &mut VisualTestContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
@@ -2177,33 +2375,13 @@ mod tests {
             project.worktrees(cx).next().unwrap().read(cx).id()
         });
 
-        // Select a kernel whose interpreter doesn't exist, simulating a machine
-        // where Python isn't installed properly. This is the same path the
-        // kernel picker uses.
-        let missing_interpreter = path!("/nonexistent/python3");
-        let broken_spec = KernelSpecification::Jupyter(LocalKernelSpecification {
-            name: "python3".to_string(),
-            path: PathBuf::from(missing_interpreter),
-            kernelspec: JupyterKernelspec {
-                argv: vec![
-                    missing_interpreter.to_string(),
-                    "-m".to_string(),
-                    "ipykernel_launcher".to_string(),
-                    "-f".to_string(),
-                    "{connection_file}".to_string(),
-                ],
-                display_name: "Python 3".to_string(),
-                language: "python".to_string(),
-                interrupt_mode: None,
-                metadata: None,
-                env: None,
-            },
-        });
-        cx.update(|cx| {
-            ReplStore::global(cx).update(cx, |store, cx| {
-                store.set_active_kernelspec(worktree_id, broken_spec, cx);
-            })
-        });
+        if let Some(selected_kernel) = selected_kernel {
+            cx.update(|cx| {
+                ReplStore::global(cx).update(cx, |store, cx| {
+                    store.set_active_kernelspec(worktree_id, selected_kernel, cx);
+                })
+            });
+        }
 
         let notebook_item = cx
             .update(|cx| {
@@ -2234,13 +2412,108 @@ mod tests {
             cx.new(|cx| NotebookEditor::new(project.clone(), notebook_item, window, cx))
         });
 
+        (editor, cx)
+    }
+
+    /// Stands in for a launched kernel so a test can observe it being killed
+    /// without spawning a real interpreter.
+    #[derive(Debug)]
+    struct FakeRunningKernel {
+        killed: Arc<AtomicBool>,
+        request_tx: futures::channel::mpsc::Sender<JupyterMessage>,
+        stdin_tx: futures::channel::mpsc::Sender<JupyterMessage>,
+        working_directory: PathBuf,
+        execution_state: ExecutionState,
+        kernel_info: Option<KernelInfoReply>,
+    }
+
+    impl FakeRunningKernel {
+        fn new(killed: Arc<AtomicBool>) -> Self {
+            Self {
+                killed,
+                request_tx: futures::channel::mpsc::channel(1).0,
+                stdin_tx: futures::channel::mpsc::channel(1).0,
+                working_directory: PathBuf::from("/"),
+                execution_state: ExecutionState::Idle,
+                kernel_info: None,
+            }
+        }
+    }
+
+    impl crate::kernels::RunningKernel for FakeRunningKernel {
+        fn request_tx(&self) -> futures::channel::mpsc::Sender<JupyterMessage> {
+            self.request_tx.clone()
+        }
+
+        fn stdin_tx(&self) -> futures::channel::mpsc::Sender<JupyterMessage> {
+            self.stdin_tx.clone()
+        }
+
+        fn working_directory(&self) -> &PathBuf {
+            &self.working_directory
+        }
+
+        fn execution_state(&self) -> &ExecutionState {
+            &self.execution_state
+        }
+
+        fn set_execution_state(&mut self, state: ExecutionState) {
+            self.execution_state = state;
+        }
+
+        fn kernel_info(&self) -> Option<&KernelInfoReply> {
+            self.kernel_info.as_ref()
+        }
+
+        fn set_kernel_info(&mut self, info: KernelInfoReply) {
+            self.kernel_info = Some(info);
+        }
+
+        fn force_shutdown(&mut self, _window: &mut Window, _cx: &mut App) -> Task<Result<()>> {
+            self.kill();
+            Task::ready(Ok(()))
+        }
+
+        fn kill(&mut self) {
+            self.killed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The launch task of a kernel that is still starting. Panics if it already
+    /// resolved.
+    fn pending_kernel(
+        editor: &Entity<NotebookEditor>,
+        cx: &mut VisualTestContext,
+    ) -> Shared<Task<()>> {
+        editor.read_with(cx, |editor, _| match &editor.kernel {
+            Kernel::StartingKernel(task) => task.clone(),
+            _ => panic!("kernel should still be starting"),
+        })
+    }
+
+    fn code_cell(
+        editor: &Entity<NotebookEditor>,
+        cx: &mut VisualTestContext,
+    ) -> Entity<crate::notebook::CodeCell> {
+        editor.read_with(cx, |editor, _| {
+            let cell_id = editor.cell_order.first().expect("notebook has one cell");
+            match editor.cell_map.get(cell_id) {
+                Some(Cell::Code(cell)) => cell.clone(),
+                _ => panic!("expected a code cell"),
+            }
+        })
+    }
+
+    /// When the configured interpreter doesn't exist (e.g. Python isn't installed),
+    /// running a cell must not leave it stuck in the executing state. It should
+    /// instead surface the kernel launch error as an error output on the cell.
+    #[gpui::test]
+    async fn test_run_cell_with_missing_interpreter_shows_error(cx: &mut TestAppContext) {
+        let (editor, cx) = notebook_with_missing_interpreter(cx).await;
+
         // Creating the editor launches the kernel. Wait for the actual launch
         // task, which fails because the interpreter cannot be spawned.
-        let pending_kernel = editor.read_with(cx, |editor, _| match &editor.kernel {
-            Kernel::StartingKernel(task) => task.clone(),
-            _ => panic!("kernel should be starting right after the editor is created"),
-        });
-        pending_kernel.await;
+        pending_kernel(&editor, cx).await;
 
         editor.read_with(cx, |editor, _| {
             assert!(
@@ -2282,6 +2555,236 @@ mod tests {
                 other => panic!("expected a single error output, got: {other:?}"),
             }
         });
+    }
+
+    fn python_env(name: &str, in_worktree: bool, has_ipykernel: bool) -> KernelSpecification {
+        KernelSpecification::PythonEnv(crate::kernels::PythonEnvKernelSpecification {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/{name}/bin/python")),
+            kernelspec: JupyterKernelspec {
+                argv: Vec::new(),
+                display_name: name.to_string(),
+                language: "python".to_string(),
+                interrupt_mode: None,
+                metadata: None,
+                env: None,
+            },
+            has_ipykernel,
+            can_install_ipykernel: true,
+            in_worktree,
+            environment_kind: None,
+        })
+    }
+
+    fn jupyter_kernel(name: &str) -> KernelSpecification {
+        KernelSpecification::Jupyter(LocalKernelSpecification {
+            name: name.to_string(),
+            path: PathBuf::from(format!("/kernels/{name}")),
+            kernelspec: JupyterKernelspec {
+                argv: Vec::new(),
+                display_name: name.to_string(),
+                language: "python".to_string(),
+                interrupt_mode: None,
+                metadata: None,
+                env: None,
+            },
+        })
+    }
+
+    fn default_kernel_name(
+        specs: Vec<KernelSpecification>,
+        selected: Option<KernelSpecification>,
+        notebook_kernel_name: Option<&str>,
+        cx: &mut TestAppContext,
+    ) -> Option<String> {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let worktree_id = WorktreeId::from_usize(1);
+        let store = cx.new(|cx| ReplStore::new(FakeFs::new(cx.background_executor().clone()), cx));
+        store.update(cx, |store, cx| {
+            store.set_kernel_specs_for_testing(specs, cx);
+            if let Some(selected) = selected {
+                store.set_active_kernelspec(worktree_id, selected, cx);
+            }
+        });
+        store.read_with(cx, |store, _| {
+            default_kernel_specification(store, worktree_id, notebook_kernel_name)
+                .map(|spec| spec.name().to_string())
+        })
+    }
+
+    /// Guessing an interpreter meant a bare `python3` from PATH, which usually
+    /// lacks ipykernel and failed to start. Only the project's own environment,
+    /// an explicit choice, or the Jupyter kernel the notebook names are safe.
+    #[gpui::test]
+    fn test_default_kernel_prefers_the_project_environment(cx: &mut TestAppContext) {
+        let specs = vec![
+            python_env("global", false, true),
+            python_env("project-without-ipykernel", true, false),
+            python_env("project", true, true),
+            jupyter_kernel("python3"),
+        ];
+        assert_eq!(
+            default_kernel_name(specs, None, Some("python3"), cx).as_deref(),
+            Some("project")
+        );
+    }
+
+    #[gpui::test]
+    fn test_default_kernel_falls_back_to_the_named_jupyter_kernel(cx: &mut TestAppContext) {
+        let specs = vec![
+            python_env("global", false, true),
+            python_env("project-without-ipykernel", true, false),
+            jupyter_kernel("other"),
+            jupyter_kernel("course"),
+        ];
+        assert_eq!(
+            default_kernel_name(specs, None, Some("course"), cx).as_deref(),
+            Some("course")
+        );
+    }
+
+    #[gpui::test]
+    fn test_default_kernel_is_none_rather_than_a_guess(cx: &mut TestAppContext) {
+        let specs = vec![
+            python_env("global", false, true),
+            python_env("project-without-ipykernel", true, false),
+            jupyter_kernel("other"),
+        ];
+        assert_eq!(default_kernel_name(specs, None, Some("python3"), cx), None);
+    }
+
+    #[gpui::test]
+    fn test_default_kernel_keeps_the_selected_kernel(cx: &mut TestAppContext) {
+        let specs = vec![python_env("project", true, true)];
+        let selected = python_env("global", false, true);
+        assert_eq!(
+            default_kernel_name(specs, Some(selected), None, cx).as_deref(),
+            Some("global")
+        );
+    }
+
+    /// With no suitable kernel, nothing is launched and the notebook says so,
+    /// instead of starting a `python3` that could not run.
+    #[gpui::test]
+    async fn test_notebook_without_a_suitable_kernel_asks_for_one(cx: &mut TestAppContext) {
+        let (editor, cx) = open_test_notebook(None, cx).await;
+
+        pending_kernel(&editor, cx).await;
+        cx.run_until_parked();
+
+        editor.read_with(cx, |editor, _| {
+            assert!(
+                matches!(editor.kernel, Kernel::Shutdown),
+                "no kernel should be launched, instead status is: {}",
+                editor.kernel.status().to_string()
+            );
+            assert!(editor.kernel_specification.is_none());
+        });
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.run_current_cell(&Run, window, cx);
+        });
+
+        let cell = code_cell(&editor, cx);
+        cell.read_with(cx, |cell, cx| {
+            assert!(!cell.is_executing());
+            let nbformat::v4::Cell::Code { outputs, .. } = cell.to_nbformat_cell(cx) else {
+                panic!("expected a code cell");
+            };
+            match outputs.as_slice() {
+                [nbformat::v4::Output::Error(error)] => {
+                    let traceback = error.traceback.join("\n");
+                    assert!(
+                        traceback.contains("no kernel is selected"),
+                        "the cell should ask for a kernel, got: {traceback}"
+                    );
+                }
+                other => panic!("expected a single error output, got: {other:?}"),
+            }
+        });
+    }
+
+    /// A kernel takes seconds to start and a notebook is typically run as soon as
+    /// it opens, so a cell run while the kernel is still starting must be queued
+    /// until the launch resolves. Rejecting it outright dropped the execution: the
+    /// cell reported "the kernel is still starting" and never ran, even though the
+    /// kernel came up moments later.
+    #[gpui::test]
+    async fn test_run_cell_while_kernel_is_starting_queues_the_execution(cx: &mut TestAppContext) {
+        let (editor, cx) = notebook_with_missing_interpreter(cx).await;
+
+        let pending = pending_kernel(&editor, cx);
+
+        editor.update_in(cx, |editor, window, cx| {
+            editor.run_current_cell(&Run, window, cx);
+        });
+
+        let cell = code_cell(&editor, cx);
+        cell.read_with(cx, |cell, _| {
+            assert!(
+                cell.is_executing(),
+                "a cell run while the kernel is starting should be queued, not rejected"
+            );
+            assert!(
+                !cell.has_outputs(),
+                "queueing must not report an error output while the kernel is still starting"
+            );
+        });
+
+        // The launch fails here because the interpreter cannot be spawned. What
+        // matters is that the queued request was re-dispatched rather than dropped,
+        // so the cell ends up with the launch failure instead of hanging.
+        pending.await;
+        cx.run_until_parked();
+
+        cell.read_with(cx, |cell, cx| {
+            assert!(
+                !cell.is_executing(),
+                "the queued cell must not be left spinning once the kernel launch resolves"
+            );
+
+            let nbformat::v4::Cell::Code { outputs, .. } = cell.to_nbformat_cell(cx) else {
+                panic!("expected a code cell");
+            };
+            match outputs.as_slice() {
+                [nbformat::v4::Output::Error(error)] => {
+                    let traceback = error.traceback.join("\n");
+                    assert!(
+                        traceback.contains("the kernel failed to launch"),
+                        "the queued request should be re-dispatched to the resolved kernel, got: {traceback}"
+                    );
+                }
+                other => panic!("expected a single error output, got: {other:?}"),
+            }
+        });
+    }
+
+    /// A kernel runs in its own process session, so nothing reaps it when the app
+    /// exits, and entities are not dropped on quit, so the kernel's own `Drop`
+    /// never runs either. Without an explicit shutdown the interpreter outlived
+    /// Zed, holding its environment's memory until killed by hand.
+    #[gpui::test]
+    async fn test_kernel_is_killed_when_the_app_quits(cx: &mut TestAppContext) {
+        let (editor, cx) = notebook_with_missing_interpreter(cx).await;
+
+        let killed = Arc::new(AtomicBool::new(false));
+        editor.update(cx, |editor, _| {
+            editor.kernel = Kernel::RunningKernel(Box::new(FakeRunningKernel::new(killed.clone())));
+        });
+
+        // Quit through the real shutdown path so the `on_app_quit` registration is
+        // exercised. `cx.cx` is the underlying app context: `VisualTestContext`'s
+        // own `update` goes through the window, which shutdown has already torn
+        // down by the time it returns.
+        cx.cx.update(|cx| cx.shutdown());
+
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "quitting the app must shut the notebook's kernel down"
+        );
     }
 
     /// Opening a notebook as a single file (its own worktree) leaves the
@@ -2336,6 +2839,106 @@ mod tests {
         notebook_item.read_with(cx, |item, _| {
             assert_eq!(item.notebook.cells.len(), 1);
         });
+    }
+
+    /// Relative paths in a cell, like `pd.read_csv("train.csv")`, must resolve
+    /// next to the notebook, as they do in Jupyter and VS Code, not at the
+    /// worktree root.
+    #[gpui::test]
+    async fn suzuri_kernel_starts_in_the_notebook_directory(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+        });
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/course"),
+            json!({
+                "lectures": {
+                    "09-decision-tree": {
+                        "basics.ipynb": NOTEBOOK_WITH_ONE_CODE_CELL,
+                        "train.csv": "",
+                    },
+                },
+                "top.ipynb": NOTEBOOK_WITH_ONE_CODE_CELL,
+            }),
+        )
+        .await;
+        cx.update(|cx| ReplStore::init(fs.clone(), cx));
+
+        let cases = [
+            (
+                path!("/course"),
+                "lectures/09-decision-tree/basics.ipynb",
+                path!("/course/lectures/09-decision-tree"),
+            ),
+            (path!("/course"), "top.ipynb", path!("/course")),
+            (
+                path!("/course/lectures/09-decision-tree/basics.ipynb"),
+                "",
+                path!("/course/lectures/09-decision-tree"),
+            ),
+        ];
+
+        for (project_root, notebook_path, expected_directory) in cases {
+            let project = Project::test(fs.clone(), [project_root.as_ref()], cx).await;
+            let worktree_id = project.read_with(cx, |project, cx| {
+                project.worktrees(cx).next().unwrap().read(cx).id()
+            });
+
+            // Launching the kernel must fail harmlessly instead of spawning a real
+            // interpreter.
+            let missing_interpreter = path!("/nonexistent/python3");
+            let broken_spec = KernelSpecification::Jupyter(LocalKernelSpecification {
+                name: "python3".to_string(),
+                path: PathBuf::from(missing_interpreter),
+                kernelspec: JupyterKernelspec {
+                    argv: vec![missing_interpreter.to_string()],
+                    display_name: "Python 3".to_string(),
+                    language: "python".to_string(),
+                    interrupt_mode: None,
+                    metadata: None,
+                    env: None,
+                },
+            });
+            cx.update(|cx| {
+                ReplStore::global(cx).update(cx, |store, cx| {
+                    store.set_active_kernelspec(worktree_id, broken_spec, cx);
+                })
+            });
+
+            let notebook_item = cx
+                .update(|cx| {
+                    NotebookItem::try_open(
+                        &project,
+                        &ProjectPath {
+                            worktree_id,
+                            path: rel_path(notebook_path).into(),
+                        },
+                        cx,
+                    )
+                    .expect("ipynb files should be openable as notebooks")
+                })
+                .await
+                .expect("notebook should parse");
+
+            let window_cx = cx.add_empty_window();
+            window_cx.executor().allow_parking();
+            let editor = window_cx.update(|window, cx| {
+                cx.new(|cx| NotebookEditor::new(project.clone(), notebook_item, window, cx))
+            });
+
+            let working_directory =
+                window_cx.update(|_, cx| editor.read(cx).kernel_working_directory(cx));
+            assert_eq!(
+                working_directory,
+                PathBuf::from(expected_directory),
+                "kernel directory for {notebook_path:?} in {project_root:?}"
+            );
+        }
     }
 
     /// Notebooks must be saved through the project rather than through the

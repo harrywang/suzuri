@@ -20,16 +20,17 @@ use std::{
 
 use collections::{HashMap, HashSet};
 use editor::{
-    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey, RowHighlightOptions,
+    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey, RowHighlightOptions, RowMotion,
     display_map::{
-        BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId, RenderBlock,
+        BlockId, BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId,
+        RenderBlock, ToDisplayPoint as _,
     },
 };
 use gpui::{
     App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
     HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
     RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
-    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, img, rems,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, rems, svg,
 };
 use language::LanguageName;
 use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -58,8 +59,7 @@ struct LivePreviewFoldTag;
 const MARKDOWN: &str = "Markdown";
 const MARKDOWN_INLINE: &str = "Markdown-Inline";
 
-mod bibliography;
-pub use bibliography::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
+pub use citations::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MarkdownHeadingStyle {
@@ -191,6 +191,10 @@ fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
 pub struct MarkdownLivePreviewSettings {
     pub enabled: bool,
     pub heading_styles: MarkdownHeadingStyles,
+    pub block_quote_border_color: settings::MarkdownQuoteBorderColor,
+    pub block_quote_border_width: Option<f32>,
+    pub block_quote_gap: Option<f32>,
+    pub block_quote_paragraph_spacing: Option<f32>,
 }
 
 impl Settings for MarkdownLivePreviewSettings {
@@ -200,6 +204,16 @@ impl Settings for MarkdownLivePreviewSettings {
         let defaults = MarkdownHeadingStyles::default();
         Self {
             enabled: content.enabled.unwrap_or(true),
+            block_quote_border_color: content.block_quote_border_color.unwrap_or_default(),
+            block_quote_border_width: content
+                .block_quote_border_width
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            block_quote_gap: content
+                .block_quote_gap
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            block_quote_paragraph_spacing: content
+                .block_quote_paragraph_spacing
+                .filter(|value| value.is_finite() && *value >= 0.0),
             heading_styles: MarkdownHeadingStyles {
                 h1: defaults.h1.with_content(heading_content.h1),
                 h2: defaults.h2.with_content(heading_content.h2),
@@ -339,6 +353,64 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         }),
     );
 
+    // A vertical motion into a rendered quote must resolve against its source
+    // rows, so the quote is revealed before the editor's own handler runs. These
+    // listeners run ahead of the built-in ones and always pass the action on.
+    // Intercepting here rather than inside `Editor::move_up` and friends keeps
+    // `navigation.rs` identical to upstream.
+    use editor::actions::{
+        MoveDownByLines, MoveUpByLines, SelectDown, SelectDownByLines, SelectUp, SelectUpByLines,
+    };
+    use zed_actions::editor::{MoveDown, MoveUp};
+    for row_delta in [-1, 1] {
+        let weak_editor = cx.weak_entity();
+        let reveal = move |cx: &mut App| {
+            weak_editor
+                .update(cx, |editor, cx| {
+                    editor.prepare_vertical_navigation(row_delta, true, false, cx);
+                })
+                .log_err();
+            cx.propagate();
+        };
+        if row_delta < 0 {
+            let on_move = reveal.clone();
+            subscriptions.push(editor.register_action::<MoveUp>(move |_, _, cx| on_move(cx)));
+            subscriptions.push(editor.register_action::<SelectUp>(move |_, _, cx| reveal(cx)));
+        } else {
+            let on_move = reveal.clone();
+            subscriptions.push(editor.register_action::<MoveDown>(move |_, _, cx| on_move(cx)));
+            subscriptions.push(editor.register_action::<SelectDown>(move |_, _, cx| reveal(cx)));
+        }
+    }
+    // The by-lines motions keep their line count private to the editor crate, so
+    // the distance is unknown here: reveal every editable quote in the direction
+    // of travel. They are bound in no default keymap, and the blocks a motion
+    // does not land in are restored by the recompute its selection change triggers.
+    for upward in [true, false] {
+        let weak_editor = cx.weak_entity();
+        let reveal = move |cx: &mut App| {
+            weak_editor
+                .update(cx, |editor, cx| {
+                    reveal_editable_blocks_toward(editor, upward, cx);
+                })
+                .log_err();
+            cx.propagate();
+        };
+        if upward {
+            let on_move = reveal.clone();
+            subscriptions
+                .push(editor.register_action::<MoveUpByLines>(move |_, _, cx| on_move(cx)));
+            subscriptions
+                .push(editor.register_action::<SelectUpByLines>(move |_, _, cx| reveal(cx)));
+        } else {
+            let on_move = reveal.clone();
+            subscriptions
+                .push(editor.register_action::<MoveDownByLines>(move |_, _, cx| on_move(cx)));
+            subscriptions
+                .push(editor.register_action::<SelectDownByLines>(move |_, _, cx| reveal(cx)));
+        }
+    }
+
     // Local images are cached by path, so overwriting a file in place (say,
     // re-cropping a screenshot) would otherwise keep serving the bitmap
     // decoded on first render for the life of the process: gpui's app-level
@@ -349,13 +421,17 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     if let Some(project) = editor.project().cloned() {
         let bibliography = Bibliography::global(cx);
         Bibliography::ensure_project(&bibliography, &project, cx);
-        // Restyle citations when a `.bib` finishes parsing, so keys resolve
-        // (or stop resolving) without waiting for the next edit.
+        // Recompute when a `.bib` finishes parsing, so keys resolve (or stop
+        // resolving) and the reference list re-renders without waiting for
+        // the next edit.
         subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
-            let markers = editor
-                .addon::<LivePreviewAddon>()
-                .and_then(|addon| addon.markers.clone());
-            apply_emphasis_highlights(editor, markers.as_deref(), cx);
+            recompute(editor, cx);
+        }));
+        // A `.csl` file a note points at loads asynchronously; rendering
+        // switches from APA to it the moment it arrives.
+        let style_files = citations::StyleFiles::global(cx);
+        subscriptions.push(cx.observe(&style_files, |editor, _, cx| {
+            recompute(editor, cx);
         }));
         editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
             project.clone(),
@@ -379,14 +455,30 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                 let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
                     return;
                 };
-                let (changed_images, changed_notes, note_created, changed_bibs, removed_bibs) = {
+                let (
+                    changed_images,
+                    changed_notes,
+                    note_created,
+                    changed_bibs,
+                    removed_bibs,
+                    changed_styles,
+                ) = {
                     let worktree = worktree.read(cx);
                     let mut images = Vec::new();
                     let mut notes = Vec::new();
                     let mut created = false;
                     let mut bibs = Vec::new();
                     let mut removed_bibs = Vec::new();
+                    let mut styles = Vec::new();
                     for (path, _, change) in changes.iter() {
+                        // A style file edited or dropped in is read again
+                        // on the next render.
+                        if path.extension().is_some_and(|extension| extension == "csl")
+                            && *change != PathChange::Loaded
+                        {
+                            styles.push(worktree.absolutize(path));
+                            continue;
+                        }
                         // Unlike images and notes below, `.bib` files do want
                         // the initial scan's `Loaded`: a worktree that
                         // finishes scanning after the editor opened is how its
@@ -423,11 +515,17 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                             notes.push(absolute);
                         }
                     }
-                    (images, notes, created, bibs, removed_bibs)
+                    (images, notes, created, bibs, removed_bibs, styles)
                 };
 
                 if !changed_bibs.is_empty() {
                     Bibliography::reload_paths(&bibliography, project, changed_bibs, cx);
+                }
+                if !changed_styles.is_empty() {
+                    let style_files = citations::StyleFiles::global(cx);
+                    for path in changed_styles {
+                        citations::StyleFiles::forget(&style_files, &path, cx);
+                    }
                 }
                 for path in removed_bibs {
                     Bibliography::remove_path(&bibliography, &path, cx);
@@ -463,6 +561,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         image_cache,
         markers: None,
         applied_blocks: Vec::new(),
+        markdown_blocks: HashMap::default(),
         selected_image: None,
         active_cell: None,
         active_property: None,
@@ -495,6 +594,7 @@ struct LivePreviewAddon {
     image_cache: Entity<RetainAllImageCache>,
     markers: Option<Arc<MarkerSet>>,
     applied_blocks: Vec<AppliedBlock>,
+    markdown_blocks: HashMap<(usize, usize), (String, Entity<Markdown>, Subscription)>,
     /// The image widget currently selected (Obsidian-style click state),
     /// identified by its marker range.
     selected_image: Option<Range<Anchor>>,
@@ -534,7 +634,159 @@ struct LivePreviewAddon {
     _subscriptions: Vec<Subscription>,
 }
 
+impl LivePreviewAddon {
+    /// Rendered prose blocks whose source can be edited in place: a motion that
+    /// lands inside one must see its source rows, not the widget's.
+    fn editable_replacement_blocks(&self) -> Vec<(Range<Anchor>, CustomBlockId)> {
+        self.applied_blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockRenderKind::Markdown) && !block.below)
+            .map(|block| (block.range.clone(), block.block_id))
+            .collect()
+    }
+}
+
+fn reveal_editable_blocks_toward(editor: &mut Editor, upward: bool, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon::<LivePreviewAddon>() else {
+        return;
+    };
+    let candidates = addon.editable_replacement_blocks();
+    if candidates.is_empty() {
+        return;
+    }
+    let snapshot = editor.display_snapshot(cx);
+    let head_rows = editor
+        .selections
+        .all::<Point>(&snapshot)
+        .into_iter()
+        .map(|selection| selection.head().row)
+        .collect::<Vec<_>>();
+    let reveal = candidates
+        .into_iter()
+        .filter_map(|(range, id)| {
+            let start = range.start.to_point(&snapshot).row;
+            let end = range.end.to_point(&snapshot).row;
+            head_rows
+                .iter()
+                .any(|head| if upward { start <= *head } else { end >= *head })
+                .then_some(id)
+        })
+        .collect::<HashSet<_>>();
+    if !reveal.is_empty() {
+        editor.remove_blocks(reveal, None, cx);
+    }
+}
+
 impl Addon for LivePreviewAddon {
+    fn blocks_to_reveal_before(
+        &self,
+        motion: &RowMotion,
+        editor: &Editor,
+        cx: &mut Context<Editor>,
+    ) -> Vec<CustomBlockId> {
+        let candidates = self.editable_replacement_blocks();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let snapshot = editor.display_snapshot(cx);
+        let selections = editor.selections.all::<Point>(&snapshot);
+        match *motion {
+            RowMotion::Vertical {
+                row_delta,
+                display_lines,
+                inclusive_selection,
+            } => {
+                if row_delta == 0 {
+                    return Vec::new();
+                }
+                let fold_row = |point: Point, bias: text::Bias| {
+                    snapshot
+                        .fold_snapshot()
+                        .to_fold_point(snapshot.inlay_snapshot().to_inlay_point(point), bias)
+                        .row()
+                };
+                let targets = selections
+                    .into_iter()
+                    .map(|selection| {
+                        let head = if inclusive_selection
+                            && !selection.reversed
+                            && !selection.is_empty()
+                        {
+                            editor::movement::left(
+                                &snapshot,
+                                selection.end.to_display_point(&snapshot),
+                            )
+                            .to_point(&snapshot)
+                        } else {
+                            selection.head()
+                        };
+                        let (row, max_row) = if display_lines {
+                            (
+                                snapshot
+                                    .point_to_display_point(head, text::Bias::Left)
+                                    .row()
+                                    .0,
+                                snapshot.max_point().row().0,
+                            )
+                        } else {
+                            (
+                                fold_row(head, text::Bias::Left),
+                                snapshot.fold_snapshot().max_point().row(),
+                            )
+                        };
+                        i64::from(row)
+                            .saturating_add(row_delta)
+                            .clamp(0, i64::from(max_row)) as u32
+                    })
+                    .collect::<Vec<_>>();
+                candidates
+                    .into_iter()
+                    .filter_map(|(range, id)| {
+                        let lands_inside = if display_lines {
+                            let row = editor.row_for_block(id, cx)?;
+                            let block = snapshot.block_for_id(BlockId::Custom(id))?;
+                            let end = row.0.saturating_add(block.height());
+                            targets
+                                .iter()
+                                .any(|target| *target >= row.0 && *target < end)
+                        } else {
+                            let start = fold_row(range.start.to_point(&snapshot), text::Bias::Left);
+                            let end = fold_row(range.end.to_point(&snapshot), text::Bias::Right);
+                            targets
+                                .iter()
+                                .any(|target| *target >= start && *target <= end)
+                        };
+                        lands_inside.then_some(id)
+                    })
+                    .collect()
+            }
+            RowMotion::Linewise { rows } => {
+                let ranges = selections
+                    .into_iter()
+                    .map(|selection| {
+                        let end_row = if !selection.is_empty() && selection.end.column == 0 {
+                            selection.end.row.saturating_sub(1)
+                        } else {
+                            selection.end.row
+                        };
+                        selection.start.row..=end_row.saturating_add(rows)
+                    })
+                    .collect::<Vec<_>>();
+                candidates
+                    .into_iter()
+                    .filter_map(|(range, id)| {
+                        let start = range.start.to_point(&snapshot).row;
+                        let end = range.end.to_point(&snapshot).row;
+                        ranges
+                            .iter()
+                            .any(|range| start <= *range.end() && end >= *range.start())
+                            .then_some(id)
+                    })
+                    .collect()
+            }
+        }
+    }
+
     fn to_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -547,6 +799,9 @@ impl Addon for LivePreviewAddon {
 struct MarkerSet {
     inline: Vec<InlineMarker>,
     blocks: Vec<BlockMarker>,
+    /// The heading block that names the reference list, when the note has
+    /// one; `attach_references_block` turns it into the rendered list.
+    references_heading: Option<Range<Anchor>>,
     /// Ranges that get an always-on strikethrough text decoration: themes
     /// color `~~struck~~` spans but do not apply the actual line-through, and
     /// with the delimiters hidden there would otherwise be no visual cue.
@@ -587,6 +842,9 @@ struct MarkerSet {
     /// other inline constructs a tag has no syntax to hide: the `#` is part
     /// of the tag's name, so it is styled in place rather than concealed.
     tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -624,6 +882,11 @@ enum InlineKind {
         destination: LinkDestination,
         label: SharedString,
     },
+    /// A citation group (`[@key, p. 3; @other]` or a bare `@key`) rendered as
+    /// the note's CSL style's in-text form, `(Vaswani et al., 2017, p. 3)` or
+    /// `[1]`. The whole group is concealed; touching it hands back the
+    /// source with its key chips.
+    Citation { rendered: SharedString },
     /// A LaTeX formula (`$x$` or `$$x$$`), rendered as a typeset image.
     ///
     /// Rendering is asynchronous, so the placeholder reads whatever the shared
@@ -653,6 +916,14 @@ struct BlockMarker {
     /// Leading-whitespace columns of the first line, so nested widgets (e.g.
     /// a code block inside a list item) keep their indentation.
     indent_columns: u32,
+}
+
+/// The warning under a References list, with a link to what fixes it.
+#[derive(Clone, PartialEq)]
+struct ReferencesNote {
+    text: SharedString,
+    link_label: SharedString,
+    url: SharedString,
 }
 
 #[derive(Clone, PartialEq)]
@@ -695,6 +966,15 @@ enum BlockRenderKind {
         kind: CalloutKind,
         title: String,
         collapse: Option<bool>,
+    },
+    /// A `References` (or `Bibliography`) heading, rendered together with the
+    /// reference-list entries for every work the note cites, formatted in
+    /// the note's CSL style. Each item is `(key, rendered text)`.
+    References {
+        items: Vec<(SharedString, SharedString)>,
+        /// A line under the list, e.g. that the frontmatter names a style
+        /// that is not bundled and APA is showing instead.
+        note: Option<ReferencesNote>,
     },
     /// Display math (`$$...$$` alone on its lines), rendered as a centered
     /// typeset formula. Unlike other blocks, revealing its source does not
@@ -938,7 +1218,10 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
     let enabled = is_enabled(addon, cx);
 
     let markers = if enabled && !editor.read_only(cx) {
-        extract_markers(editor, cx).map(Arc::new)
+        extract_markers(editor, cx).map(|mut markers| {
+            attach_citation_rendering(&mut markers, editor, cx);
+            Arc::new(markers)
+        })
     } else {
         None
     };
@@ -964,6 +1247,7 @@ const CITATION: usize = 6;
 const HIGHLIGHT: usize = 7;
 const TAG: usize = 8;
 const CITATION_UNKNOWN: usize = 9;
+const CODE: usize = 10;
 const HEADING_STYLE_BASE: usize = 100;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
@@ -989,6 +1273,8 @@ fn apply_emphasis_highlights(
     // works in one.
     let highlight_background = cx.theme().status().warning.opacity(0.28);
     let tag_background = cx.theme().status().info_background;
+    // Same pill the markdown preview draws for inline code.
+    let code_background = cx.theme().colors().editor_foreground.opacity(0.08);
     let error_color = cx.theme().status().error;
 
     // A cite key that resolves to no `.bib` entry is the kind of silent error
@@ -1129,6 +1415,15 @@ fn apply_emphasis_highlights(
                 ..Default::default()
             },
         ),
+        (
+            CODE,
+            markers.map(|markers| markers.code.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                background_color: Some(code_background),
+                ..Default::default()
+            },
+        ),
     ];
     for (key, ranges, style) in sets {
         match ranges {
@@ -1214,12 +1509,27 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     let image_cache = addon.image_cache.clone();
     let callout_collapse = addon.callout_collapse.clone();
     let applied_blocks = std::mem::take(&mut addon.applied_blocks);
+    let mut markdown_blocks = std::mem::take(&mut addon.markdown_blocks);
 
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let Some(markers) = markers else {
         clear_decorations(editor, applied_blocks, cx);
         return;
     };
+
+    let markdown_ranges = markers
+        .blocks
+        .iter()
+        .filter_map(|marker| {
+            matches!(marker.kind, BlockRenderKind::Markdown).then(|| {
+                (
+                    marker.range.start.to_offset(&snapshot).0,
+                    marker.range.end.to_offset(&snapshot).0,
+                )
+            })
+        })
+        .collect::<HashSet<_>>();
+    markdown_blocks.retain(|range, _| markdown_ranges.contains(range));
 
     // Session restore can resurrect concealments saved as folds by older
     // builds as plain `⋯` folds this addon does not own; heal them whenever
@@ -1263,6 +1573,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             | InlineKind::Checkbox { .. }
             | InlineKind::Footnote { .. }
             | InlineKind::Link { .. }
+            | InlineKind::Citation { .. }
             | InlineKind::Math { .. } => &marker.range,
         };
         let span = reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
@@ -1276,14 +1587,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         // runs every frame; by the time it draws, the cache holds at least a
         // pending entry.
         if let InlineKind::Math { source, style } = &marker.kind {
-            let text_color = cx.theme().colors().editor_foreground;
             request_math_render(
                 MathKey {
                     source: source.clone(),
                     style: *style,
-                    color: u32::from(gpui::Rgba::from(text_color)),
                 },
-                text_color,
                 cx,
             );
         }
@@ -1382,6 +1690,20 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             source.push_str("\n\n");
             source.push_str(&markers.definitions);
         }
+        // The reuse check below compares sources, so the rendered entries
+        // ride along: a newly cited work or a style change re-renders.
+        if let BlockRenderKind::References { items, note } = &marker.kind {
+            for (_, text) in items {
+                source.push('\n');
+                source.push_str(text);
+            }
+            if let Some(note) = note {
+                source.push('\n');
+                source.push_str(&note.text);
+                source.push('\n');
+                source.push_str(&note.url);
+            }
+        }
         let embed = match &marker.kind {
             BlockRenderKind::Embed { target, section } => {
                 let state = embed_state(
@@ -1477,19 +1799,42 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 continue;
             }
             BlockRenderKind::Markdown => {
-                let markdown = cx.new(|cx| {
-                    Markdown::new_with_options(
-                        SharedString::from(source.clone()),
-                        language_registry.clone(),
-                        None,
-                        markdown::MarkdownOptions {
-                            parse_html: true,
-                            render_mermaid_diagrams: true,
-                            ..Default::default()
-                        },
-                        cx,
-                    )
-                });
+                let key = (
+                    marker.range.start.to_offset(&snapshot).0,
+                    marker.range.end.to_offset(&snapshot).0,
+                );
+                if !markdown_blocks
+                    .get(&key)
+                    .is_some_and(|(cached_source, _, _)| cached_source == &source)
+                {
+                    let markdown = cx.new(|cx| {
+                        Markdown::new_with_options(
+                            SharedString::from(source.clone()),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    });
+                    let subscription = cx.observe(&markdown, |editor, _, cx| {
+                        apply_decorations(editor, cx);
+                    });
+                    markdown_blocks.insert(key, (source.clone(), markdown, subscription));
+                }
+                let Some((_, markdown, _)) = markdown_blocks.get(&key) else {
+                    continue;
+                };
+                // A fresh Markdown entity is empty until its background parse
+                // finishes. Keep source visible rather than collapsing the block
+                // for a frame, and retain parsed content while editing its source.
+                if markdown.read(cx).is_parsing() {
+                    continue;
+                }
+                let markdown = markdown.clone();
                 render_markdown_block(
                     markdown,
                     weak_editor.clone(),
@@ -1577,6 +1922,14 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 marker.range.clone(),
                 marker.indent_columns,
             ),
+            BlockRenderKind::References { items, note } => render_references_block(
+                weak_editor.clone(),
+                marker.range.clone(),
+                plain_heading_text(source.lines().next().unwrap_or_default()),
+                items.clone(),
+                note.clone(),
+                marker.indent_columns,
+            ),
             BlockRenderKind::Frontmatter => {
                 render_frontmatter_block(weak_editor.clone(), marker.range.clone(), source.clone())
             }
@@ -1652,14 +2005,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 )
             }
             BlockRenderKind::Math { source } => {
-                let text_color = cx.theme().colors().editor_foreground;
                 request_math_render(
                     MathKey {
                         source: SharedString::from(source.clone()),
                         style: MathStyle::Display,
-                        color: u32::from(gpui::Rgba::from(text_color)),
                     },
-                    text_color,
                     cx,
                 );
                 render_math_block(
@@ -1667,6 +2017,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     marker.range.clone(),
                     SharedString::from(source.clone()),
                     below,
+                    marker.indent_columns,
                 )
             }
         };
@@ -1721,6 +2072,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
 
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
         addon.applied_blocks = new_applied_blocks;
+        addon.markdown_blocks = markdown_blocks;
     }
 }
 
@@ -2083,20 +2435,19 @@ fn embed_section(text: &str, section: &str) -> Option<String> {
 struct MathKey {
     source: SharedString,
     style: MathStyle,
-    /// Packed RGBA, since `Hsla` is not hashable and the color is baked into
-    /// the SVG's fill.
-    color: u32,
 }
 
 enum MathEntry {
     /// A background render is in flight; callers show the LaTeX source.
     Pending,
     Ready {
-        image: Arc<gpui::RenderImage>,
-        /// Fraction of the image's height that sits below the text baseline.
+        /// The formula as an SVG document, handed to `svg()` so that gpui
+        /// rasterizes it at the size it is actually drawn.
+        svg: Arc<[u8]>,
+        /// Fraction of the formula's height that sits below the text baseline.
         baseline_fraction: f32,
-        /// Width of the image in ems, used to size the inline element so it
-        /// takes exactly the space the glyphs occupy.
+        /// Width of the formula in ems, used to size the element so it takes
+        /// exactly the space the glyphs occupy.
         width_em: f32,
         height_em: f32,
     },
@@ -2117,10 +2468,13 @@ struct MathCache {
 
 impl gpui::Global for MathCache {}
 
-/// Em size the SVG is rasterized at. Larger than any realistic buffer font so
-/// the outlines stay crisp when the element scales them down to the line's
-/// actual size.
-const MATH_RASTER_EM: f32 = 64.0;
+/// Em size, in SVG user units, the formula's outlines are laid out in.
+///
+/// It sets only the coordinate scale of the vector document — `svg()` hands
+/// the outlines to gpui, which rasterizes them at whatever size the element is
+/// drawn — so any value works. It stays well above 1 so the emitted path
+/// coordinates keep their precision.
+const MATH_LAYOUT_EM: f32 = 64.0;
 
 /// Formulas render at this multiple of the buffer font size. The KaTeX fonts
 /// have a visibly smaller x-height than code fonts, so at 1:1 math looks
@@ -2133,7 +2487,7 @@ const MATH_FONT_SCALE: f32 = 1.21;
 ///
 /// Called from `apply_decorations` rather than from the placeholder closure:
 /// kicking off work during render would spawn a task on every frame.
-fn request_math_render(key: MathKey, text_color: Hsla, cx: &mut App) {
+fn request_math_render(key: MathKey, cx: &mut App) {
     if cx.default_global::<MathCache>().entries.contains_key(&key) {
         return;
     }
@@ -2141,42 +2495,29 @@ fn request_math_render(key: MathKey, text_color: Hsla, cx: &mut App) {
         .entries
         .insert(key.clone(), MathEntry::Pending);
 
-    let svg_renderer = cx.svg_renderer();
+    // `svg()` paints through an alpha mask and takes its color from the
+    // element's style, so the fill baked into the document never shows. That
+    // is why `MathKey` carries no color: one render serves every theme.
     let theme = MathTheme {
-        text_color,
-        font_size: MATH_RASTER_EM,
+        text_color: gpui::black(),
+        font_size: MATH_LAYOUT_EM,
     };
     cx.spawn(async move |cx| {
         let rendered = cx
             .background_spawn({
                 let key = key.clone();
-                async move {
-                    let rendered = math_render::render_to_svg(&key.source, key.style, &theme)?;
-                    let image = svg_renderer
-                        .render_single_frame(rendered.svg.as_bytes(), 1.0)
-                        .map_err(|error| anyhow::anyhow!("{error}"))?;
-                    anyhow::Ok((rendered, image))
-                }
+                async move { math_render::render_to_svg(&key.source, key.style, &theme) }
             })
             .await;
 
         cx.update(|cx| {
             let entry = match rendered {
-                Ok((rendered, image)) => {
-                    let total_em = rendered.height_em + rendered.depth_em;
-                    let size = image.size(0);
-                    let width_em = if total_em > 0.0 && size.height.0 > 0 {
-                        size.width.0 as f32 / size.height.0 as f32 * total_em
-                    } else {
-                        0.0
-                    };
-                    MathEntry::Ready {
-                        image,
-                        baseline_fraction: rendered.baseline_fraction(),
-                        width_em,
-                        height_em: total_em,
-                    }
-                }
+                Ok(rendered) => MathEntry::Ready {
+                    baseline_fraction: rendered.baseline_fraction(),
+                    width_em: rendered.width_em,
+                    height_em: rendered.height_em + rendered.depth_em,
+                    svg: Arc::from(rendered.svg.into_bytes()),
+                },
                 Err(_) => MathEntry::Failed,
             };
             cx.global_mut::<MathCache>().entries.insert(key, entry);
@@ -2214,6 +2555,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         // The label stands in for the link in the display text, so soft
         // wrapping and the cursor's column math see the width that is drawn.
         InlineKind::Link { label, .. } => Some(placeholder_display_text(label)),
+        InlineKind::Citation { rendered } => Some(placeholder_display_text(rendered)),
         InlineKind::Bullet
         | InlineKind::Checkbox { .. }
         | InlineKind::Footnote { .. }
@@ -2286,6 +2628,23 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                     .into_any_element()
             })
         }
+        InlineKind::Citation { rendered } => {
+            let rendered = rendered.clone();
+            Arc::new(move |_, _, cx: &mut App| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                let colors = cx.theme().colors();
+                // The same chip the key carries in source, so a rendered
+                // citation and a revealed one read as the same object.
+                div()
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(theme_settings.buffer_font_size(cx))
+                    .text_color(colors.text)
+                    .bg(colors.editor_document_highlight_read_background)
+                    .rounded_sm()
+                    .child(rendered.clone())
+                    .into_any_element()
+            })
+        }
         InlineKind::Footnote { label } => {
             let label = label.clone();
             Arc::new(move |_, _, cx: &mut App| {
@@ -2315,7 +2674,6 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                 let key = MathKey {
                     source: source.clone(),
                     style,
-                    color: u32::from(gpui::Rgba::from(text_color)),
                 };
                 let line_height = font_size * theme_settings.line_height();
                 let text_system = cx.text_system().clone();
@@ -2331,7 +2689,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
 
                 match cx.default_global::<MathCache>().entries.get(&key) {
                     Some(MathEntry::Ready {
-                        image,
+                        svg: document,
                         baseline_fraction,
                         width_em,
                         height_em,
@@ -2360,7 +2718,13 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                             .w(width)
                             .pt(pad_top)
                             .pb(pad_bottom)
-                            .child(img(ImageSource::Render(image.clone())).h(height).w(width))
+                            .child(
+                                svg()
+                                    .data(document)
+                                    .text_color(text_color)
+                                    .h(height)
+                                    .w(width),
+                            )
                             .into_any_element()
                     }
                     // While a render is in flight — and permanently for a
@@ -2398,6 +2762,13 @@ fn marker_content_key(kind: &InlineKind) -> u64 {
             let mut hasher = collections::FxHasher::default();
             label.hash(&mut hasher);
             4 + hasher.finish()
+        }
+        // A style change re-renders every group over unchanged ranges.
+        InlineKind::Citation { rendered } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            rendered.hash(&mut hasher);
+            6 + hasher.finish()
         }
         // Both take part: the label is what is drawn, the destination is
         // what a click opens, and either can change over an unchanged range.
@@ -2492,7 +2863,7 @@ fn render_markdown_block(
     image_cache: Entity<RetainAllImageCache>,
 ) -> RenderBlock {
     Arc::new(move |block_cx| {
-        let style = block_markdown_style(block_cx.window, block_cx.app);
+        let mut style = block_markdown_style(block_cx.window, block_cx.app);
         let editor = editor.clone();
         let start = range.start;
         let range = range.clone();
@@ -2500,9 +2871,45 @@ fn render_markdown_block(
         let image_cache = image_cache.clone();
         let gutter_width =
             block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
-        let max_width = block_cx.max_width;
+        // The scroll range can exceed the pane width because of other source
+        // lines. Rendered prose must wrap inside the visible editor instead.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width);
+        let max_width = block_cx
+            .max_width
+            .min((visible_width - block_cx.margins.right).max(gpui::px(1.)));
         let source_click_editor = editor.clone();
+        let is_quote = markdown
+            .read(block_cx.app)
+            .source()
+            .trim_start()
+            .starts_with('>');
+        if is_quote {
+            // Match the editor's rounded line height without forcing paragraph
+            // gaps onto whole rows.
+            style.base_text_style.line_height = block_cx.line_height.into();
+            style.container_style.text.line_height = Some(block_cx.line_height.into());
+            style.paragraph_line_height = block_cx.line_height.into();
+            if let Some(spacing) =
+                MarkdownLivePreviewSettings::get_global(block_cx.app).block_quote_paragraph_spacing
+            {
+                style.paragraph_spacing = gpui::px(spacing);
+            }
+        }
         div()
+            .debug_selector(|| "mdlp-prose-block".into())
+            // The editor rounds block heights up to whole rows. Share that
+            // unused space above and below a quote instead of leaving it below.
+            .when(is_quote, |block| {
+                block.flex().flex_col().justify_center().h_full()
+            })
             .pl(gutter_width)
             .w(max_width)
             .cursor_pointer()
@@ -3487,7 +3894,26 @@ fn render_table_block(
         // flex growth: growing distributed leftover space equally, which
         // ballooned short columns whenever the block was wider than the
         // table's content.
-        let column_width = |weight: f32| gpui::px((weight * 8. + 20.).max(48.));
+        // Cells render in the buffer font, so the per-character budget has to
+        // come from that font's own advance: a fixed estimate wraps every
+        // header as soon as the buffer font is larger than the guess.
+        // `block_cx.em_width` is the ink width of `m`, narrower than the
+        // advance, so it would still wrap.
+        let character_width = {
+            let settings = theme_settings::ThemeSettings::get_global(block_cx.app);
+            let font = settings.buffer_font.clone();
+            let font_size = settings.buffer_font_size(block_cx.app);
+            let text_system = block_cx.window.text_system();
+            let font_id = text_system.resolve_font(&font);
+            text_system
+                .ch_advance(font_id, font_size)
+                .log_err()
+                .unwrap_or(block_cx.em_width)
+        };
+        // `px_2` on both sides, plus the cell border and rounding slack.
+        let cell_padding = block_cx.window.rem_size() + gpui::px(6.);
+        let column_width =
+            move |weight: f32| (character_width * weight + cell_padding).max(gpui::px(48.));
         let handle_width = gpui::px(14.);
         // The grid needs its explicit content width: fixed-width cells only
         // overflow their rows visually, so without it the scroll container
@@ -4865,6 +5291,100 @@ fn move_image_to_row(
     }
 }
 
+fn render_references_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    heading: String,
+    items: Vec<(SharedString, SharedString)>,
+    note: Option<ReferencesNote>,
+    indent_columns: u32,
+) -> RenderBlock {
+    let heading = SharedString::from(heading);
+    Arc::new(move |block_cx| {
+        let editor = editor.clone();
+        let start = range.start;
+        let note = note.clone();
+        let text_color = block_cx.app.theme().colors().text;
+        let link_color = block_cx.app.theme().colors().text_accent;
+        let warning_color = block_cx.app.theme().status().warning;
+        let entry_gap = theme_settings::ThemeSettings::get_global(block_cx.app)
+            .buffer_font_size(block_cx.app)
+            * 1.2;
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        // `max_width` includes the editor's horizontal scroll range (see the
+        // table block), so text wrapped to it runs past the viewport. Wrap
+        // to the visible width instead.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width);
+        let text_width = (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
+            .max(gpui::px(200.));
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .flex()
+            .flex_col()
+            .cursor_pointer()
+            .text_color(text_color)
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
+            .child(
+                div()
+                    .w(text_width)
+                    .text_xl()
+                    .font_weight(FontWeight::BOLD)
+                    .pb_2()
+                    .child(heading.clone()),
+            )
+            // Entries wrap at the body's line height and sit Typst's
+            // paragraph spacing (1.2em) apart: enough that the next work
+            // starts visibly after a long author list, less than the blank
+            // line between body paragraphs.
+            .children(items.iter().enumerate().map(|(index, (_, text))| {
+                div()
+                    .w(text_width)
+                    .line_height(block_cx.line_height)
+                    .when(index + 1 < items.len(), |this| this.pb(entry_gap))
+                    .child(text.clone())
+            }))
+            .when_some(note, |this, note| {
+                let url = note.url.clone();
+                this.child(
+                    div()
+                        .w(text_width)
+                        .pt_1()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .text_color(warning_color)
+                        .child(note.text)
+                        .child(
+                            div()
+                                .id("mdlp-references-note-link")
+                                .cursor_pointer()
+                                .text_color(link_color)
+                                .underline()
+                                .child(note.link_label)
+                                // The block above reveals the heading's source
+                                // on mouse down; the link must not.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        ),
+                )
+            })
+            .into_any_element()
+    })
+}
+
 fn render_rule_block(
     editor: WeakEntity<Editor>,
     range: Range<Anchor>,
@@ -5428,10 +5948,32 @@ fn render_math_block(
     range: Range<Anchor>,
     source: SharedString,
     below: bool,
+    indent_columns: u32,
 ) -> RenderBlock {
     Arc::new(move |block_cx| {
         let editor = editor.clone();
         let start = range.start;
+        // The block's origin is the editor's left edge, so centering inside
+        // `max_width` alone would center on the gutter's midpoint rather than
+        // the text's. `max_width` also grows with the horizontal scroll range
+        // a long source line adds, so measure the visible text area instead:
+        // a replace block never extends the editor's scroll range, and a
+        // formula centered past the viewport could not be scrolled to.
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width + gutter_width);
+        let text_width = (visible_width - gutter_width - block_cx.margins.right)
+            .min(block_cx.max_width)
+            .max(block_cx.em_width);
+        let horizontal_padding = block_cx.em_width;
         let cx = &mut *block_cx.app;
         let theme_settings = theme_settings::ThemeSettings::get_global(cx);
         let font_size = theme_settings.buffer_font_size(cx);
@@ -5440,26 +5982,30 @@ fn render_math_block(
         let key = MathKey {
             source: source.clone(),
             style: MathStyle::Display,
-            color: u32::from(gpui::Rgba::from(text_color)),
         };
 
         let content = match cx.default_global::<MathCache>().entries.get(&key) {
             Some(MathEntry::Ready {
-                image,
+                svg: document,
                 width_em,
                 height_em,
                 ..
             }) => {
                 let math_em = font_size * MATH_FONT_SCALE;
-                let height = math_em * *height_em;
-                let width = math_em * *width_em;
-                img(ImageSource::Render(image.clone()))
-                    .h(height)
-                    .w(width)
+                let size = fit_display_math(
+                    gpui::size(math_em * *width_em, math_em * *height_em),
+                    text_width - horizontal_padding * 2.0,
+                );
+                svg()
+                    .data(document)
+                    .text_color(text_color)
+                    .h(size.height)
+                    .w(size.width)
                     .into_any_element()
             }
             _ if below => Empty.into_any_element(),
             _ => div()
+                .max_w_full()
                 .font(buffer_font)
                 .text_size(font_size)
                 .text_color(text_color)
@@ -5468,7 +6014,9 @@ fn render_math_block(
         };
 
         div()
-            .w(block_cx.max_width)
+            .w(gutter_width + text_width)
+            .pl(gutter_width + horizontal_padding)
+            .pr(horizontal_padding)
             .py(block_cx.line_height * 0.25)
             .flex()
             .justify_center()
@@ -5482,6 +6030,22 @@ fn render_math_block(
             .child(content)
             .into_any_element()
     })
+}
+
+/// Shrinks a display formula, keeping its aspect ratio, to the width it is
+/// centered in. A formula that is wider than the text area cannot be centered
+/// in it: flex centering overflows both sides equally, so the left half lands
+/// on the gutter and the right half past the viewport, where nothing can
+/// scroll to it. A formula that fits is returned unchanged.
+fn fit_display_math(
+    size: gpui::Size<gpui::Pixels>,
+    available: gpui::Pixels,
+) -> gpui::Size<gpui::Pixels> {
+    if size.width <= available || size.width <= gpui::Pixels::ZERO {
+        return size;
+    }
+    let scale = f32::from(available.max(gpui::Pixels::ZERO)) / f32::from(size.width);
+    gpui::size(size.width * scale, size.height * scale)
 }
 
 /// Parses frontmatter (YAML `---` or TOML `+++`) into Properties-card rows.
@@ -5563,6 +6127,34 @@ fn parse_frontmatter_properties(source: &str) -> Vec<FrontmatterProperty> {
         });
     }
     properties
+}
+
+/// Shortens ISO 8601 timestamps for the Properties card. Tools that write
+/// frontmatter from JavaScript store a plain date as `new Date(..)
+/// .toISOString()`, i.e. midnight UTC, so that case shows as the date alone
+/// rather than shifting to the previous day in western timezones. The source
+/// text is untouched; editing the value still shows it verbatim.
+fn display_scalar_property(text: &str) -> String {
+    use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, Utc};
+
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(text) {
+        let utc = timestamp.with_timezone(&Utc);
+        if utc.time() == NaiveTime::MIN {
+            return utc.format("%Y-%m-%d").to_string();
+        }
+        return timestamp
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+    }
+    if let Ok(timestamp) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f") {
+        return if timestamp.time() == NaiveTime::MIN {
+            timestamp.format("%Y-%m-%d").to_string()
+        } else {
+            timestamp.format("%Y-%m-%d %H:%M").to_string()
+        };
+    }
+    text.to_string()
 }
 
 fn unquote(value: &str) -> &str {
@@ -6011,7 +6603,7 @@ fn render_frontmatter_block(
                                 if text.is_empty() {
                                     this.text_color(colors.text_muted).child("Empty")
                                 } else {
-                                    this.child(SharedString::from(text.clone()))
+                                    this.child(SharedString::from(display_scalar_property(text)))
                                 }
                             })
                             .on_mouse_down(MouseButton::Left, move |_, window, cx| {
@@ -6226,12 +6818,35 @@ fn image_context_menu(
 
 fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
     let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
-    let buffer_font = theme_settings::ThemeSettings::get_global(cx)
-        .buffer_font
-        .clone();
-    let font_family = buffer_font.family;
-    style.base_text_style.font_family = font_family.clone();
-    style.container_style.text.font_family = Some(font_family.clone());
+    // A quote marker needs foreground contrast; theme borders can blend into the editor background.
+    let quote_settings = MarkdownLivePreviewSettings::get_global(cx);
+    style.block_quote_border_width = quote_settings.block_quote_border_width.map(gpui::px);
+    style.block_quote_gap = quote_settings.block_quote_gap.map(gpui::px);
+    let colors = cx.theme().colors();
+    style.block_quote_border_color =
+        match MarkdownLivePreviewSettings::get_global(cx).block_quote_border_color {
+            settings::MarkdownQuoteBorderColor::Accent => colors.text_accent,
+            settings::MarkdownQuoteBorderColor::Text => colors.editor_foreground,
+            settings::MarkdownQuoteBorderColor::MutedText => colors.text_muted,
+            settings::MarkdownQuoteBorderColor::LineNumber => colors.editor_line_number,
+        };
+    let settings = theme_settings::ThemeSettings::get_global(cx);
+    let font_family = settings.buffer_font.family.clone();
+    // Rendered prose must retain the source editor's metrics rather than the
+    // UI typography that MarkdownFont::Editor uses for general Markdown views.
+    let typography = TextStyleRefinement {
+        font_family: Some(font_family.clone()),
+        font_features: Some(settings.buffer_font.features.clone()),
+        font_fallbacks: settings.buffer_font.fallbacks.clone(),
+        font_size: Some(settings.buffer_font_size(cx).into()),
+        font_weight: Some(settings.buffer_font.weight),
+        line_height: Some(gpui::relative(settings.buffer_line_height.value())),
+        ..Default::default()
+    };
+    style.base_text_style.refine(&typography);
+    style.base_text_style.font_fallbacks = settings.buffer_font.fallbacks.clone();
+    style.container_style.text = typography;
+    style.paragraph_line_height = gpui::relative(settings.buffer_line_height.value());
     style.heading.text.font_family = Some(font_family.clone());
 
     let heading = |level| {
@@ -6288,6 +6903,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         prose_regions: Vec::new(),
         code_spans: Vec::new(),
         last_table_end_row: None,
+        references_heading: None,
         inline: Vec::new(),
         blocks: Vec::new(),
         strikethrough: Vec::new(),
@@ -6302,6 +6918,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations: Vec::new(),
         highlights: Vec::new(),
         tags: Vec::new(),
+        code: Vec::new(),
     };
 
     for layer in buffer_snapshot.syntax_layers() {
@@ -6322,6 +6939,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     let Extraction {
         inline,
         mut blocks,
+        references_heading,
         strikethrough,
         italic,
         bold,
@@ -6334,6 +6952,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations,
         highlights,
         tags,
+        code,
         ..
     } = extraction;
 
@@ -6364,6 +6983,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     Some(MarkerSet {
         inline,
         blocks,
+        references_heading,
         strikethrough,
         italic,
         bold,
@@ -6376,6 +6996,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bare_citations,
         highlights,
         tags,
+        code,
     })
 }
 
@@ -6391,6 +7012,7 @@ struct Extraction<'a> {
     last_table_end_row: Option<u32>,
     inline: Vec<InlineMarker>,
     blocks: Vec<BlockMarker>,
+    references_heading: Option<Range<Anchor>>,
     strikethrough: Vec<Range<Anchor>>,
     italic: Vec<Range<Anchor>>,
     bold: Vec<Range<Anchor>>,
@@ -6403,6 +7025,9 @@ struct Extraction<'a> {
     bare_citations: Vec<Range<Anchor>>,
     highlights: Vec<Range<Anchor>>,
     tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
 }
 
 impl Extraction<'_> {
@@ -6525,6 +7150,23 @@ impl Extraction<'_> {
         (start_row, end_row)
     }
 
+    /// Remembers the heading block just pushed when it names the reference
+    /// list. The last such heading wins, matching where a reference list
+    /// sits in a manuscript.
+    fn note_references_heading(&mut self, node: tree_sitter::Node) {
+        let title = self
+            .text
+            .get(node.byte_range())
+            .and_then(|text| text.lines().next())
+            .map(plain_heading_text)
+            .unwrap_or_default();
+        if is_references_heading(&title)
+            && let Some(block) = self.blocks.last()
+        {
+            self.references_heading = Some(block.range.clone());
+        }
+    }
+
     fn push_block_rows(
         &mut self,
         start_row: u32,
@@ -6559,10 +7201,12 @@ impl Extraction<'_> {
                     let (start_row, end_row) = self.node_rows(node);
                     let level = heading_level(node) as u8;
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
+                    self.note_references_heading(node);
                 }
                 "setext_heading" => {
                     let (start_row, end_row) = self.node_rows(node);
                     self.push_block_rows(start_row, end_row, 2, BlockRenderKind::Markdown);
+                    self.note_references_heading(node);
                 }
                 "thematic_break" => {
                     let (start_row, end_row) = self.node_rows(node);
@@ -6769,13 +7413,24 @@ impl Extraction<'_> {
                 }
                 "code_span" => {
                     self.code_spans.push(node.byte_range());
+                    let mut content = node.byte_range();
                     for index in 0..node.child_count() {
                         let Some(child) = node.child(index) else {
                             continue;
                         };
                         if child.kind() == "code_span_delimiter" {
-                            self.hide(child.byte_range(), node.byte_range());
+                            let delimiter = child.byte_range();
+                            if delimiter.start == content.start {
+                                content.start = delimiter.end;
+                            } else {
+                                content.end = content.end.min(delimiter.start);
+                            }
+                            self.hide(delimiter, node.byte_range());
                         }
+                    }
+                    if content.start < content.end {
+                        let range = self.anchor_range(content);
+                        self.code.push(range);
                     }
                 }
                 "inline_link" | "full_reference_link" | "collapsed_reference_link" => {
@@ -7529,6 +8184,227 @@ fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::N
         }
     }
 }
+
+/// A heading line's plain title: `## References ##` → `References`.
+fn plain_heading_text(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('#')
+        .trim_end_matches('#')
+        .trim()
+        .to_string()
+}
+
+fn is_references_heading(title: &str) -> bool {
+    matches!(
+        title.trim().to_ascii_lowercase().as_str(),
+        "references" | "bibliography" | "works cited" | "reference list"
+    )
+}
+
+/// Renders the note's citations in its CSL style (the frontmatter `csl:`
+/// key, else APA): every group whose keys all resolve becomes a concealed
+/// span drawn as the in-text form, and the reference-list heading, when the
+/// note has one, becomes a block that also lists the cited works. One pass
+/// renders both so numbered styles agree between marks and list.
+fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut App) {
+    if markers.citation_groups.is_empty() && markers.bare_citations.is_empty() {
+        return;
+    }
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let head_end = MultiBufferOffset(snapshot.len().0.min(FRONTMATTER_SCAN_BYTES));
+    let head: String = snapshot
+        .text_for_range(MultiBufferOffset(0)..head_end)
+        .collect();
+    let source = citations::document_style_source(&head);
+    let search_dirs = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .map(|buffer| citations::style_search_dirs(buffer.read(cx), cx))
+        .unwrap_or_default();
+    let Some(fs) = editor
+        .project()
+        .map(|project| project.read(cx).fs().clone())
+    else {
+        return;
+    };
+    let Some(resolved) = citations::resolve_style(source.as_ref(), &search_dirs, fs, cx) else {
+        return;
+    };
+    let style = resolved.style;
+    let style_problem = resolved.problem;
+    let bibliography = Bibliography::global(cx);
+    let bibliography = bibliography.read(cx);
+
+    // Every group in document order, bracketed and bare alike.
+    let mut groups: Vec<(Range<Anchor>, bool)> = markers
+        .citation_groups
+        .iter()
+        .map(|range| (range.clone(), true))
+        .chain(
+            markers
+                .bare_citations
+                .iter()
+                .map(|range| (range.clone(), false)),
+        )
+        .collect();
+    groups.sort_by_key(|(range, _)| range.start.to_offset(&snapshot));
+
+    // A group renders when its keys all resolve and its syntax has a slot in
+    // the renderer; otherwise its chips stay as they are.
+    let parsed: Vec<(Range<Anchor>, Option<Vec<citation_group::Item>>)> = groups
+        .into_iter()
+        .map(|(range, bracketed)| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let items = citation_group::parse(&text, bracketed).filter(|items| {
+                items
+                    .iter()
+                    .all(|item| bibliography.entry_for_rendering(&item.key).is_some())
+            });
+            (range, items)
+        })
+        .collect();
+    let cite_groups: Vec<Vec<citations::CiteItem<'_>>> = parsed
+        .iter()
+        .filter_map(|(_, items)| items.as_ref())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(citations::CiteItem {
+                        entry: bibliography.entry_for_rendering(&item.key)?,
+                        locator: item.locator.clone(),
+                        form: item.form,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if cite_groups.is_empty() {
+        return;
+    }
+    let rendered = citations::render_document(&cite_groups, &style);
+
+    let mut rendered_citations = rendered.citations.into_iter();
+    for (range, items) in &parsed {
+        if items.is_none() {
+            continue;
+        }
+        let Some(text) = rendered_citations.next() else {
+            break;
+        };
+        let start = range.start.to_offset(&snapshot);
+        let end = range.end.to_offset(&snapshot);
+        // The group's own bracket concealments would nest inside this one.
+        markers.inline.retain(|marker| {
+            let marker_start = marker.range.start.to_offset(&snapshot);
+            let marker_end = marker.range.end.to_offset(&snapshot);
+            !(start <= marker_start && marker_end <= end)
+        });
+        markers.inline.push(InlineMarker {
+            range: range.clone(),
+            kind: InlineKind::Citation {
+                rendered: SharedString::from(text),
+            },
+        });
+    }
+
+    let Some(heading) = markers.references_heading.clone() else {
+        return;
+    };
+    if rendered.bibliography.is_empty() {
+        return;
+    }
+    let items = rendered
+        .bibliography
+        .into_iter()
+        .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
+        .collect::<Vec<_>>();
+    let note = style_problem.map(|problem| ReferencesNote {
+        text: SharedString::from(problem.message),
+        link_label: SharedString::from(problem.link_label),
+        url: SharedString::from(problem.url),
+    });
+    if let Some(marker) = markers
+        .blocks
+        .iter_mut()
+        .find(|block| block.range == heading)
+    {
+        marker.height_estimate = 2 + items.len() as u32 * 3 + u32::from(note.is_some());
+        marker.kind = BlockRenderKind::References { items, note };
+    }
+}
+
+/// Reading a pandoc citation group into its items.
+mod citation_group {
+    pub struct Item {
+        pub key: String,
+        pub locator: Option<(citations::Locator, String)>,
+        pub form: citations::CiteForm,
+    }
+
+    /// `[@a, p. 3; -@b]` or a bare `@a`. `None` when any part is not
+    /// `[-]@key[, locator]`, e.g. a prefix like `[see @a]`, which the
+    /// renderer has no slot for.
+    pub fn parse(text: &str, bracketed: bool) -> Option<Vec<Item>> {
+        let inner = if bracketed {
+            text.strip_prefix('[')?.strip_suffix(']')?
+        } else {
+            text
+        };
+        let mut items = Vec::new();
+        for part in inner.split(';') {
+            let part = part.trim();
+            let (form, rest) = match part.strip_prefix('-') {
+                Some(rest) => (citations::CiteForm::YearOnly, rest),
+                None if bracketed => (citations::CiteForm::Normal, part),
+                None => (citations::CiteForm::Prose, part),
+            };
+            let rest = rest.strip_prefix('@')?;
+            let key_end = rest
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            '_' | ':'
+                                | '.'
+                                | '#'
+                                | '$'
+                                | '%'
+                                | '&'
+                                | '-'
+                                | '+'
+                                | '?'
+                                | '<'
+                                | '>'
+                                | '~'
+                                | '/'
+                        ))
+                })
+                .unwrap_or(rest.len());
+            let key = rest[..key_end].trim_end_matches([
+                ':', '.', '#', '$', '%', '&', '+', '?', '<', '>', '~', '/', '-',
+            ]);
+            if key.is_empty() {
+                return None;
+            }
+            let locator = match citations::parse_cite_suffix(&rest[key.len()..]) {
+                citations::CiteSuffix::None => None,
+                citations::CiteSuffix::Locator(kind, value) => Some((kind, value)),
+                citations::CiteSuffix::Unsupported => return None,
+            };
+            items.push(Item {
+                key: key.to_string(),
+                locator,
+                form,
+            });
+        }
+        (!items.is_empty()).then_some(items)
+    }
+}
+
+/// How much of the buffer's head is scanned for a frontmatter `csl:` key.
+const FRONTMATTER_SCAN_BYTES: usize = 4096;
 
 fn heading_level(node: tree_sitter::Node) -> u32 {
     for index in 0..node.child_count() {

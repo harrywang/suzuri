@@ -13,7 +13,8 @@ path = "src/markdown_live_preview.rs"
 
 [dependencies]
 anyhow.workspace = true
-biblatex.workspace = true
+chrono.workspace = true
+citations.workspace = true
 clock.workspace = true
 collections.workspace = true
 editor.workspace = true
@@ -36,8 +37,10 @@ ui.workspace = true
 urlencoding.workspace = true
 util.workspace = true
 workspace.workspace = true
+zed_actions.workspace = true
 
 [dev-dependencies]
+markdown = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 image.workspace = true

@@ -25,6 +25,13 @@
     },
   },
   {
+    "context": "CitationPicker || (CitationPicker > Picker > Editor) || (CitationPicker > Picker > menu)", // SUZURI
+    "use_key_equivalents": true,
+    "bindings": {
+      "tab": "picker::MultiSelectNext",
+    },
+  },
+  {
     "context": "FileFinder || (FileFinder > Picker > Editor) || (FileFinder > Picker > menu)",
     "use_key_equivalents": true,
     "bindings": {

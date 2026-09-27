@@ -190,6 +190,9 @@ pub struct SettingsContent {
     #[serde(flatten)]
     pub remote: RemoteSettingsContent,
 
+    /// Settings related to the command palette.
+    pub command_palette: Option<CommandPaletteSettingsContent>,
+
     /// Settings related to the file finder.
     pub file_finder: Option<FileFinderSettingsContent>,
 
@@ -243,6 +246,9 @@ pub struct SettingsContent {
 
     /// The settings for markdown live preview in the editor.
     pub markdown_live_preview: Option<MarkdownLivePreviewSettingsContent>,
+
+    /// The settings for inserting citations from Zotero into the vault library.
+    pub citations: Option<CitationsSettingsContent>,
 
     /// The settings for exporting markdown notes to other formats.
     pub markdown_export: Option<MarkdownExportSettingsContent>,
@@ -408,11 +414,12 @@ impl SettingsContent {
 fallible_options::flattened_deserialize!(SettingsContent {
     sections: { project, theme, extension, workspace, editor, remote },
     options: {
-        call_hierarchy, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
+        call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
-        // SUZURI: the fork's own settings sections must be listed here too.
-        markdown_live_preview, typeset_preview, markdown_export,
+        // SUZURI: begin. The fork's own settings sections must be listed here too.
+        markdown_live_preview, typeset_preview, citations, markdown_export,
+        // SUZURI: end
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
@@ -937,6 +944,15 @@ pub struct PanelSettingsContent {
 
 #[with_fallible_options]
 #[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
+pub struct CommandPaletteSettingsContent {
+    /// Whether to use command history ranking for sorting in the command palette.
+    ///
+    /// Default: true
+    pub use_command_history: Option<bool>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, Debug, PartialEq)]
 pub struct FileFinderSettingsContent {
     /// Whether to show file icons in the file finder.
     ///
@@ -1341,6 +1357,17 @@ pub struct MarkdownHeadingStylesSettingsContent {
     pub h6: Option<MarkdownHeadingStyleSettingsContent>,
 }
 
+// SUZURI: Reuse existing theme roles for quote borders without requiring theme authors to add tokens.
+#[derive(Clone, Copy, Default, PartialEq, Debug, JsonSchema, MergeFrom, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownQuoteBorderColor {
+    Accent,
+    #[default]
+    Text,
+    MutedText,
+    LineNumber,
+}
+
 /// The settings for markdown live preview in the editor.
 #[with_fallible_options]
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
@@ -1354,12 +1381,41 @@ pub struct MarkdownLivePreviewSettingsContent {
     // SUZURI: Keep the native heading settings during upstream schema updates.
     /// Typography overrides for rendered heading levels.
     pub heading_styles: Option<MarkdownHeadingStylesSettingsContent>,
+    // SUZURI: Optional live-preview quote styling without requiring theme changes.
+    /// Theme color role for plain block quote borders. Follows the active theme.
+    /// Default: "text". Other choices: "accent", "muted_text", "line_number".
+    pub block_quote_border_color: Option<MarkdownQuoteBorderColor>,
+    /// Plain block quote border width in logical pixels. Zero hides the border.
+    /// Default: null (use the renderer’s existing width). Must be non-negative.
+    pub block_quote_border_width: Option<f32>,
+    /// Gap between a plain block quote border and its text, in logical pixels.
+    /// Default: null (use the renderer’s existing spacing). Must be non-negative.
+    pub block_quote_gap: Option<f32>,
+    /// Space between paragraphs inside plain block quotes, in logical pixels.
+    /// Null uses the renderer's default (8px). Zero is allowed.
+    pub block_quote_paragraph_spacing: Option<f32>,
     /// Folder for attachments dropped onto a markdown buffer, relative to
     /// the note's folder. An empty string stores attachments directly in
     /// the note's folder.
     ///
     /// Default: "attachments"
     pub attachments_folder: Option<String>,
+}
+
+/// The settings for inserting citations from Zotero into the vault library.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct CitationsSettingsContent {
+    /// The BibLaTeX file every inserted citation is recorded in, relative to
+    /// the project root. Pandoc, LaTeX, Typst and the editor's own index all
+    /// read it directly.
+    ///
+    /// Default: "refs/refs.bib"
+    pub library: Option<String>,
+    /// Where Zotero's local API listens.
+    ///
+    /// Default: "http://127.0.0.1:23119"
+    pub zotero_url: Option<String>,
 }
 
 /// The settings for exporting markdown notes to other formats.
@@ -1373,13 +1429,6 @@ pub struct MarkdownExportSettingsContent {
     ///
     /// Default: "typst"
     pub pdf_engine: Option<String>,
-    /// The BibLaTeX file citations are resolved against, relative to the
-    /// project root. When it exists, Pandoc formats every `[@key]` from it
-    /// in the style the note's frontmatter names and appends the reference
-    /// list.
-    ///
-    /// Default: "refs/refs.bib"
-    pub bibliography: Option<String>,
 }
 
 /// The settings for live Typst and LaTeX preview.
@@ -1612,8 +1661,6 @@ impl<T: Clone> merge_from::MergeFrom for ExtendingVec<T> {
     }
 }
 
-pub const REST_OF_FILE_SCAN_EXCLUSIONS: &str = "...";
-
 // A SplicingVec in the settings replaces the value it merges over, except that
 // a `...` entry expands to that previous value.
 //
@@ -1626,6 +1673,10 @@ pub const REST_OF_FILE_SCAN_EXCLUSIONS: &str = "...";
 // repeating it.
 #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SplicingVec(pub Vec<String>);
+
+impl SplicingVec {
+    pub const REST: &str = "...";
+}
 
 impl From<Vec<String>> for SplicingVec {
     fn from(vec: Vec<String>) -> Self {
@@ -1640,7 +1691,7 @@ impl merge_from::MergeFrom for SplicingVec {
             .0
             .iter()
             .flat_map(|entry| {
-                if entry == REST_OF_FILE_SCAN_EXCLUSIONS {
+                if entry == Self::REST {
                     inherited.clone()
                 } else {
                     vec![entry.clone()]

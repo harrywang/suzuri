@@ -27,6 +27,7 @@ mod preprocess;
 
 pub use pandoc::Format;
 
+use pandoc::CslInput;
 use preprocess::{Preprocessed, Vault};
 
 /// Typst rather than a LaTeX engine: the live preview already provisions it,
@@ -34,21 +35,11 @@ use preprocess::{Preprocessed, Vault};
 /// of a TeX Live installation.
 pub const DEFAULT_PDF_ENGINE: &str = "typst";
 
-/// Where the vault's bibliography lives unless settings say otherwise,
-/// relative to the project root.
-pub const DEFAULT_BIBLIOGRAPHY: &str = "refs/refs.bib";
-
-/// The citation style used when a document names none.
-const DEFAULT_STYLE: &str = "apa";
-
 /// Settings for markdown export.
 #[derive(Clone, Debug, PartialEq, RegisterSetting)]
 pub struct MarkdownExportSettings {
     /// The program Pandoc typesets PDFs with.
     pub pdf_engine: String,
-    /// The BibLaTeX file citations are resolved against, relative to the
-    /// project root.
-    pub bibliography: String,
 }
 
 impl settings::Settings for MarkdownExportSettings {
@@ -59,61 +50,39 @@ impl settings::Settings for MarkdownExportSettings {
                 .pdf_engine
                 .filter(|engine| !engine.trim().is_empty())
                 .unwrap_or_else(|| DEFAULT_PDF_ENGINE.to_string()),
-            bibliography: content
-                .bibliography
-                .filter(|path| !path.trim().is_empty())
-                .unwrap_or_else(|| DEFAULT_BIBLIOGRAPHY.to_string()),
         }
     }
 }
 
-/// The style a document asks for in its frontmatter: `csl: ieee`, or
-/// pandoc's `csl: ieee.csl`, or `citation-style: ieee`. Only the leading
-/// frontmatter block is read.
-///
-/// This and [`style_xml`] duplicate small pieces of the citations crate so
-/// export can merge on its own rather than wait behind that branch. When
-/// citations lands, delete both and import its versions.
-fn document_style(text: &str) -> Option<String> {
-    let mut lines = text.lines();
-    let opener = lines.next()?.trim();
-    if opener != "---" && opener != "+++" {
-        return None;
+/// The CSL Pandoc should format with, following the preview's own rules: a
+/// `.csl` file the note names is used as it is when it exists, a bundled
+/// style is serialized by name, and anything unresolvable falls back to the
+/// default so the exported references never come out in a style the note
+/// did not ask for.
+fn citation_style(text: &str, search_directories: &[PathBuf]) -> Option<CslInput> {
+    use citations::StyleSource;
+    match citations::document_style_source(text) {
+        Some(StyleSource::File(relative)) => {
+            let existing = citations::style_file_candidates(&relative, search_directories)
+                .into_iter()
+                .find(|candidate| candidate.exists());
+            if let Some(path) = existing {
+                return Some(CslInput::File(path));
+            }
+            // A missing file means the bundled style of the same name, as in
+            // the preview, so `styles/ieee.csl` still means IEEE.
+            let stem = citations::document_style(text)?;
+            bundled_or_default(&stem)
+        }
+        Some(StyleSource::Bundled(name)) => bundled_or_default(&name),
+        None => citations::style_xml(citations::DEFAULT_STYLE).map(CslInput::Xml),
     }
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" || trimmed == "+++" || trimmed == "..." {
-            break;
-        }
-        let Some((key, value)) = trimmed.split_once(':').or_else(|| trimmed.split_once('=')) else {
-            continue;
-        };
-        if !matches!(key.trim(), "csl" | "citation-style" | "citation_style") {
-            continue;
-        }
-        let value = value
-            .trim()
-            .trim_matches(|character| character == '"' || character == '\'');
-        let name = value
-            .rsplit('/')
-            .next()
-            .unwrap_or(value)
-            .trim_end_matches(".csl")
-            .trim();
-        if !name.is_empty() {
-            return Some(name.to_string());
-        }
-    }
-    None
 }
 
-/// The bundled style called `name` as CSL XML, re-serialized from
-/// hayagriva's archive so Pandoc formats references in the same style the
-/// preview renders.
-fn style_xml(name: &str) -> Option<String> {
-    use hayagriva::archive::ArchivedStyle;
-    let name = name.trim().trim_end_matches(".csl").to_ascii_lowercase();
-    ArchivedStyle::by_name(&name)?.get().to_xml().ok()
+fn bundled_or_default(name: &str) -> Option<CslInput> {
+    citations::style_xml(name)
+        .or_else(|| citations::style_xml(citations::DEFAULT_STYLE))
+        .map(CslInput::Xml)
 }
 
 actions!(
@@ -163,7 +132,7 @@ struct Request {
     output: PathBuf,
     resource_directory: PathBuf,
     bibliography: Option<PathBuf>,
-    csl: Option<String>,
+    csl: Option<CslInput>,
     pdf_engine: String,
     missing_embeds: Vec<String>,
 }
@@ -236,7 +205,9 @@ fn build_request(
     };
     let project = workspace.project().clone();
 
-    let Some((path, text, worktree_root)) = read_editor(&editor, &project, cx) else {
+    let Some((path, text, worktree_root, style_search_directories)) =
+        read_editor(&editor, &project, cx)
+    else {
         return Err("Save the note first — export works on the file on disk.".to_string());
     };
     if !is_markdown(&path) {
@@ -252,14 +223,13 @@ fn build_request(
 
     let settings = MarkdownExportSettings::get_global(cx).clone();
     let bibliography = worktree_root.as_ref().and_then(|root| {
-        let library = root.join(&settings.bibliography);
+        let library = root.join(&citations::CitationsSettings::get_global(cx).library);
         library.exists().then_some(library)
     });
     // Only worth resolving when there is a bibliography to format against.
-    let csl = bibliography.as_ref().and_then(|_| {
-        let name = document_style(&text).unwrap_or_else(|| DEFAULT_STYLE.to_string());
-        style_xml(&name)
-    });
+    let csl = bibliography
+        .as_ref()
+        .and_then(|_| citation_style(&text, &style_search_directories));
 
     Ok(Request {
         format,
@@ -277,7 +247,7 @@ fn read_editor(
     editor: &Entity<Editor>,
     project: &Entity<Project>,
     cx: &App,
-) -> Option<(PathBuf, String, Option<PathBuf>)> {
+) -> Option<(PathBuf, String, Option<PathBuf>, Vec<PathBuf>)> {
     let editor = editor.read(cx);
     let buffer = editor.buffer().read(cx).as_singleton()?;
     let buffer = buffer.read(cx);
@@ -287,7 +257,10 @@ fn read_editor(
         .read(cx)
         .worktree_for_id(file.worktree_id(cx), cx)
         .map(|worktree| worktree.read(cx).abs_path().to_path_buf());
-    Some((path, buffer.text(), worktree_root))
+    // The same folders the preview searches for a `.csl` file, so an export
+    // never formats in a different style than the note shows on screen.
+    let style_search_directories = citations::style_search_dirs(buffer, cx);
+    Some((path, buffer.text(), worktree_root, style_search_directories))
 }
 
 fn is_markdown(path: &Path) -> bool {
@@ -626,8 +599,9 @@ mod tests {
         );
         let store = settings::SettingsStore::new(cx, &defaults);
         cx.set_global(store);
-        let settings = MarkdownExportSettings::get_global(cx);
-        assert_eq!(settings.pdf_engine, DEFAULT_PDF_ENGINE);
-        assert_eq!(settings.bibliography, DEFAULT_BIBLIOGRAPHY);
+        assert_eq!(
+            MarkdownExportSettings::get_global(cx).pdf_engine,
+            DEFAULT_PDF_ENGINE
+        );
     }
 }

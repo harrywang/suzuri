@@ -1,5 +1,4 @@
 use super::*;
-use editor::display_map::ToDisplayPoint as _;
 use editor::test::editor_test_context::EditorTestContext;
 use gpui::{Modifiers, TestAppContext, UpdateGlobal as _};
 use language::{Language, LanguageConfig};
@@ -625,6 +624,34 @@ async fn test_frontmatter_renders_as_block(cx: &mut TestAppContext) {
     });
     cx.executor().run_until_parked();
     assert_eq!(applied_block_count(&mut cx), 0);
+}
+
+#[test]
+fn test_frontmatter_timestamps_display_compactly() {
+    assert_eq!(
+        display_scalar_property("2026-09-26T00:00:00.000Z"),
+        "2026-09-26"
+    );
+    assert_eq!(display_scalar_property("2026-09-26T00:00:00"), "2026-09-26");
+    assert_eq!(
+        display_scalar_property("2026-09-26T14:30:15"),
+        "2026-09-26 14:30"
+    );
+    let with_offset = chrono::DateTime::parse_from_rfc3339("2026-09-26T14:30:00Z")
+        .map(|timestamp| {
+            timestamp
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string()
+        })
+        .ok();
+    assert_eq!(
+        Some(display_scalar_property("2026-09-26T14:30:00Z")),
+        with_offset
+    );
+    assert_eq!(display_scalar_property("2026-09-26"), "2026-09-26");
+    assert_eq!(display_scalar_property("Some Note"), "Some Note");
+    assert_eq!(display_scalar_property("4.5"), "4.5");
 }
 
 #[test]
@@ -3547,6 +3574,54 @@ fn highlighted_texts(
 }
 
 #[gpui::test]
+async fn test_references_heading_lists_the_cited_works(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: apa\n---\n\nAs shown in [@vaswani2017attention].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                concat!(
+                    "@article{vaswani2017attention,\n  title = {Attention Is All You Need},\n",
+                    "  author = {Vaswani, Ashish and Shazeer, Noam},\n  date = {2017},\n",
+                    "  journaltitle = {NeurIPS},\n}\n",
+                    "@book{uncited1984,\n  title = {Not Cited},\n  author = {Nobody, Ann},\n",
+                    "  date = {1984},\n}\n"
+                ),
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let items = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { items, .. } => Some(items.clone()),
+                _ => None,
+            })
+        })
+        .expect("the References heading becomes a references block");
+    assert_eq!(items.len(), 1, "only cited works are listed: {items:?}");
+    assert_eq!(items[0].0.as_ref(), "vaswani2017attention");
+    assert!(
+        items[0]
+            .1
+            .starts_with("Vaswani, A., & Shazeer, N. (2017). Attention Is All You Need."),
+        "{}",
+        items[0].1
+    );
+}
+
+#[gpui::test]
 async fn test_cite_keys_resolve_against_the_vault_bibliography(cx: &mut TestAppContext) {
     use project::Fs as _;
 
@@ -3907,9 +3982,12 @@ async fn test_hovering_a_cite_key_shows_the_reference_card(cx: &mut TestAppConte
         .and_then(|hover| hover.contents.first())
         .map(|block| block.text.clone())
         .unwrap_or_default();
+    // The card is the reference rendered in the note's CSL style (APA when
+    // the frontmatter names none), plus its in-text form.
     assert!(
-        text.contains("A Study of Things") && text.contains("Jane Smith") && text.contains("2020"),
-        "hover card should carry the reference, got {text:?}"
+        text.contains("Smith, J. (2020). A Study of Things.")
+            && text.contains("**In text:** (Smith, 2020)"),
+        "hover card should carry the rendered reference, got {text:?}"
     );
 
     // On the email's lookalike key: no card (the request delegates).
@@ -4072,8 +4150,7 @@ async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) 
     ];
     for (text, expected) in cases {
         let buffer = cx.new(|cx| language::Buffer::local(*text, cx));
-        let start =
-            cx.update(|cx| crate::bibliography::citation_key_start(buffer.read(cx), text.len()));
+        let start = cx.update(|cx| citations::citation_key_start(buffer.read(cx), text.len()));
         assert_eq!(start, *expected, "context detection for {text:?}");
     }
 }
@@ -4424,7 +4501,7 @@ async fn image_sizes_across_eviction(
     struct ImageProbe(ImageSource);
     impl Render for ImageProbe {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            img(self.0.clone())
+            gpui::img(self.0.clone())
         }
     }
 
@@ -5024,6 +5101,52 @@ async fn test_narrow_table_columns_take_content_width(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_table_columns_fit_their_widest_cell(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    // A large buffer font is the case a fixed per-character estimate gets
+    // wrong: at the default size a stale guess still happens to be wide
+    // enough.
+    cx.cx.update(|_, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.theme.buffer_font_size = Some(22.0.into());
+            });
+        });
+    });
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | Outlook | Humidity | Windy |
+        | --- | --- | --- |
+        | overcast | normal | FALSE |
+    "});
+    cx.executor().run_until_parked();
+
+    // Column widths are budgeted per character, so they have to use the
+    // buffer font's advance: any narrower estimate wraps the widest cell.
+    let advance = cx.update_editor(|_, window, cx| {
+        let settings = theme_settings::ThemeSettings::get_global(cx);
+        let font_id = window.text_system().resolve_font(&settings.buffer_font);
+        window
+            .text_system()
+            .ch_advance(font_id, settings.buffer_font_size(cx))
+            .expect("buffer font has a '0' glyph")
+    });
+
+    for (column, widest) in [(0, "overcast"), (1, "Humidity"), (2, "FALSE")] {
+        let bounds = cx
+            .cx
+            .debug_bounds(format!("mdlp-cell-h-{column}").leak())
+            .expect("header cell rendered");
+        assert!(
+            bounds.size.width >= advance * widest.chars().count() as f32,
+            "column {column} must fit {widest:?} without wrapping, got {:?}",
+            bounds.size.width
+        );
+    }
+}
+
+#[gpui::test]
 async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
@@ -5108,6 +5231,79 @@ async fn test_link_label_wider_than_the_wrap_width_does_not_panic(cx: &mut TestA
 }
 
 #[gpui::test]
+async fn test_block_quote_adjacent_paragraph_audit(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    for before in ["\n", "\n\n"] {
+        for after in ["\n", "\n\n"] {
+            cx.set_state(&format!("ˇPreceding paragraph.{before}> Quoted paragraph.\n>\n> — Attribution, [source](https://example.com){after}Following paragraph."));
+            cx.executor().run_until_parked();
+            let sources = cx.update_editor(|editor, _, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                extract_markers(editor, cx)
+                    .unwrap()
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        snapshot
+                            .text_for_range(
+                                block.range.start.to_offset(&snapshot)
+                                    ..block.range.end.to_offset(&snapshot),
+                            )
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>()
+            });
+            assert_eq!(
+                sources.len(),
+                1,
+                "before={before:?}, after={after:?}: {sources:?}"
+            );
+            assert!(sources[0].starts_with("> Quoted paragraph."), "{sources:?}");
+            assert_eq!(
+                applied_block_count(&mut cx),
+                1,
+                "before={before:?}, after={after:?}"
+            );
+            cx.set_state(&format!("Preceding paragraph.{before}> Quoted paragraph.\n>\n> — Attribution, [source](https://example.com){after}ˇFollowing paragraph."));
+            cx.executor().run_until_parked();
+            assert_eq!(
+                applied_block_count(&mut cx),
+                usize::from(after == "\n\n"),
+                "following paragraph cursor: before={before:?}, after={after:?}"
+            );
+        }
+    }
+}
+
+#[gpui::test]
+async fn test_block_prose_uses_editor_typography(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.cx.update(|window, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.theme.ui_font_size = Some(12.0.into());
+                content.theme.buffer_font_size = Some(21.0.into());
+                content.theme.buffer_font_weight = Some(settings::FontWeightContent::SEMIBOLD);
+                content.theme.buffer_line_height = Some(settings::BufferLineHeight::Custom(1.4));
+            });
+        });
+        let style = block_markdown_style(window, cx);
+        assert_eq!(style.base_text_style.font_size, gpui::px(21.0).into());
+        assert_eq!(style.base_text_style.font_weight, FontWeight::SEMIBOLD);
+        assert_eq!(style.base_text_style.line_height, gpui::relative(1.4));
+        assert_eq!(style.paragraph_line_height, gpui::relative(1.4));
+        assert_eq!(
+            style.container_style.text.font_size,
+            Some(gpui::px(21.0).into())
+        );
+        assert_eq!(
+            style.container_style.text.line_height,
+            Some(gpui::relative(1.4))
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_link_label_over_128_bytes_does_not_panic(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     // The tab map tracks a chunk's characters in a `u128` bitmap, so a
@@ -5159,4 +5355,753 @@ async fn test_soft_wrapped_line_of_links_before_a_heading_does_not_panic(cx: &mu
     cx.update_editor(|editor, window, cx| {
         editor.snapshot(window, cx);
     });
+}
+
+#[gpui::test]
+async fn test_quote_waits_for_parse_and_reuses_renderer(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("Before\n> ˇfirst\n>\n> last\n\nAfter");
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(4, 0)..Point::new(4, 0)]);
+        });
+        apply_decorations(editor, cx);
+        let addon = editor.addon::<LivePreviewAddon>().unwrap();
+        assert!(
+            addon.applied_blocks.is_empty(),
+            "source must remain visible while parsing"
+        );
+        assert_eq!(addon.markdown_blocks.len(), 1);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    cx.update_editor(|editor, window, cx| {
+        let renderer = editor
+            .addon::<LivePreviewAddon>()
+            .unwrap()
+            .markdown_blocks
+            .values()
+            .next()
+            .unwrap()
+            .1
+            .entity_id();
+        for row in [3, 4] {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([Point::new(row, 0)..Point::new(row, 0)]);
+            });
+            apply_decorations(editor, cx);
+            let addon = editor.addon::<LivePreviewAddon>().unwrap();
+            let markdown = &addon.markdown_blocks.values().next().unwrap().1;
+            assert_eq!(markdown.entity_id(), renderer);
+            assert!(!markdown.read(cx).is_parsing());
+            assert_eq!(addon.applied_blocks.len(), usize::from(row == 4));
+        }
+    });
+}
+
+#[gpui::test]
+async fn test_quote_arrow_navigation_uses_source_rows(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("Before\n\n> text\n>\n>\n>\n> line\nˇ\nAfter");
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    cx.dispatch_action(zed_actions::editor::MoveUp);
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest_anchor()
+                .head()
+                .to_point(&snapshot)
+                .row,
+            6
+        );
+    });
+    cx.executor().run_until_parked();
+    cx.set_state("Before\nˇ\n> text\n>\n> line\n\nAfter");
+    cx.executor().run_until_parked();
+    cx.dispatch_action(zed_actions::editor::MoveDown);
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        assert_eq!(
+            editor
+                .selections
+                .newest_anchor()
+                .head()
+                .to_point(&snapshot)
+                .row,
+            2
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_commonmark_quote_structure_and_reveal(cx: &mut TestAppContext) {
+    use markdown::parser::{MarkdownEvent, MarkdownTag};
+
+    let mut cx = markdown_test_context(cx).await;
+    // CommonMark 0.31.2, examples 239–244 and 250: blank quoted lines
+    // separate paragraphs, while unquoted blank lines separate quote blocks.
+    for (source, widgets, paragraphs, quotes) in [
+        (">", 1, 0, 1),
+        (">\n>\n>", 1, 0, 1),
+        ("> text\n>", 1, 1, 1),
+        ("> text\n> line", 1, 1, 1),
+        ("> text\n>\n> line", 1, 2, 1),
+        ("> text\n> \n> line", 1, 2, 1),
+        ("> text\n>\n>\n>\n> line", 1, 2, 1),
+        ("> text\n\n> line", 2, 2, 2),
+        ("> text\n>> nested", 1, 2, 2),
+        ("> text\n>>", 1, 1, 2),
+        ("> text\n\n>", 2, 1, 2),
+        (">\n>text", 1, 1, 1),
+    ] {
+        cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
+        cx.executor().run_until_parked();
+        assert_eq!(applied_block_count(&mut cx), widgets, "{source:?}");
+        cx.update_editor(|editor, _, cx| {
+            let addon = editor.addon::<LivePreviewAddon>().unwrap();
+            let mut paragraph_count = 0;
+            let mut quote_count = 0;
+            for (_, markdown, _) in addon.markdown_blocks.values() {
+                for (_, event) in markdown.read(cx).parsed_markdown().events.iter() {
+                    match event {
+                        MarkdownEvent::Start(MarkdownTag::Paragraph) => paragraph_count += 1,
+                        MarkdownEvent::Start(MarkdownTag::BlockQuote(_)) => quote_count += 1,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(paragraph_count, paragraphs, "{source:?}");
+            assert_eq!(quote_count, quotes, "{source:?}");
+        });
+        cx.set_state(&format!("Before\n\nˇ{source}\n\nAfter"));
+        cx.executor().run_until_parked();
+        assert_eq!(
+            applied_block_count(&mut cx),
+            widgets - 1,
+            "reveal {source:?}"
+        );
+        cx.set_state(&format!("Before\n\n{source}\n\nˇAfter"));
+        cx.executor().run_until_parked();
+        assert_eq!(applied_block_count(&mut cx), widgets, "leave {source:?}");
+    }
+}
+
+#[gpui::test]
+async fn test_quote_border_color_theme_roles(cx: &mut TestAppContext) {
+    use settings::MarkdownQuoteBorderColor::*;
+    let mut cx = markdown_test_context(cx).await;
+    for role in [
+        None,
+        Some(Text),
+        Some(MutedText),
+        Some(LineNumber),
+        Some(Accent),
+        None,
+    ] {
+        cx.cx.update(|window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content
+                        .markdown_live_preview
+                        .get_or_insert_default()
+                        .block_quote_border_color = role;
+                });
+            });
+            let colors = cx.theme().colors();
+            let expected = match role {
+                None | Some(Text) => colors.editor_foreground,
+                Some(MutedText) => colors.text_muted,
+                Some(LineNumber) => colors.editor_line_number,
+                Some(Accent) => colors.text_accent,
+            };
+            assert_eq!(
+                block_markdown_style(window, cx).block_quote_border_color,
+                expected
+            );
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_quote_geometry_settings(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    for (value, expected) in [
+        (None, None),
+        (Some(2.5), Some(2.5)),
+        (Some(0.0), Some(0.0)),
+        (Some(-1.0), None),
+        (None, None),
+    ] {
+        cx.cx.update(|window, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    let quote = content.markdown_live_preview.get_or_insert_default();
+                    quote.block_quote_border_width = value;
+                    quote.block_quote_gap = value;
+                    quote.block_quote_paragraph_spacing = value;
+                });
+            });
+            let style = block_markdown_style(window, cx);
+            assert_eq!(style.block_quote_border_width, expected.map(gpui::px));
+            assert_eq!(style.block_quote_gap, expected.map(gpui::px));
+            assert_eq!(
+                MarkdownLivePreviewSettings::get_global(cx).block_quote_paragraph_spacing,
+                expected
+            );
+            // The override is applied only when rendering a plain quote.
+            assert_eq!(style.paragraph_spacing, gpui::px(8.));
+        });
+    }
+}
+
+#[gpui::test]
+async fn test_quote_wraps_with_wide_source_line(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.update_editor(|editor, _, cx| {
+        editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+    });
+    let prose = "Ordinary quoted words should wrap within the visible editor. ".repeat(12);
+    cx.set_state(&format!(
+        "ˇ{}\n\n> {prose}\n>\n> Attribution\n\nAfter",
+        "wide ".repeat(500)
+    ));
+    cx.executor().run_until_parked();
+    let bounds = cx
+        .cx
+        .debug_bounds("mdlp-prose-block")
+        .expect("quote is rendered");
+    let editor_bounds = cx.update_editor(|editor, _, _| *editor.last_bounds().unwrap());
+    assert!(
+        bounds.right() <= editor_bounds.right(),
+        "quote exceeds viewport: {bounds:?}, {editor_bounds:?}"
+    );
+    assert!(
+        bounds.size.height > gpui::px(100.),
+        "long quote must wrap over multiple lines: {bounds:?}"
+    );
+    let mut previous_height = bounds.size.height;
+    for width in [900., 450.] {
+        cx.cx
+            .simulate_resize(gpui::size(gpui::px(width), gpui::px(1080.)));
+        cx.executor().run_until_parked();
+        let bounds = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
+        assert!(
+            bounds.right() <= gpui::px(width),
+            "quote overflows after resize: {bounds:?}"
+        );
+        assert!(
+            bounds.size.height > previous_height,
+            "narrower quote should wrap to more lines: {bounds:?}"
+        );
+        previous_height = bounds.size.height;
+    }
+}
+
+#[gpui::test]
+async fn test_quote_paragraph_spacing_balances_unused_row_space(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let mut balanced_nonzero_space = false;
+    for (font_size, line_height) in [(14., 1.3), (17.5, 1.4)] {
+        cx.cx.update(|_, cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |content| {
+                    content.theme.buffer_font_size = Some(font_size.into());
+                    content.theme.buffer_line_height =
+                        Some(settings::BufferLineHeight::Custom(line_height));
+                });
+            });
+        });
+        for width in [420., 800.] {
+            cx.cx
+                .simulate_resize(gpui::size(gpui::px(width), gpui::px(1080.)));
+            for spacing in [None, Some(0.), Some(12.5), Some(48.), None] {
+                cx.cx.update(|_, cx| {
+                    SettingsStore::update_global(cx, |store, cx| {
+                        store.update_user_settings(cx, |content| {
+                            content
+                                .markdown_live_preview
+                                .get_or_insert_default()
+                                .block_quote_paragraph_spacing = spacing;
+                        });
+                    });
+                });
+                for source in [
+                    "> first",
+                    "> first\n>\n> second",
+                    "> first\n>\n>\n>\n> second",
+                    "> first\n>\n> second\n>\n> third",
+                    "> A longer quote that wraps across several lines in a narrow editor pane, while retaining the editor line spacing throughout its rendered content.\n>\n> Another paragraph in the same quote.",
+                ] {
+                    cx.set_state(&format!("ˇBefore\n\n{source}\n\nAfter"));
+                    cx.executor().run_until_parked();
+                    let quote = cx.cx.debug_bounds("markdown-quote").unwrap();
+                    let block = cx.cx.debug_bounds("mdlp-prose-block").unwrap();
+                    let space_above = quote.top() - block.top();
+                    balanced_nonzero_space |= space_above > gpui::px(1.);
+                    cx.update_editor(|editor, window, cx| {
+                        let snapshot = editor.display_snapshot(cx);
+                        let id = editor.addon::<LivePreviewAddon>().unwrap().applied_blocks[0].block_id;
+                        let rows = snapshot
+                            .block_for_id(editor::display_map::BlockId::Custom(id))
+                            .unwrap()
+                            .height();
+                        let line_height = editor
+                            .style(cx)
+                            .text
+                            .line_height_in_pixels(window.rem_size());
+                        let reserved = line_height * rows as f32;
+                        let space_below = block.top() + reserved - quote.bottom();
+                        assert!(space_above >= -gpui::px(1.));
+                        assert!(space_below >= -gpui::px(1.));
+                        // Layout may snap the two edges to neighboring pixels.
+                        assert!(
+                            (space_above - space_below).abs() <= gpui::px(1.),
+                            "unequal quote spacing for {source:?}, spacing={spacing:?}: above={space_above:?}, below={space_below:?}"
+                        );
+                        let slack = reserved - quote.size.height;
+                        assert!(
+                            slack >= -gpui::px(1.) && slack < line_height + gpui::px(1.),
+                            "more than rounding slack for {source:?}, spacing={spacing:?}: {slack:?}"
+                        );
+                        let paragraphs = source.lines().filter(|line| line.starts_with("> ")).count();
+                        let gaps = gpui::px(spacing.unwrap_or(8.)) * (paragraphs - 1) as f32;
+                        let text_height = quote.size.height - gaps;
+                        let text_rows = (text_height / line_height).round();
+                        assert!(
+                            (text_height - line_height * text_rows).abs() <= gpui::px(1.),
+                            "wrapped text must retain the editor line height"
+                        );
+                        if !source.starts_with("> A longer") {
+                            assert!(
+                                (text_height - line_height * paragraphs as f32).abs() <= gpui::px(1.),
+                                "unexpected paragraph gap for {source:?}, spacing={spacing:?}: {quote:?}"
+                            );
+                        }
+                    });
+                }
+            }
+        }
+    }
+    assert!(balanced_nonzero_space, "exercise visible rounding space");
+}
+
+/// A display formula wider than the text area is scaled down to fit it, on
+/// both axes so the glyphs keep their shape; anything narrower keeps its
+/// natural size. Flex centering would otherwise push the overflow onto the
+/// gutter and past the viewport, where no scroll reaches it.
+#[test]
+fn test_display_math_wider_than_the_text_area_shrinks_to_fit() {
+    use gpui::{px, size};
+
+    let fits = fit_display_math(size(px(300.), px(40.)), px(600.));
+    assert_eq!(fits, size(px(300.), px(40.)));
+
+    let exact = fit_display_math(size(px(600.), px(40.)), px(600.));
+    assert_eq!(exact, size(px(600.), px(40.)));
+
+    let shrunk = fit_display_math(size(px(1200.), px(40.)), px(600.));
+    assert_eq!(shrunk, size(px(600.), px(20.)));
+
+    let no_room = fit_display_math(size(px(1200.), px(40.)), px(-10.));
+    assert_eq!(no_room, size(px(0.), px(0.)));
+}
+
+/// Formulas are painted with `svg()`, which hands the document to gpui and
+/// asks it to rasterize at the element's own device size. Two properties of
+/// that path are load-bearing and neither is visible to a text assertion:
+/// the outlines must still cover pixels once shrunk to a line of prose, and
+/// the coverage must land in the alpha channel, because `paint_svg` throws
+/// the colours away and keeps only the mask.
+#[gpui::test]
+fn test_math_svg_rasterizes_to_a_nonempty_alpha_mask(cx: &mut gpui::TestAppContext) {
+    let rendered = math_render::render_to_svg(
+        r"E(S) = \sum_{i=1}^{c} -p_i \log_2 p_i",
+        math_render::MathStyle::Display,
+        &math_render::MathTheme::default(),
+    )
+    .expect("formula should render");
+
+    // The size a display formula occupies at the default buffer font on a
+    // retina display: 15px * MATH_FONT_SCALE * 2.
+    let drawn_width = gpui::DevicePixels((rendered.width_em * 15.0 * 1.21 * 2.0).round() as i32);
+
+    let image = cx.update(|cx| {
+        cx.svg_renderer()
+            .parse_svg(rendered.svg.as_bytes())
+            .and_then(|svg| {
+                cx.svg_renderer().render_parsed(
+                    &svg,
+                    gpui::SvgSize::Size(gpui::size(drawn_width, drawn_width)),
+                )
+            })
+            .expect("gpui should rasterize the formula")
+    });
+
+    let size = image.size(0);
+    let frame = &image.as_bytes(0).expect("a rasterized frame");
+    let covered = frame.chunks_exact(4).filter(|pixel| pixel[3] > 0).count();
+    let total = (size.width.0 * size.height.0) as usize;
+    assert!(
+        covered * 100 / total >= 5,
+        "only {covered}/{total} pixels carry alpha; the formula would paint blank"
+    );
+}
+
+/// Concealments carry a zero-width space so the fold keeps a display column
+/// (`fold_map.rs`), and Zed flags such characters as hidden Unicode by
+/// swapping in a visible glyph. That pass must skip placeholder chunks, or
+/// every concealed backtick and asterisk leaves a mark behind.
+#[gpui::test]
+async fn test_concealment_placeholders_are_not_flagged_as_hidden_characters(
+    cx: &mut TestAppContext,
+) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nuse `code` and **bold** here\n");
+    cx.executor().run_until_parked();
+    assert!(cx.display_text().contains("use code and bold here"));
+
+    let flagged = cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let style = editor::EditorStyle::default();
+        let rows = editor::display_map::DisplayRow(0)..editor::display_map::DisplayRow(2);
+        snapshot
+            .display_snapshot
+            .highlighted_chunks(
+                rows,
+                language::LanguageAwareStyling {
+                    tree_sitter: true,
+                    diagnostics: false,
+                },
+                &style,
+            )
+            .filter(|chunk| {
+                matches!(
+                    chunk.replacement,
+                    Some(editor::display_map::ChunkReplacement::Str(_))
+                )
+            })
+            .map(|chunk| chunk.text.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        flagged,
+        Vec::<String>::new(),
+        "concealed markers must not surface the hidden-character glyph"
+    );
+}
+
+/// Inline code reads like the markdown preview's pill: the content between
+/// the backticks carries the `CODE` highlight (plain text color on a faint
+/// background), and the backticks themselves are concealed, not styled.
+#[gpui::test]
+async fn test_inline_code_is_styled_like_the_preview(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇplain line\nread `refs/refs.bib` and ``a `nested` one`` here\n");
+    cx.executor().run_until_parked();
+    assert!(
+        cx.display_text()
+            .contains("read refs/refs.bib and a `nested` one here")
+    );
+    let editor = cx.editor.clone();
+    let mut styled = highlighted_texts(&editor, CODE, &mut cx);
+    styled.sort();
+    assert_eq!(styled, vec!["a `nested` one", "refs/refs.bib"]);
+}
+
+/// Citation groups whose keys resolve render as the note's style's in-text
+/// form; a group the renderer has no slot for (a prefix) or one with an
+/// unresolved key keeps its chips.
+#[gpui::test]
+async fn test_citations_render_in_the_document_style(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                concat!(
+                    "---\ncsl: apa\n---\n\n",
+                    "As shown in [@smith2020, p. 3] and again [-@smith2020]. ",
+                    "Bare @smith2020 agrees. ",
+                    "Prefixed [see @smith2020] and unknown [@nope2020] stay.\n",
+                ),
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let display = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor.display_text(cx).replace('\u{200b}', "")
+        })
+    };
+    let text = display(cx);
+    assert!(
+        text.contains(
+            "As shown in (Smith, 2020, p. 3) and again (2020). Bare Smith (2020) agrees."
+        ),
+        "rendered in APA: {text:?}"
+    );
+    assert!(
+        text.contains("Prefixed see @smith2020 and unknown @nope2020 stay."),
+        "unsupported and unresolved groups keep their chips: {text}"
+    );
+
+    // Switching the style in the frontmatter re-renders every group.
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &concat!(
+            "---\ncsl: ieee\n---\n\n",
+            "As shown in [@smith2020, p. 3] and again [-@smith2020]. ",
+            "Bare @smith2020 agrees. ",
+            "Prefixed [see @smith2020] and unknown [@nope2020] stay.\n",
+        )
+        .into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in [1, p. 3]"),
+        "rendered in IEEE after the style change: {text}"
+    );
+}
+
+/// A `csl:` name that is not bundled must not take the rendering down with
+/// it: APA stands in, and the References block says which name failed.
+#[gpui::test]
+async fn test_an_unknown_style_falls_back_to_apa_and_says_so(cx: &mut TestAppContext) {
+    let (editor, _fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: apaa\n---\n\nAs shown in [@smith2020].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let text = editor.update(cx, |editor, cx| {
+        editor.display_text(cx).replace('\u{200b}', "")
+    });
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in for the unknown style: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .expect("the References heading becomes a references block");
+    let note = note.expect("the block carries a note about the unknown style");
+    assert!(
+        note.text.contains("\"apaa\"") && note.text.contains("APA"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.url.as_ref(), citations::STYLE_LIST_URL);
+}
+
+/// `csl:` may point at a `.csl` file in the project; it loads through the
+/// project's filesystem and rendering switches to it when it arrives. A file
+/// that is not there falls back to APA and says so.
+#[gpui::test]
+async fn test_a_csl_file_in_the_project_drives_rendering(cx: &mut TestAppContext) {
+    use project::Fs as _;
+
+    const TEST_NUMERIC_CSL: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<style xmlns="http://purl.org/net/xbiblio/csl" class="in-text" version="1.0">
+  <info>
+    <title>Test Numeric</title>
+    <id>http://example.com/styles/test-numeric</id>
+    <updated>2024-01-01T00:00:00+00:00</updated>
+  </info>
+  <citation>
+    <layout prefix="⟨" suffix="⟩" delimiter=", ">
+      <text variable="citation-number"/>
+    </layout>
+  </citation>
+  <bibliography>
+    <layout>
+      <text variable="citation-number" prefix="⟨" suffix="⟩ "/>
+      <names variable="author"><name/></names>
+      <text variable="title" prefix=". "/>
+    </layout>
+  </bibliography>
+</style>"#;
+
+    let (editor, fs, cx) = markdown_vault_test_context(
+        cx,
+        &[
+            (
+                "Note.md",
+                "---\ncsl: test-numeric.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n",
+            ),
+            (
+                "refs.bib",
+                "@article{smith2020,\n  title = {A Study},\n  author = {Smith, Jane},\n  date = {2020},\n}\n",
+            ),
+            ("test-numeric.csl", TEST_NUMERIC_CSL),
+        ],
+        "Note.md",
+    )
+    .await;
+    cx.run_until_parked();
+
+    let display = |cx: &mut gpui::VisualTestContext| {
+        editor.update(cx, |editor, cx| {
+            editor.display_text(cx).replace('\u{200b}', "")
+        })
+    };
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in ⟨1⟩."),
+        "the project's own style renders the citation: {text:?}"
+    );
+
+    // Pointing at a file that is not there falls back to APA and says so.
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: nowhere.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .flatten()
+        .expect("the References block notes the missing file");
+    assert!(
+        note.text.contains("nowhere.csl") && note.text.contains("not found"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.url.as_ref(), citations::STYLE_LIST_URL);
+
+    // A dependent style, the common shape of a journal's file, renders with
+    // the parent it points at when that file sits beside it.
+    fs.insert_file(
+        "/vault/journal.csl",
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<style xmlns=\"http://purl.org/net/xbiblio/csl\" version=\"1.0\" default-locale=\"en-US\">\n",
+            "  <info><title>Journal</title><id>http://example.com/styles/journal</id>\n",
+            "    <link href=\"http://example.com/styles/test-numeric\" rel=\"independent-parent\"/>\n",
+            "    <updated>2024-01-01T00:00:00+00:00</updated></info>\n",
+            "</style>\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: journal.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in ⟨1⟩."),
+        "the dependent style renders through its parent file: {text:?}"
+    );
+
+    // A dependent style whose parent is neither bundled nor beside it falls
+    // back to APA, and the note links to the parent's download.
+    fs.insert_file(
+        "/vault/orphan.csl",
+        concat!(
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n",
+            "<style xmlns=\"http://purl.org/net/xbiblio/csl\" version=\"1.0\" default-locale=\"en-US\">\n",
+            "  <info><title>Orphan</title><id>http://example.com/styles/orphan</id>\n",
+            "    <link href=\"http://www.zotero.org/styles/some-society\" rel=\"independent-parent\"/>\n",
+            "    <updated>2024-01-01T00:00:00+00:00</updated></info>\n",
+            "</style>\n"
+        )
+        .as_bytes()
+        .to_vec(),
+    )
+    .await;
+    fs.save(
+        "/vault/Note.md".as_ref(),
+        &"---\ncsl: orphan.csl\n---\n\nAs shown in [@smith2020].\n\n## References\n".into(),
+        Default::default(),
+    )
+    .await
+    .expect("failed to update the note");
+    cx.run_until_parked();
+    let text = display(cx);
+    assert!(
+        text.contains("As shown in (Smith, 2020)."),
+        "APA stands in for the orphaned dependent style: {text:?}"
+    );
+    let note = editor
+        .read_with(cx, |editor, _| {
+            let addon = editor
+                .addon::<LivePreviewAddon>()
+                .expect("live preview addon");
+            let markers = addon.markers.clone().expect("markers are extracted");
+            markers.blocks.iter().find_map(|block| match &block.kind {
+                BlockRenderKind::References { note, .. } => Some(note.clone()),
+                _ => None,
+            })
+        })
+        .flatten()
+        .expect("the References block notes the missing parent");
+    assert!(
+        note.text.contains("\"some-society\"") && note.text.contains("some-society.csl"),
+        "{}",
+        note.text
+    );
+    assert_eq!(note.link_label.as_ref(), "Download some-society.csl");
+    assert_eq!(
+        note.url.as_ref(),
+        "https://www.zotero.org/styles/some-society"
+    );
 }

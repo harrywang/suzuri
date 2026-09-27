@@ -73,6 +73,16 @@ impl Format {
     }
 }
 
+/// How the citation style reaches Pandoc's citeproc.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CslInput {
+    /// A style serialized from the bundled archive, staged as a file for the
+    /// run so Pandoc formats references in the style the preview renders.
+    Xml(String),
+    /// A `.csl` file of the note's own, handed over as it is.
+    File(PathBuf),
+}
+
 /// Everything one conversion needs, resolved on the main thread so the
 /// conversion itself can run in the background.
 pub struct Conversion {
@@ -84,10 +94,8 @@ pub struct Conversion {
     /// image paths resolve the way they do in the preview.
     pub resource_directory: PathBuf,
     pub bibliography: Option<PathBuf>,
-    /// CSL the document asked for, as XML. Written beside the input so
-    /// Pandoc's citeproc formats references in the same style the preview
-    /// renders them.
-    pub csl: Option<String>,
+    /// The style citeproc formats with, when there is a bibliography.
+    pub csl: Option<CslInput>,
     pub pdf_engine: String,
 }
 
@@ -260,11 +268,12 @@ pub async fn convert(conversion: Conversion, tools: Tools) -> Result<()> {
     std::fs::write(&input, &conversion.source).context("writing the document to convert")?;
 
     let csl_path = match &conversion.csl {
-        Some(xml) => {
+        Some(CslInput::Xml(xml)) => {
             let path = staging.path().join("style.csl");
             std::fs::write(&path, xml).context("writing the citation style")?;
             Some(path)
         }
+        Some(CslInput::File(path)) => Some(path.clone()),
         None => None,
     };
 
@@ -430,14 +439,14 @@ mod tests {
         .expect("writing the bibliography");
         let output = directory.path().join("out.html");
 
-        let csl = crate::style_xml("ieee").expect("IEEE is a bundled style");
+        let csl = citations::style_xml("ieee").expect("IEEE is a bundled style");
         let conversion = Conversion {
             format: Format::Html,
             source: "Shown here [@vaswani2017attention].\n\n## References\n".to_string(),
             output: output.clone(),
             resource_directory: directory.path().to_path_buf(),
             bibliography: Some(bibliography),
-            csl: Some(csl),
+            csl: Some(CslInput::Xml(csl)),
             pdf_engine: "typst".to_string(),
         };
         let tools = Tools {
@@ -507,7 +516,7 @@ mod tests {
             output: output.clone(),
             resource_directory: directory.path().to_path_buf(),
             bibliography: Some(bibliography),
-            csl: crate::style_xml("ieee"),
+            csl: citations::style_xml("ieee").map(CslInput::Xml),
             pdf_engine: "typst".to_string(),
         };
         smol::block_on(convert(

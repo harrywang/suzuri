@@ -1046,6 +1046,10 @@ impl Vim {
                     cx.notify();
                 }
             }
+            // SUZURI: Visual-line commands operate on source rows, including the following newline.
+            if vim.mode == Mode::VisualLine {
+                vim.update_editor(cx, |_, editor, cx| editor.prepare_linewise_edit(1, cx));
+            }
             f(vim, action, window, cx);
         }));
         cx.on_release(|_, _| drop(subscription)).detach();

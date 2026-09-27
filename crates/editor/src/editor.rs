@@ -63,6 +63,7 @@ pub mod test;
 
 mod clipboard;
 mod code_actions;
+mod columnar_selection;
 mod completions;
 mod config;
 mod cursor_animation;
@@ -779,8 +780,67 @@ impl BufferSerialization {
     }
 }
 
+// SUZURI: begin. Editable previews reveal their source before a row-based motion is mapped
+// through their replacement rows. The addon decides which blocks; the editor only removes them,
+// so the reasoning stays out of vendor code. Editor motions reach this through the addon's own
+// `register_action` listeners; Vim's motions bypass editor actions and call these directly.
+pub enum RowMotion {
+    Vertical {
+        row_delta: i64,
+        display_lines: bool,
+        inclusive_selection: bool,
+    },
+    Linewise {
+        rows: u32,
+    },
+}
+
+impl Editor {
+    pub fn prepare_vertical_navigation(
+        &mut self,
+        row_delta: i64,
+        display_lines: bool,
+        inclusive_selection: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.reveal_blocks_before(
+            RowMotion::Vertical {
+                row_delta,
+                display_lines,
+                inclusive_selection,
+            },
+            cx,
+        );
+    }
+
+    pub fn prepare_linewise_edit(&mut self, rows: u32, cx: &mut Context<Self>) {
+        self.reveal_blocks_before(RowMotion::Linewise { rows }, cx);
+    }
+
+    fn reveal_blocks_before(&mut self, motion: RowMotion, cx: &mut Context<Self>) {
+        let mut reveal = HashSet::default();
+        for addon in self.addons.values() {
+            reveal.extend(addon.blocks_to_reveal_before(&motion, self, cx));
+        }
+        if !reveal.is_empty() {
+            self.remove_blocks(reveal, None, cx);
+        }
+    }
+}
+// SUZURI: end
+
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
+    // SUZURI: See `RowMotion` above.
+    fn blocks_to_reveal_before(
+        &self,
+        _: &RowMotion,
+        _: &Editor,
+        _: &mut Context<Editor>,
+    ) -> Vec<CustomBlockId> {
+        Vec::new()
+    }
+
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
 
     fn render_buffer_header_controls(
@@ -1436,6 +1496,8 @@ struct DeferredSelectionEffectsState {
 pub struct TransactionSelections {
     pub undo: Arc<[Selection<Anchor>]>,
     pub redo: Option<Arc<[Selection<Anchor>]>>,
+    undo_add_selections_state: Option<AddSelectionsState>,
+    redo_add_selections_state: Option<AddSelectionsState>,
 }
 
 #[derive(Default)]
@@ -1452,6 +1514,7 @@ impl SelectionHistory {
         &mut self,
         transaction_id: TransactionId,
         selections: Arc<[Selection<Anchor>]>,
+        add_selections_state: Option<AddSelectionsState>,
     ) {
         if selections.is_empty() {
             log::error!(
@@ -1465,6 +1528,8 @@ impl SelectionHistory {
             TransactionSelections {
                 undo: selections,
                 redo: None,
+                undo_add_selections_state: add_selections_state,
+                redo_add_selections_state: None,
             },
         );
     }
@@ -1547,12 +1612,14 @@ struct RowHighlight {
 #[derive(Clone, Debug)]
 struct AddSelectionsState {
     groups: Vec<AddSelectionsGroup>,
+    skip_soft_wrap: bool,
 }
 
 #[derive(Clone, Debug)]
 struct AddSelectionsGroup {
     above: bool,
     stack: Vec<usize>,
+    goal_source: Option<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -1728,6 +1795,8 @@ struct GutterButtonTooltip {
     primary: GutterButtonIntent,
     secondary: GutterButtonIntent,
     focus_handle: FocusHandle,
+    #[cfg(test)]
+    on_render: Option<Rc<RefCell<Vec<(String, String)>>>>,
 }
 
 impl GutterButtonTooltip {
@@ -1739,7 +1808,7 @@ impl GutterButtonTooltip {
         }
     }
 
-    fn meta_text(&self, intent: GutterButtonIntent) -> String {
+    fn meta_text(&self) -> String {
         const RIGHT_CLICK_HINT: &str = "right-click for more options";
 
         if self.primary == self.secondary {
@@ -1749,11 +1818,11 @@ impl GutterButtonTooltip {
             modifiers: Modifiers::secondary_key(),
             ..Default::default()
         };
-        let other = match intent {
-            GutterButtonIntent::SetBookmark => "breakpoint",
-            GutterButtonIntent::SetBreakpoint => "bookmark",
+        let secondary = match self.secondary {
+            GutterButtonIntent::SetBookmark => "bookmark",
+            GutterButtonIntent::SetBreakpoint => "breakpoint",
         };
-        format!("{modifier_as_text}-click to add a {other}\n{RIGHT_CLICK_HINT}")
+        format!("{modifier_as_text}-click to add a {secondary}\n{RIGHT_CLICK_HINT}")
     }
 }
 
@@ -1761,7 +1830,14 @@ impl Render for GutterButtonTooltip {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let intent = self.active_intent(window.modifiers());
         let key_binding = KeyBinding::for_action_in(intent.action(), &self.focus_handle, cx);
-        let meta_text = self.meta_text(intent);
+        let meta_text = self.meta_text();
+
+        #[cfg(test)]
+        if let Some(on_render) = &self.on_render {
+            on_render
+                .borrow_mut()
+                .push((intent.as_str().to_owned(), meta_text.clone()));
+        }
 
         tooltip_container(cx, move |this, _| {
             this.child(
@@ -3526,9 +3602,14 @@ impl Editor {
             return;
         }
 
+        let cancelling_group = self.selections.pending_anchor().is_none()
+            && self.selections.disjoint_anchors().len() > 1;
         if self.mode.is_full()
             && self.change_selections(Default::default(), window, cx, |s| s.try_cancel())
         {
+            if cancelling_group {
+                self.add_selections_state = None;
+            }
             cx.notify();
             return;
         }
@@ -4826,6 +4907,8 @@ impl Editor {
                         primary,
                         secondary,
                         focus_handle: focus_handle.clone(),
+                        #[cfg(test)]
+                        on_render: None,
                     })
                     .into()
                 })
@@ -7968,13 +8051,23 @@ impl Editor {
 
     fn restore_selections(
         &mut self,
-        selections: Option<Arc<[Selection<Anchor>]>>,
+        selections: Option<(Arc<[Selection<Anchor>]>, Option<AddSelectionsState>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(selections) = selections.filter(|selections| !selections.is_empty()) {
-            self.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                s.select_anchors(selections.to_vec());
+        if let Some((selections, add_selections_state)) =
+            selections.filter(|(selections, _)| !selections.is_empty())
+        {
+            self.with_selection_effects_deferred(window, cx, |editor, window, cx| {
+                editor.change_selections(
+                    SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selection_collection| {
+                        selection_collection.select_anchors_unexpanded(selections.to_vec());
+                    },
+                );
+                editor.add_selections_state = add_selections_state;
             });
         }
     }
@@ -7989,7 +8082,12 @@ impl Editor {
             if transaction.is_none() {
                 log::error!("No selection history for undone transaction; selection unchanged");
             }
-            let selections = transaction.map(|transaction| transaction.undo.clone());
+            let selections = transaction.map(|transaction| {
+                (
+                    transaction.undo.clone(),
+                    transaction.undo_add_selections_state.clone(),
+                )
+            });
             self.restore_selections(selections, window, cx);
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(window, cx);
@@ -8011,10 +8109,14 @@ impl Editor {
         }
 
         if let Some(transaction_id) = self.buffer.update(cx, |buffer, cx| buffer.redo(cx)) {
-            let selections = self
-                .selection_history
-                .transaction(transaction_id)
-                .and_then(|transaction| transaction.redo.clone());
+            let selections =
+                self.selection_history
+                    .transaction(transaction_id)
+                    .and_then(|transaction| {
+                        transaction.redo.clone().map(|selections| {
+                            (selections, transaction.redo_add_selections_state.clone())
+                        })
+                    });
             self.restore_selections(selections, window, cx);
             self.request_autoscroll(Autoscroll::fit(), cx);
             self.unmark_text(window, cx);
@@ -8541,7 +8643,7 @@ impl Editor {
         buffers.retain(|buffer| !buffer.read(cx).read_only());
 
         let transaction_id_prev = buffer.read(cx).last_transaction_id(cx);
-        let selections_prev = transaction_id_prev
+        let (selections_prev, add_selections_state_prev) = transaction_id_prev
             .and_then(|transaction_id_prev| {
                 // default to selections as they were after the last edit, if we have them,
                 // instead of how they are now.
@@ -8549,9 +8651,19 @@ impl Editor {
                 // will take you back to where you made the last edit, instead of staying where you scrolled
                 self.selection_history
                     .transaction(transaction_id_prev)
-                    .map(|t| t.undo.clone())
+                    .map(|transaction| {
+                        (
+                            transaction.undo.clone(),
+                            transaction.undo_add_selections_state.clone(),
+                        )
+                    })
             })
-            .unwrap_or_else(|| self.selections.disjoint_anchors_arc());
+            .unwrap_or_else(|| {
+                (
+                    self.selections.disjoint_anchors_arc(),
+                    self.add_selections_state.clone(),
+                )
+            });
 
         let mut timeout = cx.background_executor().timer(FORMAT_TIMEOUT).fuse();
         let format = project.update(cx, |project, cx| {
@@ -8583,9 +8695,11 @@ impl Editor {
                 if has_new_transaction {
                     editor
                         .update(cx, |editor, _| {
-                            editor
-                                .selection_history
-                                .insert_transaction(transaction_id_now, selections_prev);
+                            editor.selection_history.insert_transaction(
+                                transaction_id_now,
+                                selections_prev,
+                                add_selections_state_prev,
+                            );
                         })
                         .ok();
                 }
@@ -8755,8 +8869,11 @@ impl Editor {
             .buffer
             .update(cx, |buffer, cx| buffer.start_transaction_at(now, cx))
         {
-            self.selection_history
-                .insert_transaction(tx_id, self.selections.disjoint_anchors_arc());
+            self.selection_history.insert_transaction(
+                tx_id,
+                self.selections.disjoint_anchors_arc(),
+                self.add_selections_state.clone(),
+            );
             cx.emit(EditorEvent::TransactionBegun {
                 transaction_id: tx_id,
             });
@@ -8777,6 +8894,7 @@ impl Editor {
         {
             if let Some(transaction) = self.selection_history.transaction_mut(transaction_id) {
                 transaction.redo = Some(self.selections.disjoint_anchors_arc());
+                transaction.redo_add_selections_state = self.add_selections_state.clone();
             } else {
                 log::error!("unexpectedly ended a transaction that wasn't started by this editor");
             }
@@ -8795,7 +8913,17 @@ impl Editor {
     ) -> bool {
         self.selection_history
             .transaction_mut(transaction_id)
-            .map(modify)
+            .map(|transaction| {
+                let undo = transaction.undo.clone();
+                let redo = transaction.redo.clone();
+                modify(transaction);
+                if undo != transaction.undo {
+                    transaction.undo_add_selections_state = None;
+                }
+                if redo != transaction.redo {
+                    transaction.redo_add_selections_state = None;
+                }
+            })
             .is_some()
     }
 
@@ -9395,19 +9523,22 @@ impl Editor {
         self.highlighted_rows
             .values()
             .flat_map(|highlighted_rows| {
-                let start_index = highlighted_rows.partition_point(|highlight| {
-                    highlight
-                        .range
-                        .end
-                        .cmp(&anchor_range.start, buffer_snapshot)
-                        .is_lt()
-                });
                 let end_index = highlighted_rows.partition_point(|highlight| {
                     highlight
                         .range
                         .start
                         .cmp(&anchor_range.end, buffer_snapshot)
                         .is_le()
+                });
+                // Search within `..end_index` so a highlight whose anchors
+                // have drifted to `start > end` can't produce an inverted
+                // slice; the filter below drops it either way.
+                let start_index = highlighted_rows[..end_index].partition_point(|highlight| {
+                    highlight
+                        .range
+                        .end
+                        .cmp(&anchor_range.start, buffer_snapshot)
+                        .is_lt()
                 });
                 highlighted_rows[start_index..end_index]
                     .iter()
@@ -11369,7 +11500,7 @@ impl Editor {
         self.read_scroll_position_from_db(item_id, workspace_id, window, cx);
     }
 
-    pub(crate) fn lsp_data_enabled(&self) -> bool {
+    pub fn lsp_data_enabled(&self) -> bool {
         self.enable_lsp_data && self.mode().is_full()
     }
 
@@ -11687,6 +11818,7 @@ fn process_completion_for_edit(
         let replace_range = &completion.replace_range;
         if let CompletionSource::Lsp {
             insert_range: Some(insert_range),
+            lsp_completion,
             ..
         } = &completion.source
         {
@@ -11725,7 +11857,7 @@ fn process_completion_for_edit(
                                     ..buffer.anchor_after(replace_range.end),
                             );
                             let mut current_needle = text_to_replace.next();
-                            for haystack_ch in completion.label.text.chars() {
+                            for haystack_ch in lsp_completion.label.chars() {
                                 if let Some(needle_ch) = current_needle
                                     && haystack_ch.eq_ignore_ascii_case(&needle_ch)
                                 {
@@ -11748,9 +11880,8 @@ fn process_completion_for_edit(
                                     )
                                     .collect::<String>()
                                     .to_ascii_lowercase();
-                                completion
+                                lsp_completion
                                     .label
-                                    .text
                                     .to_ascii_lowercase()
                                     .ends_with(&text_after_cursor)
                             } else {

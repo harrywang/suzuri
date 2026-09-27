@@ -96,8 +96,13 @@ cargo nextest run -p markdown_live_preview -p pdf_viewer -p typeset_preview
 cargo nextest run -p project_panel -p languages
 ```
 
-Known-failing on a clean upstream tree: `project_panel tests::undo::undo_create_dirty_file`.
-Before blaming a merge for any failure, stash the merge and confirm the test fails without it.
+The fork breaks a fixed set of upstream tests on every merge — 11 save-prompt tests in
+`workspace`/`zed` plus `project_panel tests::undo::undo_create_dirty_file` (the fork's
+`autosave` default in `assets/settings/default.json`), `zed tests::test_action_namespaces`
+(the fork's two extra action namespaces), and the `collab *_postgres` tests (no local
+database). See "Tests the fork breaks permanently" in CLAUDE.md. Before blaming a merge for
+anything else, check whether the fork touches the files involved at all:
+`git diff $(git merge-base upstream/main main) main -- <path>`.
 
 ## 5. Smoke-test the real app
 
