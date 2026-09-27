@@ -302,9 +302,25 @@ pub async fn convert(conversion: Conversion, tools: Tools) -> Result<()> {
     }
     if conversion.format == Format::Pdf {
         match &tools.pdf_engine {
-            Some(engine) => command.arg("--pdf-engine").arg(engine),
-            None => command.arg("--pdf-engine").arg(&conversion.pdf_engine),
-        };
+            // Pandoc recognizes Typst by the program name it is given, and
+            // only then keeps images reachable from Typst's project root.
+            // Handed an absolute path it extracts media to a temp folder that
+            // Typst, rooted at the note's folder, cannot see. So the
+            // provisioned binary goes on the PATH and Pandoc gets the name.
+            Some(engine) => {
+                if let Some(directory) = engine.parent() {
+                    command.env("PATH", path_with(directory));
+                }
+                let name = engine
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("typst");
+                command.arg("--pdf-engine").arg(name);
+            }
+            None => {
+                command.arg("--pdf-engine").arg(&conversion.pdf_engine);
+            }
+        }
     }
     if let Some(bibliography) = &conversion.bibliography {
         command
@@ -325,6 +341,15 @@ pub async fn convert(conversion: Conversion, tools: Tools) -> Result<()> {
         return Ok(());
     }
     bail!("{}", failure_message(&output.stderr, &output.stdout));
+}
+
+/// The PATH with `directory` in front, so Pandoc finds a provisioned engine by
+/// its bare name.
+fn path_with(directory: &Path) -> std::ffi::OsString {
+    let existing = std::env::var_os("PATH").unwrap_or_default();
+    let mut entries = vec![directory.to_path_buf()];
+    entries.extend(std::env::split_paths(&existing));
+    std::env::join_paths(entries).unwrap_or(existing)
 }
 
 /// Pandoc's own diagnostic, trimmed to something a toast can hold.
@@ -569,10 +594,21 @@ mod tests {
             return;
         };
         let directory = tempfile::tempdir().expect("a temporary directory");
+        // An image is what exposes the engine-name quirk: Pandoc extracts it
+        // to a temp folder, and only when it knows the engine is Typst does
+        // it keep that folder reachable from Typst's root.
+        std::fs::write(
+            directory.path().join("figure.svg"),
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"8\" height=\"8\">\
+             <rect width=\"8\" height=\"8\" fill=\"black\"/></svg>",
+        )
+        .expect("writing the figure");
         let output = directory.path().join("paper.pdf");
         let conversion = Conversion {
             format: Format::Pdf,
-            source: "# A Paper\n\nWith a sentence and $x^2$ of math.\n".to_string(),
+            source: "# A Paper\n\nWith a sentence, $x^2$ of math, and a figure:\n\n\
+                     ![](figure.svg){width=40}\n"
+                .to_string(),
             output: output.clone(),
             resource_directory: directory.path().to_path_buf(),
             bibliography: None,

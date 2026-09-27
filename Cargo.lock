@@ -10979,6 +10979,7 @@ dependencies = [
  "editor",
  "gpui",
  "http_client",
+ "log",
  "paths",
  "project",
  "settings",

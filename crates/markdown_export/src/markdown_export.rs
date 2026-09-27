@@ -222,7 +222,10 @@ fn build_request(
     } = preprocess::preprocess(&text, source_directory.as_deref(), &vault);
 
     let settings = MarkdownExportSettings::get_global(cx).clone();
-    let bibliography = worktree_root.as_ref().and_then(|root| {
+    let bibliography = worktree_root.as_deref().and_then(|root| {
+        // Opening a lone file gives it a worktree whose root is the file
+        // itself; the vault it belongs to is that file's folder.
+        let root = if root.is_file() { root.parent()? } else { root };
         let library = root.join(&citations::CitationsSettings::get_global(cx).library);
         library.exists().then_some(library)
     });
@@ -315,6 +318,9 @@ fn run(
                 .ok();
         }
         Err(error) => {
+            // A toast is gone in seconds and cannot be copied; the log is
+            // where a failed export can still be diagnosed afterwards.
+            log::warn!("markdown export to {} failed: {error:#}", format.label());
             workspace
                 .update(cx, |workspace, cx| {
                     show_toast(workspace, &format!("Export failed. {error:#}"), cx);
