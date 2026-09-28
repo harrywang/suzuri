@@ -8,8 +8,10 @@
   // - "dark": Use the theme indicated by the "dark" field
   "theme": {
     "mode": "system",
-    "light": "One Light",
-    "dark": "One Dark",
+    // SUZURI: begin. Ship the fork's own themes, matching the suzuri.ai screenshots.
+    "light": "Suzuri Light",
+    "dark": "Suzuri Dark",
+    // SUZURI: end
   },
   "icon_theme": "Zed (Default)",
   // The name of a base set of key bindings to use.
