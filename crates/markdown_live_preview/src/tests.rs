@@ -2809,6 +2809,43 @@ async fn test_display_math_renders_as_block(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_failed_display_math_keeps_the_renderer_message(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // A double `_` is an error in strict LaTeX; this is #83's repro.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+
+        $$E(\text{Survived}) = \text{__ENTROPY__}$$
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    let messages = cx.update(|_, cx| {
+        cx.try_global::<MathCache>()
+            .map(|cache| {
+                cache
+                    .entries
+                    .values()
+                    .filter_map(|entry| match entry {
+                        MathEntry::Failed { message } => Some(message.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    assert_eq!(messages.len(), 1, "expected one failed formula");
+    // The tooltip shows this, so it must be the parser's explanation rather
+    // than the context label that only names the failing stage.
+    assert!(
+        !messages[0].is_empty() && !messages[0].contains("parsing LaTeX math"),
+        "unexpected failure message: {}",
+        messages[0]
+    );
+}
+
+#[gpui::test]
 async fn test_display_math_keeps_rendering_while_editing(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
 

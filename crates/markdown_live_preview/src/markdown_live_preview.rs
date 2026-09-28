@@ -2452,8 +2452,9 @@ enum MathEntry {
         height_em: f32,
     },
     /// The formula does not parse. Callers keep showing the source, which is
-    /// also what the user needs to see in order to fix it.
-    Failed,
+    /// also what the user needs to see in order to fix it, marked with the
+    /// renderer's message.
+    Failed { message: SharedString },
 }
 
 /// Rasterized formulas, keyed by content.
@@ -2518,7 +2519,11 @@ fn request_math_render(key: MathKey, cx: &mut App) {
                     height_em: rendered.height_em + rendered.depth_em,
                     svg: Arc::from(rendered.svg.into_bytes()),
                 },
-                Err(_) => MathEntry::Failed,
+                // The context layer only says which stage failed; the parser's
+                // own message is the part that tells the user what to fix.
+                Err(error) => MathEntry::Failed {
+                    message: error.root_cause().to_string().into(),
+                },
             };
             cx.global_mut::<MathCache>().entries.insert(key, entry);
             // The placeholder closures read the cache during render, so every
@@ -2527,6 +2532,34 @@ fn request_math_render(key: MathKey, cx: &mut App) {
         });
     })
     .detach();
+}
+
+/// The LaTeX source shown in place of a formula that is still rendering or
+/// that failed to. A failure gets the editor's diagnostic styling and the
+/// renderer's message on hover; left as plain text, it reads as a formula
+/// that silently did not render, with no hint about why.
+fn math_source_fallback(
+    id: impl Into<ElementId>,
+    source: SharedString,
+    entry: Option<&MathEntry>,
+    cx: &App,
+) -> AnyElement {
+    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+    let text = div()
+        .font(theme_settings.buffer_font.clone())
+        .text_size(theme_settings.buffer_font_size(cx))
+        .text_color(cx.theme().colors().editor_foreground)
+        .child(source);
+    match entry {
+        Some(MathEntry::Failed { message }) => text
+            .id(id)
+            .text_decoration_1()
+            .text_decoration_wavy()
+            .text_decoration_color(cx.theme().status().error)
+            .tooltip(ui::Tooltip::text(format!("Math error: {message}")))
+            .into_any_element(),
+        _ => text.into_any_element(),
+    }
 }
 
 /// Chunks carry their character positions in a `u128` bitmap, so the tab map
@@ -2666,7 +2699,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         InlineKind::Math { source, style } => {
             let source = source.clone();
             let style = *style;
-            Arc::new(move |_, _, cx: &mut App| {
+            Arc::new(move |fold_id, _, cx: &mut App| {
                 let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                 let font_size = theme_settings.buffer_font_size(cx);
                 let buffer_font = theme_settings.buffer_font.clone();
@@ -2687,7 +2720,10 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                 let descent = text_system.descent(font_id, font_size).abs();
                 let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
 
-                match cx.default_global::<MathCache>().entries.get(&key) {
+                match cx
+                    .try_global::<MathCache>()
+                    .and_then(|cache| cache.entries.get(&key))
+                {
                     Some(MathEntry::Ready {
                         svg: document,
                         baseline_fraction,
@@ -2731,12 +2767,7 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                     // formula that does not parse — fall back to the LaTeX
                     // source, so the text never disappears out from under
                     // the user.
-                    Some(MathEntry::Pending) | Some(MathEntry::Failed) | None => div()
-                        .font(buffer_font)
-                        .text_size(font_size)
-                        .text_color(text_color)
-                        .child(source.clone())
-                        .into_any_element(),
+                    entry => math_source_fallback(fold_id, source.clone(), entry, cx),
                 }
             })
         }
@@ -5975,16 +6006,17 @@ fn render_math_block(
             .max(block_cx.em_width);
         let horizontal_padding = block_cx.em_width;
         let cx = &mut *block_cx.app;
-        let theme_settings = theme_settings::ThemeSettings::get_global(cx);
-        let font_size = theme_settings.buffer_font_size(cx);
-        let buffer_font = theme_settings.buffer_font.clone();
+        let font_size = theme_settings::ThemeSettings::get_global(cx).buffer_font_size(cx);
         let text_color = cx.theme().colors().editor_foreground;
         let key = MathKey {
             source: source.clone(),
             style: MathStyle::Display,
         };
 
-        let content = match cx.default_global::<MathCache>().entries.get(&key) {
+        let content = match cx
+            .try_global::<MathCache>()
+            .and_then(|cache| cache.entries.get(&key))
+        {
             Some(MathEntry::Ready {
                 svg: document,
                 width_em,
@@ -6004,12 +6036,14 @@ fn render_math_block(
                     .into_any_element()
             }
             _ if below => Empty.into_any_element(),
-            _ => div()
+            entry => div()
                 .max_w_full()
-                .font(buffer_font)
-                .text_size(font_size)
-                .text_color(text_color)
-                .child(source.clone())
+                .child(math_source_fallback(
+                    block_cx.block_id,
+                    source.clone(),
+                    entry,
+                    cx,
+                ))
                 .into_any_element(),
         };
 

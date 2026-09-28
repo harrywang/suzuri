@@ -4135,6 +4135,8 @@ fn run_math_rendering_visual_tests(
          $$E(S) = \\sum_{i=1}^{c} -p_i \\log_2 p_i$$\n\n\
          Information gain is entropy reduction:\n\n\
          $$Gain(T, X) = E(T) - E(T, X)$$\n\n\
+         Math that does not parse, like $x__1$, keeps its source marked as an error:\n\n\
+         $$E(\\text{Survived}) = \\text{__ENTROPY__}$$\n\n\
          For outlook:\n\n\
          $$Gain(PlayGolf, Outlook) = 0.94 - 0.693 = 0.247$$\n\n\
          Each branch contributes its own entropy, weighted by how much of the data lands in it:\n\n\
