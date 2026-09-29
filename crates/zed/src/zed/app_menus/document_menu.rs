@@ -13,12 +13,6 @@ pub fn document_menu() -> Menu {
         MenuItem::action("Insert Citation…", citations::InsertCitation),
         MenuItem::action("Open Citation Source", citations::OpenSource),
         MenuItem::separator(),
-        MenuItem::action(
-            "Toggle Live Preview",
-            markdown_live_preview::ToggleLivePreview,
-        ),
-        MenuItem::action("Preview Typst or LaTeX", typeset_preview::OpenLivePreview),
-        MenuItem::separator(),
         export_submenu(),
     ])
 }

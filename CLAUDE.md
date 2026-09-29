@@ -35,7 +35,7 @@ The fork's own changes are small and additive:
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
-| Document menu (citations, previews, export) and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
+| Document menu (citations, export) and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | In-app updates from GitHub releases (see "Cutting a release") | `crates/suzuri_update/`, `crates/auto_update/src/auto_update.rs` (`init`, `get_release_asset`, `release_notes_url`, the macOS and Linux installers), `crates/auto_update_ui/src/auto_update_ui.rs` (app name), `crates/release_channel/src/lib.rs` (`poll_for_updates`) |
 | Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
