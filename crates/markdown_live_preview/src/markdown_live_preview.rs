@@ -2534,6 +2534,89 @@ fn request_math_render(key: MathKey, cx: &mut App) {
     .detach();
 }
 
+/// Builds an inline placeholder at the font size of the editor painting it.
+/// The minimap shares the main editor's display map, and so its
+/// placeholders; a size read from settings draws minimap rows at full buffer
+/// size, overlapping each other. Both editors push their own size as the
+/// inherited text style while laying out and painting lines.
+fn at_editor_font_size(
+    render: impl 'static + FnOnce(Pixels, &mut App) -> AnyElement,
+) -> AtEditorFontSize {
+    AtEditorFontSize {
+        render: Some(Box::new(render)),
+    }
+}
+
+struct AtEditorFontSize {
+    render: Option<Box<dyn FnOnce(Pixels, &mut App) -> AnyElement>>,
+}
+
+impl gpui::Element for AtEditorFontSize {
+    type RequestLayoutState = Option<AnyElement>;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let mut child = match self.render.take() {
+            Some(render) => render(font_size, cx),
+            None => Empty.into_any_element(),
+        };
+        let layout_id = child.request_layout(window, cx);
+        (layout_id, Some(child))
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(child) = child {
+            child.prepaint(window, cx);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(child) = child {
+            child.paint(window, cx);
+        }
+    }
+}
+
+impl IntoElement for AtEditorFontSize {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
 /// The LaTeX source shown in place of a formula that is still rendering or
 /// that failed to. A failure gets the editor's diagnostic styling and the
 /// renderer's message on hover; left as plain text, it reads as a formula
@@ -2542,12 +2625,13 @@ fn math_source_fallback(
     id: impl Into<ElementId>,
     source: SharedString,
     entry: Option<&MathEntry>,
+    font_size: Pixels,
     cx: &App,
 ) -> AnyElement {
     let theme_settings = theme_settings::ThemeSettings::get_global(cx);
     let text = div()
         .font(theme_settings.buffer_font.clone())
-        .text_size(theme_settings.buffer_font_size(cx))
+        .text_size(font_size)
         .text_color(cx.theme().colors().editor_foreground)
         .child(source);
     match entry {
@@ -2596,14 +2680,17 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
     };
     let render: Arc<dyn Send + Sync + Fn(_, _, &mut App) -> gpui::AnyElement> = match &marker.kind {
         InlineKind::Hide { .. } => Arc::new(|_, _, _| Empty.into_any_element()),
-        InlineKind::Bullet => Arc::new(|_, _, cx| {
-            let theme_settings = theme_settings::ThemeSettings::get_global(cx);
-            div()
-                .font(theme_settings.buffer_font.clone())
-                .text_size(theme_settings.buffer_font_size(cx))
-                .text_color(cx.theme().colors().text)
-                .child("•")
-                .into_any_element()
+        InlineKind::Bullet => Arc::new(|_, _, _| {
+            at_editor_font_size(|font_size, cx| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                div()
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(font_size)
+                    .text_color(cx.theme().colors().text)
+                    .child("•")
+                    .into_any_element()
+            })
+            .into_any_element()
         }),
         InlineKind::Checkbox {
             checked,
@@ -2639,136 +2726,151 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         InlineKind::Link { destination, label } => {
             let destination = destination.clone();
             let label = label.clone();
-            Arc::new(move |fold_id, _, cx: &mut App| {
-                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+            Arc::new(move |fold_id, _, _| {
                 let editor = editor.clone();
                 let destination = destination.clone();
-                div()
-                    .id(fold_id)
-                    .cursor_pointer()
-                    .font(theme_settings.buffer_font.clone())
-                    .text_size(theme_settings.buffer_font_size(cx))
-                    .text_color(cx.theme().colors().text_accent)
-                    .hover(|style| style.underline())
-                    .child(label.clone())
-                    // Opening the note is the link's job, so it claims the
-                    // press instead of letting the editor place the cursor
-                    // (which would reveal the source under the pointer).
-                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .on_click(move |_, window, cx| {
-                        open_link(&editor, &destination, window, cx);
-                    })
-                    .into_any_element()
+                let label = label.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                    div()
+                        .id(fold_id)
+                        .cursor_pointer()
+                        .font(theme_settings.buffer_font.clone())
+                        .text_size(font_size)
+                        .text_color(cx.theme().colors().text_accent)
+                        .hover(|style| style.underline())
+                        .child(label)
+                        // Opening the note is the link's job, so it claims the
+                        // press instead of letting the editor place the cursor
+                        // (which would reveal the source under the pointer).
+                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                        .on_click(move |_, window, cx| {
+                            open_link(&editor, &destination, window, cx);
+                        })
+                        .into_any_element()
+                })
+                .into_any_element()
             })
         }
         InlineKind::Citation { rendered } => {
             let rendered = rendered.clone();
-            Arc::new(move |_, _, cx: &mut App| {
-                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
-                let colors = cx.theme().colors();
-                // The same chip the key carries in source, so a rendered
-                // citation and a revealed one read as the same object.
-                div()
-                    .font(theme_settings.buffer_font.clone())
-                    .text_size(theme_settings.buffer_font_size(cx))
-                    .text_color(colors.text)
-                    .bg(colors.editor_document_highlight_read_background)
-                    .rounded_sm()
-                    .child(rendered.clone())
-                    .into_any_element()
+            Arc::new(move |_, _, _| {
+                let rendered = rendered.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                    let colors = cx.theme().colors();
+                    // The same chip the key carries in source, so a rendered
+                    // citation and a revealed one read as the same object.
+                    div()
+                        .font(theme_settings.buffer_font.clone())
+                        .text_size(font_size)
+                        .text_color(colors.text)
+                        .bg(colors.editor_document_highlight_read_background)
+                        .rounded_sm()
+                        .child(rendered)
+                        .into_any_element()
+                })
+                .into_any_element()
             })
         }
         InlineKind::Footnote { label } => {
             let label = label.clone();
-            Arc::new(move |_, _, cx: &mut App| {
-                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
-                let font_size = theme_settings.buffer_font_size(cx);
-                // The editor centers an inline element in the line, so the
-                // only way to raise a marker above the baseline is to pad it
-                // asymmetrically: bottom padding of 2d shifts it up by d.
-                let raise = font_size * 0.3;
-                div()
-                    .pb(raise * 2.0)
-                    .font(theme_settings.buffer_font.clone())
-                    .text_size(font_size * 0.75)
-                    .text_color(cx.theme().colors().text_accent)
-                    .child(label.clone())
-                    .into_any_element()
+            Arc::new(move |_, _, _| {
+                let label = label.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                    // The editor centers an inline element in the line, so the
+                    // only way to raise a marker above the baseline is to pad it
+                    // asymmetrically: bottom padding of 2d shifts it up by d.
+                    let raise = font_size * 0.3;
+                    div()
+                        .pb(raise * 2.0)
+                        .font(theme_settings.buffer_font.clone())
+                        .text_size(font_size * 0.75)
+                        .text_color(cx.theme().colors().text_accent)
+                        .child(label)
+                        .into_any_element()
+                })
+                .into_any_element()
             })
         }
         InlineKind::Math { source, style } => {
             let source = source.clone();
             let style = *style;
-            Arc::new(move |fold_id, _, cx: &mut App| {
-                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
-                let font_size = theme_settings.buffer_font_size(cx);
-                let buffer_font = theme_settings.buffer_font.clone();
-                let text_color = cx.theme().colors().editor_foreground;
-                let key = MathKey {
-                    source: source.clone(),
-                    style,
-                };
-                let line_height = font_size * theme_settings.line_height();
-                let text_system = cx.text_system().clone();
-                let font_id = text_system.resolve_font(&buffer_font);
-                let ascent = text_system.ascent(font_id, font_size);
-                // `TextSystem::descent` is negative on macOS (a signed offset
-                // below the baseline), while the painted baseline's formula
-                // (`gpui::paint_line`) works in magnitudes — feeding the
-                // signed value into `baseline_offset` lands 2×descent too
-                // low, so compute the baseline from magnitudes directly.
-                let descent = text_system.descent(font_id, font_size).abs();
-                let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
+            Arc::new(move |fold_id, _, _| {
+                let source = source.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                    let buffer_font = theme_settings.buffer_font.clone();
+                    let text_color = cx.theme().colors().editor_foreground;
+                    let key = MathKey {
+                        source: source.clone(),
+                        style,
+                    };
+                    let line_height = font_size * theme_settings.line_height();
+                    let text_system = cx.text_system().clone();
+                    let font_id = text_system.resolve_font(&buffer_font);
+                    let ascent = text_system.ascent(font_id, font_size);
+                    // `TextSystem::descent` is negative on macOS (a signed offset
+                    // below the baseline), while the painted baseline's formula
+                    // (`gpui::paint_line`) works in magnitudes — feeding the
+                    // signed value into `baseline_offset` lands 2×descent too
+                    // low, so compute the baseline from magnitudes directly.
+                    let descent = text_system.descent(font_id, font_size).abs();
+                    let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
 
-                match cx
-                    .try_global::<MathCache>()
-                    .and_then(|cache| cache.entries.get(&key))
-                {
-                    Some(MathEntry::Ready {
-                        svg: document,
-                        baseline_fraction,
-                        width_em,
-                        height_em,
-                    }) => {
-                        let math_em = font_size * MATH_FONT_SCALE;
-                        let height = math_em * *height_em;
-                        let width = math_em * *width_em;
-                        // The editor centers inline elements in the line
-                        // (element top lands at `(line_height - height) / 2`),
-                        // while text baselines sit at `baseline_offset`. Shift
-                        // the image by the difference so the formula's
-                        // baseline lands exactly on the text's.
-                        let formula_ascent = height * (1.0 - *baseline_fraction);
-                        let shift = text_baseline - (line_height - height) / 2.0 - formula_ascent;
-                        // The centering offsets a padded element by half its
-                        // padding, so doubling the needed shift as one-sided
-                        // padding moves the image by exactly `shift` without
-                        // relying on inset positioning.
-                        let (pad_top, pad_bottom) = if shift >= gpui::px(0.) {
-                            (shift * 2.0, gpui::px(0.))
-                        } else {
-                            (gpui::px(0.), shift * -2.0)
-                        };
-                        div()
-                            .h(height + pad_top + pad_bottom)
-                            .w(width)
-                            .pt(pad_top)
-                            .pb(pad_bottom)
-                            .child(
-                                svg()
-                                    .data(document)
-                                    .text_color(text_color)
-                                    .h(height)
-                                    .w(width),
-                            )
-                            .into_any_element()
+                    match cx
+                        .try_global::<MathCache>()
+                        .and_then(|cache| cache.entries.get(&key))
+                    {
+                        Some(MathEntry::Ready {
+                            svg: document,
+                            baseline_fraction,
+                            width_em,
+                            height_em,
+                        }) => {
+                            let math_em = font_size * MATH_FONT_SCALE;
+                            let height = math_em * *height_em;
+                            let width = math_em * *width_em;
+                            // The editor centers inline elements in the line
+                            // (element top lands at `(line_height - height) / 2`),
+                            // while text baselines sit at `baseline_offset`. Shift
+                            // the image by the difference so the formula's
+                            // baseline lands exactly on the text's.
+                            let formula_ascent = height * (1.0 - *baseline_fraction);
+                            let shift =
+                                text_baseline - (line_height - height) / 2.0 - formula_ascent;
+                            // The centering offsets a padded element by half its
+                            // padding, so doubling the needed shift as one-sided
+                            // padding moves the image by exactly `shift` without
+                            // relying on inset positioning.
+                            let (pad_top, pad_bottom) = if shift >= gpui::px(0.) {
+                                (shift * 2.0, gpui::px(0.))
+                            } else {
+                                (gpui::px(0.), shift * -2.0)
+                            };
+                            div()
+                                .h(height + pad_top + pad_bottom)
+                                .w(width)
+                                .pt(pad_top)
+                                .pb(pad_bottom)
+                                .child(
+                                    svg()
+                                        .data(document)
+                                        .text_color(text_color)
+                                        .h(height)
+                                        .w(width),
+                                )
+                                .into_any_element()
+                        }
+                        // While a render is in flight — and permanently for a
+                        // formula that does not parse — fall back to the LaTeX
+                        // source, so the text never disappears out from under
+                        // the user.
+                        entry => math_source_fallback(fold_id, source, entry, font_size, cx),
                     }
-                    // While a render is in flight — and permanently for a
-                    // formula that does not parse — fall back to the LaTeX
-                    // source, so the text never disappears out from under
-                    // the user.
-                    entry => math_source_fallback(fold_id, source.clone(), entry, cx),
-                }
+                })
+                .into_any_element()
             })
         }
     };
@@ -6042,6 +6144,7 @@ fn render_math_block(
                     block_cx.block_id,
                     source.clone(),
                     entry,
+                    font_size,
                     cx,
                 ))
                 .into_any_element(),

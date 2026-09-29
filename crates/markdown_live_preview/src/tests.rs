@@ -4229,6 +4229,63 @@ async fn test_concealed_source_selection_with_unrelated_fold_contract(cx: &mut T
     });
 }
 
+/// The minimap shares its parent's display map and so lays out live preview's
+/// placeholders too. Only the font size each editor pushes as the inherited
+/// text style keeps them at minimap scale instead of drawing buffer-sized
+/// links and bullets over the minimap's rows (#103).
+#[gpui::test]
+async fn test_placeholder_sees_painting_editor_font_size_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇabove\nconcealed text\n");
+    cx.executor().run_until_parked();
+
+    let seen = Arc::new(Mutex::new(None));
+    cx.update_editor(|editor, _, cx| {
+        let buffer = editor.buffer().read(cx).snapshot(cx);
+        let render_seen = seen.clone();
+        editor.set_concealments(
+            std::any::TypeId::of::<EditorTestContext>(),
+            vec![editor::display_map::Concealment {
+                range: buffer.anchor_before(Point::new(1, 0))
+                    ..buffer.anchor_after(Point::new(1, 9)),
+                placeholder: editor::display_map::FoldPlaceholder {
+                    render: Arc::new(move |_, _, _| {
+                        let seen = render_seen.clone();
+                        at_editor_font_size(move |font_size, _| {
+                            if let Ok(mut seen) = seen.lock() {
+                                *seen = Some(font_size);
+                            }
+                            div().child("concealed").into_any_element()
+                        })
+                        .into_any_element()
+                    }),
+                    constrain_width: false,
+                    collapsed_text: Some("concealed".into()),
+                    ..Default::default()
+                },
+                content_key: 0,
+            }],
+            cx,
+        );
+    });
+    cx.executor().run_until_parked();
+    let buffer_font_size =
+        cx.update(|_, cx| theme_settings::ThemeSettings::get_global(cx).buffer_font_size(cx));
+    assert_eq!(*seen.lock().unwrap(), Some(buffer_font_size));
+
+    // The minimap overrides its font size exactly like this.
+    *seen.lock().unwrap() = None;
+    cx.update_editor(|editor, _, cx| {
+        editor.set_text_style_refinement(TextStyleRefinement {
+            font_size: Some(gpui::px(5.).into()),
+            ..Default::default()
+        });
+        cx.notify();
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(*seen.lock().unwrap(), Some(gpui::px(5.)));
+}
+
 /// Live preview relies on editor line styles changing vertical geometry without
 /// changing logical row identity. If those coordinate transforms diverge, headings
 /// render at the right size while cursors, hit-testing, and scrolling use the wrong row.
