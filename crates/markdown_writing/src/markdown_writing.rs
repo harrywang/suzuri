@@ -34,6 +34,26 @@ actions!(
         ToggleInlineCode,
         /// Turns the selection into a link, or a link back into its text.
         InsertLink,
+        /// Makes the lines in the selection a level 1 heading, or body text
+        /// if they already are one.
+        ToggleHeading1,
+        /// Makes the lines in the selection a level 2 heading, or body text
+        /// if they already are one.
+        ToggleHeading2,
+        /// Makes the lines in the selection a level 3 heading, or body text
+        /// if they already are one.
+        ToggleHeading3,
+        /// Makes the lines in the selection a level 4 heading, or body text
+        /// if they already are one.
+        ToggleHeading4,
+        /// Makes the lines in the selection a level 5 heading, or body text
+        /// if they already are one.
+        ToggleHeading5,
+        /// Makes the lines in the selection a level 6 heading, or body text
+        /// if they already are one.
+        ToggleHeading6,
+        /// Turns the headings in the selection back into body text.
+        ClearHeading,
     ]
 );
 
@@ -65,6 +85,13 @@ fn register_editor(editor: &mut Editor, _window: Option<&mut Window>, _cx: &mut 
         toggle_emphasis(text, selection, Emphasis::Code)
     });
     register::<InsertLink>(editor, toggle_link);
+    register::<ToggleHeading1>(editor, |text, selection| set_heading(text, selection, 1));
+    register::<ToggleHeading2>(editor, |text, selection| set_heading(text, selection, 2));
+    register::<ToggleHeading3>(editor, |text, selection| set_heading(text, selection, 3));
+    register::<ToggleHeading4>(editor, |text, selection| set_heading(text, selection, 4));
+    register::<ToggleHeading5>(editor, |text, selection| set_heading(text, selection, 5));
+    register::<ToggleHeading6>(editor, |text, selection| set_heading(text, selection, 6));
+    register::<ClearHeading>(editor, |text, selection| set_heading(text, selection, 0));
 }
 
 fn register<A: gpui::Action>(editor: &mut Editor, transform: fn(&str, Range<usize>) -> Change) {
@@ -493,6 +520,98 @@ fn toggle_link(text: &str, selection: Range<usize>) -> Change {
     }
 }
 
+/// The length of an ATX heading's prefix (up to three spaces of indent, the
+/// `#` run and the whitespace after it) and its level, or `(0, 0)` for a line
+/// that is not a heading. A heading needs the space after its `#` run, so a
+/// `#tag` at the start of a line is left alone.
+fn heading_prefix(line: &str) -> (usize, usize) {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return (0, 0);
+    }
+    let after_indent = &line[indent..];
+    let level = after_indent.len() - after_indent.trim_start_matches('#').len();
+    let after_hashes = &after_indent[level..];
+    let spacing = after_hashes.len() - after_hashes.trim_start_matches([' ', '\t']).len();
+    if !(1..=6).contains(&level) || (spacing == 0 && !after_hashes.is_empty()) {
+        return (0, 0);
+    }
+    (indent + level + spacing, level)
+}
+
+/// Gives every line the selection touches a level `level` heading, or body
+/// text when `level` is 0. Lines that all have that level already become body
+/// text instead, the way the emphasis commands toggle.
+fn set_heading(text: &str, selection: Range<usize>, level: usize) -> Change {
+    let start = text[..selection.start]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+    // A selection that ends at the start of a line, as a triple-click leaves
+    // it, does not take that line along.
+    let last = if selection.end > start && text[..selection.end].ends_with('\n') {
+        selection.end - 1
+    } else {
+        selection.end
+    };
+    let end = text[last..]
+        .find('\n')
+        .map_or(text.len(), |index| last + index);
+    let lines: Vec<&str> = text[start..end].split('\n').collect();
+    // Across several lines, blank ones stay blank rather than becoming empty
+    // headings; a blank line on its own gets the prefix to type after.
+    let single_line = lines.len() == 1;
+    let is_target = |line: &str| single_line || !line.trim().is_empty();
+    let already = level > 0
+        && lines
+            .iter()
+            .filter(|line| is_target(line))
+            .all(|line| heading_prefix(line).1 == level);
+    let prefix = if level == 0 || already {
+        String::new()
+    } else {
+        format!("{} ", "#".repeat(level))
+    };
+
+    let mut output = String::with_capacity(end - start + lines.len() * prefix.len());
+    // Each line's start before and after the edit, with its prefix length
+    // before and after, so the selection can be carried across.
+    let mut line_maps = Vec::with_capacity(lines.len());
+    let mut old_line_start = start;
+    for (index, line) in lines.iter().enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let (old_prefix, new_prefix) = if is_target(line) {
+            (heading_prefix(line).0, prefix.as_str())
+        } else {
+            (0, "")
+        };
+        line_maps.push((old_line_start, old_prefix, output.len(), new_prefix.len()));
+        output.push_str(new_prefix);
+        output.push_str(&line[old_prefix..]);
+        old_line_start += line.len() + 1;
+    }
+
+    let map = |offset: usize| {
+        if offset > end {
+            return output.len() + offset - end;
+        }
+        let (old_line_start, old_prefix, new_line_start, new_prefix) = line_maps
+            .iter()
+            .rev()
+            .find(|(old_line_start, ..)| *old_line_start <= offset)
+            .copied()
+            .unwrap_or((start, 0, 0, 0));
+        // A cursor inside the old prefix lands just after the new one.
+        new_line_start + new_prefix + offset.saturating_sub(old_line_start + old_prefix)
+    };
+    Change {
+        range: start..end,
+        selection: map(selection.start)..map(selection.end),
+        text: output,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +684,47 @@ mod tests {
 
     fn link(marked: &str) -> String {
         run(marked, toggle_link)
+    }
+
+    fn heading(level: usize, marked: &str) -> String {
+        run(marked, |text, selection| {
+            set_heading(text, selection, level)
+        })
+    }
+
+    #[test]
+    fn heading_prefixes_the_line_and_keeps_the_cursor_in_its_text() {
+        assert_eq!(heading(2, "Heˇllo"), "## Heˇllo");
+        assert_eq!(heading(2, "a\nHeˇllo\nb"), "a\n## Heˇllo\nb");
+        assert_eq!(heading(3, "ˇ"), "### ˇ");
+    }
+
+    #[test]
+    fn heading_changes_an_existing_level_and_the_same_level_toggles_it_off() {
+        assert_eq!(heading(1, "### Heˇllo"), "# Heˇllo");
+        assert_eq!(heading(2, "## Heˇllo"), "Heˇllo");
+        assert_eq!(heading(0, "  ##   Heˇllo"), "Heˇllo");
+        assert_eq!(heading(0, "plain ˇtext"), "plain ˇtext");
+    }
+
+    #[test]
+    fn a_cursor_inside_the_old_prefix_lands_after_the_new_one() {
+        assert_eq!(heading(1, "##ˇ Title"), "# ˇTitle");
+        assert_eq!(heading(0, "#ˇ# Title"), "ˇTitle");
+    }
+
+    #[test]
+    fn tags_and_over_long_runs_are_not_headings() {
+        assert_eq!(heading(1, "#taˇg"), "# #taˇg");
+        assert_eq!(heading(0, "####### sevˇen"), "####### sevˇen");
+    }
+
+    #[test]
+    fn a_selection_sets_every_line_it_touches_and_skips_blank_ones() {
+        assert_eq!(heading(2, "«one\n\ntwo»"), "## «one\n\n## two»");
+        assert_eq!(heading(2, "«# one\n## two»"), "## «one\n## two»");
+        assert_eq!(heading(2, "«## one\n## two»"), "«one\ntwo»");
+        assert_eq!(heading(1, "«one\n»two"), "# «one\n»two");
     }
 
     #[test]

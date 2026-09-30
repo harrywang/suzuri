@@ -619,6 +619,15 @@
     "bindings": {
       "ctrl-b": "markdown::ToggleBold",
       "ctrl-i": "markdown::ToggleItalic",
+      // Google Docs' heading shortcuts. Windows is left out: there ctrl-alt
+      // is AltGr, which types characters such as `}` on many layouts.
+      "ctrl-alt-1": "markdown::ToggleHeading1",
+      "ctrl-alt-2": "markdown::ToggleHeading2",
+      "ctrl-alt-3": "markdown::ToggleHeading3",
+      "ctrl-alt-4": "markdown::ToggleHeading4",
+      "ctrl-alt-5": "markdown::ToggleHeading5",
+      "ctrl-alt-6": "markdown::ToggleHeading6",
+      "ctrl-alt-0": "markdown::ClearHeading",
     },
   },
   {
