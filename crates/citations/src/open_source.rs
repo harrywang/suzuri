@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use editor::Editor;
 use editor::ToOffset as _;
-use gpui::{App, Context, TaskExt as _, Window, actions};
+use gpui::{App, Context, InteractiveElement as _, TaskExt as _, Window, actions};
 use project::Project;
 use settings::Settings as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -24,8 +24,21 @@ actions!(
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|workspace, _: &OpenSource, window, cx| {
-            open_source(workspace, window, cx);
+        // Attached per render, and only while the cursor is on a citation
+        // key, so the menu item greys out anywhere else.
+        workspace.register_action_renderer(|div, workspace, _window, cx| {
+            let on_key = workspace
+                .active_item_as::<Editor>(cx)
+                .and_then(|editor| {
+                    source_for_cursor(editor.read(cx), workspace.project().read(cx), cx)
+                })
+                .is_some();
+            if !on_key {
+                return div;
+            }
+            div.on_action(cx.listener(|workspace, _: &OpenSource, window, cx| {
+                open_source(workspace, window, cx);
+            }))
         });
     })
     .detach();
@@ -154,6 +167,71 @@ mod tests {
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             editor::init(cx);
         });
+    }
+
+    /// The Document menu greys an item out when `is_action_available` finds
+    /// no listener, so these actions must only be listened for while they
+    /// can do something.
+    #[gpui::test]
+    async fn citation_actions_are_available_only_where_they_apply(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            init(cx);
+            crate::insert_citation::init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/vault", json!({ "Note.md": "See [@smith2020]." }))
+            .await;
+        let project = Project::test(fs.clone(), ["/vault".as_ref()], cx).await;
+        // The multi-workspace is what renders the workspace's action
+        // listeners, so it has to be the window's root, as in the app.
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let available = |action: &dyn gpui::Action, cx: &mut gpui::VisualTestContext| {
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.is_action_available(action, cx)
+            })
+        };
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            Editor::new_file(workspace, &workspace::NewFile, window, cx)
+        });
+        assert!(!available(&crate::InsertCitation, cx), "an unsaved buffer");
+        assert!(!available(&OpenSource, cx), "an unsaved buffer");
+
+        let note_path = project
+            .read_with(cx, |project, cx| {
+                project.find_project_path("/vault/Note.md", cx)
+            })
+            .expect("the note is in the vault");
+        let editor = workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.open_path(note_path, None, true, window, cx)
+            })
+            .await
+            .expect("failed to open the note")
+            .downcast::<Editor>()
+            .expect("a markdown file opens in an editor");
+        let place_cursor = |offset: u32, cx: &mut gpui::VisualTestContext| {
+            editor.update_in(cx, |editor, window, cx| {
+                let point = text::Point::new(0, offset);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([point..point]);
+                });
+            });
+        };
+
+        place_cursor(0, cx);
+        assert!(available(&crate::InsertCitation, cx), "a saved note");
+        assert!(!available(&OpenSource, cx), "the cursor is off any key");
+
+        place_cursor("See [@smi".len() as u32, cx);
+        assert!(available(&OpenSource, cx), "the cursor is on a key");
     }
 
     #[gpui::test]

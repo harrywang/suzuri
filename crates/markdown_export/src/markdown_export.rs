@@ -15,7 +15,9 @@
 use std::path::{Path, PathBuf};
 
 use editor::Editor;
-use gpui::{App, AppContext as _, Context, Entity, TaskExt as _, Window, actions};
+use gpui::{
+    App, AppContext as _, Context, Entity, InteractiveElement as _, TaskExt as _, Window, actions,
+};
 use project::Project;
 use settings::{RegisterSetting, Settings as _};
 use util::ResultExt as _;
@@ -105,23 +107,46 @@ struct ExportToast;
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|workspace, _: &ExportToPdf, window, cx| {
-            export(workspace, Format::Pdf, window, cx);
-        });
-        workspace.register_action(|workspace, _: &ExportToDocx, window, cx| {
-            export(workspace, Format::Docx, window, cx);
-        });
-        workspace.register_action(|workspace, _: &ExportToHtml, window, cx| {
-            export(workspace, Format::Html, window, cx);
-        });
-        workspace.register_action(|workspace, _: &ExportToLatex, window, cx| {
-            export(workspace, Format::Latex, window, cx);
-        });
-        workspace.register_action(|workspace, _: &ExportToEpub, window, cx| {
-            export(workspace, Format::Epub, window, cx);
+        // Attached per render, and only while the active item is a saved
+        // markdown note, so the Export menus grey out when there is nothing
+        // to export instead of answering with a toast.
+        workspace.register_action_renderer(|div, workspace, _window, cx| {
+            if !can_export(workspace, cx) {
+                return div;
+            }
+            div.on_action(cx.listener(|workspace, _: &ExportToPdf, window, cx| {
+                export(workspace, Format::Pdf, window, cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &ExportToDocx, window, cx| {
+                export(workspace, Format::Docx, window, cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &ExportToHtml, window, cx| {
+                export(workspace, Format::Html, window, cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &ExportToLatex, window, cx| {
+                export(workspace, Format::Latex, window, cx);
+            }))
+            .on_action(cx.listener(|workspace, _: &ExportToEpub, window, cx| {
+                export(workspace, Format::Epub, window, cx);
+            }))
         });
     })
     .detach();
+}
+
+/// Runs on every render, so it only resolves the path; `read_editor` is
+/// what copies the note's text once an export actually starts.
+fn can_export(workspace: &Workspace, cx: &App) -> bool {
+    workspace
+        .active_item_as::<Editor>(cx)
+        .and_then(|editor| markdown_path(editor.read(cx), cx))
+        .is_some()
+}
+
+fn markdown_path(editor: &Editor, cx: &App) -> Option<PathBuf> {
+    let buffer = editor.buffer().read(cx).as_singleton()?;
+    let path = buffer.read(cx).file()?.as_local()?.abs_path(cx);
+    is_markdown(&path).then_some(path)
 }
 
 /// Everything one export needs, gathered while the main thread still has the

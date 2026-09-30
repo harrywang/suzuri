@@ -5,10 +5,10 @@
 //! them by hand feel broken rather than minimal. These commands edit the
 //! markdown source, so the note stays plain text that every other tool reads.
 
-use std::ops::Range;
+use std::{any::TypeId, ops::Range};
 
 use editor::Editor;
-use gpui::{App, Context, Window, actions};
+use gpui::{App, Context, DispatchPhase, Window, actions};
 use language::LanguageName;
 use multi_buffer::MultiBufferOffset;
 use util::ResultExt as _;
@@ -43,44 +43,45 @@ pub fn init(cx: &mut App) {
     cx.observe_new(register_editor).detach();
 }
 
-fn register_editor(editor: &mut Editor, _window: Option<&mut Window>, cx: &mut Context<Editor>) {
+fn register_editor(editor: &mut Editor, _window: Option<&mut Window>, _cx: &mut Context<Editor>) {
     if !editor.mode().is_full() {
         return;
     }
     // Registered on every full editor rather than only markdown ones: a
     // buffer's language is often detected after its editor is created, and a
     // note opened that way would otherwise never get the commands. The
-    // handlers check the language when they run instead.
-    register::<ToggleBold>(editor, cx, |text, selection| {
+    // listeners are attached per render instead, and only while the buffer is
+    // markdown, so the Format menu greys out everywhere else.
+    register::<ToggleBold>(editor, |text, selection| {
         toggle_emphasis(text, selection, Emphasis::Bold)
     });
-    register::<ToggleItalic>(editor, cx, |text, selection| {
+    register::<ToggleItalic>(editor, |text, selection| {
         toggle_emphasis(text, selection, Emphasis::Italic)
     });
-    register::<ToggleStrikethrough>(editor, cx, |text, selection| {
+    register::<ToggleStrikethrough>(editor, |text, selection| {
         toggle_emphasis(text, selection, Emphasis::Strikethrough)
     });
-    register::<ToggleInlineCode>(editor, cx, |text, selection| {
+    register::<ToggleInlineCode>(editor, |text, selection| {
         toggle_emphasis(text, selection, Emphasis::Code)
     });
-    register::<InsertLink>(editor, cx, toggle_link);
+    register::<InsertLink>(editor, toggle_link);
 }
 
-fn register<A: gpui::Action>(
-    editor: &mut Editor,
-    cx: &mut Context<Editor>,
-    transform: fn(&str, Range<usize>) -> Change,
-) {
-    let weak_editor = cx.weak_entity();
+fn register<A: gpui::Action>(editor: &mut Editor, transform: fn(&str, Range<usize>) -> Change) {
     editor
-        .register_action::<A>(move |_, window, cx| {
-            weak_editor
-                .update(cx, |editor, cx| {
-                    if is_markdown(editor, cx) {
-                        apply(editor, transform, window, cx);
-                    }
-                })
-                .log_err();
+        .register_action_renderer(move |editor, window, cx| {
+            if !is_markdown(editor, cx) {
+                return;
+            }
+            let weak_editor = cx.weak_entity();
+            window.on_action(TypeId::of::<A>(), move |_, phase, window, cx| {
+                if phase != DispatchPhase::Bubble {
+                    return;
+                }
+                weak_editor
+                    .update(cx, |editor, cx| apply(editor, transform, window, cx))
+                    .log_err();
+            });
         })
         .detach();
 }
@@ -495,6 +496,32 @@ fn toggle_link(text: &str, selection: Range<usize>) -> Change {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Format menu greys an item out when `is_action_available` finds no
+    /// listener, and a buffer's language can arrive after its editor exists.
+    #[gpui::test]
+    async fn format_commands_are_available_only_in_markdown(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            editor::init(cx);
+            init(cx);
+        });
+        let mut cx = editor::test::editor_test_context::EditorTestContext::new(cx).await;
+        cx.set_state("ˇplain text");
+        let bold_available = |cx: &mut editor::test::editor_test_context::EditorTestContext| {
+            cx.executor().run_until_parked();
+            cx.update(|window, cx| {
+                window.draw(cx).clear(cx);
+                window.is_action_available(&ToggleBold, cx)
+            })
+        };
+        assert!(!bold_available(&mut cx), "a buffer with no language");
+
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language::markdown_lang()), cx));
+        assert!(bold_available(&mut cx), "the buffer became markdown");
+    }
 
     /// Applies a change to `text` and renders the selection as `«…»`, or `ˇ`
     /// for a cursor, so a test reads as before and after.

@@ -44,19 +44,45 @@ actions!(
 
 pub fn init(cx: &mut App) {
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
-        workspace.register_action(|workspace, _: &InsertCitation, window, cx| {
-            let zotero_url = CitationsSettings::get_global(cx).zotero_url.clone();
-            let zotero = match ZoteroClient::local(zotero_url) {
-                Ok(client) => Arc::new(client),
-                Err(error) => {
-                    log::error!("citations: {error:#}");
-                    return;
-                }
-            };
-            CitationPicker::open(workspace, zotero, window, cx);
+        // Attached per render, and only while there is a saved file to cite
+        // into, so the menu item greys out rather than doing nothing.
+        workspace.register_action_renderer(|div, workspace, _window, cx| {
+            if !can_insert_citation(workspace, cx) {
+                return div;
+            }
+            div.on_action(cx.listener(|workspace, _: &InsertCitation, window, cx| {
+                let zotero_url = CitationsSettings::get_global(cx).zotero_url.clone();
+                let zotero = match ZoteroClient::local(zotero_url) {
+                    Ok(client) => Arc::new(client),
+                    Err(error) => {
+                        log::error!("citations: {error:#}");
+                        return;
+                    }
+                };
+                CitationPicker::open(workspace, zotero, window, cx);
+            }))
         });
     })
     .detach();
+}
+
+/// What [`CitationPicker::open`] needs: an editor on a file inside a
+/// worktree, whose root the vault library is resolved against.
+fn can_insert_citation(workspace: &Workspace, cx: &App) -> bool {
+    let Some(editor) = workspace.active_item_as::<Editor>(cx) else {
+        return false;
+    };
+    let Some(buffer) = editor.read(cx).buffer().read(cx).as_singleton() else {
+        return false;
+    };
+    let Some(file) = buffer.read(cx).file() else {
+        return false;
+    };
+    workspace
+        .project()
+        .read(cx)
+        .worktree_for_id(file.worktree_id(cx), cx)
+        .is_some()
 }
 
 /// The citation syntax of the buffer being edited, chosen by file
