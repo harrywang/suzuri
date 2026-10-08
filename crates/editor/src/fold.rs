@@ -601,6 +601,7 @@ impl Editor {
         self.scrollbar_marker_state.dirty = true;
         self.update_data_on_scroll(false, window, cx);
         self.folds_did_change(cx);
+        self.inlay_hint_visibility_changed(cx);
     }
 
     /// Removes any folds whose ranges intersect any of the given ranges.
@@ -615,6 +616,7 @@ impl Editor {
             map.unfold_intersecting(ranges.iter().cloned(), inclusive, cx);
         });
         self.folds_did_change(cx);
+        self.inlay_hint_visibility_changed(cx);
     }
 
     pub fn fold_buffer(&mut self, buffer_id: BufferId, cx: &mut Context<Self>) {
@@ -658,6 +660,7 @@ impl Editor {
             ids: ids_to_fold,
             folded: true,
         });
+        self.inlay_hint_visibility_changed(cx);
         cx.notify();
     }
 
@@ -672,6 +675,7 @@ impl Editor {
             ids: vec![buffer_id],
             folded: false,
         });
+        self.inlay_hint_visibility_changed(cx);
         cx.notify();
     }
 
@@ -709,6 +713,7 @@ impl Editor {
             map.remove_folds_with_type(ranges.iter().cloned(), type_id, cx)
         });
         self.folds_did_change(cx);
+        self.inlay_hint_visibility_changed(cx);
     }
 
     pub fn update_renderer_widths(
