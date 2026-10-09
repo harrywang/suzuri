@@ -937,6 +937,13 @@ impl FoldSnapshot {
         &self.inlay_snapshot.buffer
     }
 
+    pub(super) fn is_inlay_offset_folded(&self, offset: InlayOffset) -> bool {
+        let (_, _, item) = self
+            .transforms
+            .find::<InlayOffset, _>((), &offset, Bias::Right);
+        item.is_some_and(|transform| transform.placeholder.is_some())
+    }
+
     #[ztracing::instrument(skip_all)]
     fn fold_width(&self, fold_id: &FoldId) -> Option<Pixels> {
         self.fold_metadata_by_id.get(fold_id)?.width

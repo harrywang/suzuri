@@ -739,9 +739,11 @@ impl WrapSnapshot {
                     let row = edit.new_rows.start + i as u32;
                     let scale = line_font_scales.get(&row).copied().unwrap_or(1.0);
                     let effective_wrap_width = wrap_width / scale.max(0.01);
-                    for boundary in
-                        line_wrapper.wrap_line(&line_fragments, effective_wrap_width, indent_adjustment)
-                    {
+                    for boundary in line_wrapper.wrap_line(
+                        &line_fragments,
+                        effective_wrap_width,
+                        indent_adjustment,
+                    ) {
                         let wrapped = &line[prev_boundary_ix..boundary.ix];
                         push_isomorphic(&mut edit_transforms, TextSummary::from(wrapped));
                         edit_transforms.push(Transform::wrap(boundary.next_indent));
