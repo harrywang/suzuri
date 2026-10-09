@@ -1652,6 +1652,7 @@
       "ctrl-0": "pdf_viewer::ResetZoom",
       "ctrl-1": "pdf_viewer::ZoomToActualSize",
       "ctrl-shift-0": "pdf_viewer::FitToView",
+      "ctrl-g": "pdf_viewer::GoToPage",
     },
   },
   {

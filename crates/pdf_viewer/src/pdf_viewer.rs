@@ -24,12 +24,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use editor::{Editor, EditorEvent, actions::SelectAll};
 use file_icons::FileIcons;
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, Font,
     IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, Styled, Task, Window, actions, div, img, point,
-    px,
+    ScrollHandle, ScrollWheelEvent, SharedString, Styled, Subscription, Task, TextAlign,
+    TextStyleRefinement, Window, actions, div, img, point, px,
 };
 use project::Project;
 use ui::WithScrollbar;
@@ -74,6 +75,8 @@ actions!(
         ZoomToActualSize,
         /// Copy all document text to the clipboard.
         CopyDocumentText,
+        /// Type a page number to jump to that page.
+        GoToPage,
     ]
 );
 
@@ -117,6 +120,12 @@ pub struct PdfViewer {
     selection_start: Option<TextPosition>,
     selection_end: Option<TextPosition>,
     is_selecting: bool,
+    /// The page number in the status bar, editable to jump to a page.
+    page_input: Entity<Editor>,
+    /// The page last written into `page_input`. `None` makes the next frame
+    /// write the current page, which is how a half-typed number is discarded.
+    shown_page: Option<usize>,
+    _page_input_subscription: Subscription,
 }
 
 /// The rendered page cache, keyed by page index, holding the scale each page
@@ -194,13 +203,40 @@ impl PdfViewer {
         .detach();
     }
 
+    fn new_page_input(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<Editor>, Subscription) {
+        let page_input = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text_style_refinement(TextStyleRefinement {
+                color: Some(cx.theme().colors().text),
+                text_align: Some(TextAlign::Center),
+                ..Default::default()
+            });
+            editor
+        });
+        let subscription = cx.subscribe_in(
+            &page_input,
+            window,
+            |this, _, event: &EditorEvent, _window, cx| {
+                if let EditorEvent::Blurred = event {
+                    this.shown_page = None;
+                    cx.notify();
+                }
+            },
+        );
+        (page_input, subscription)
+    }
+
     pub fn new(
         pdf_item: Entity<PdfItem>,
         project: Entity<Project>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         Self::register_subscriptions(&pdf_item, cx);
+        let (page_input, page_input_subscription) = Self::new_page_input(window, cx);
         let mut this = Self {
             pdf_item,
             project,
@@ -223,6 +259,9 @@ impl PdfViewer {
             selection_start: None,
             selection_end: None,
             is_selecting: false,
+            page_input,
+            shown_page: None,
+            _page_input_subscription: page_input_subscription,
         };
         this.load_metadata(cx);
         this
@@ -412,6 +451,87 @@ impl PdfViewer {
         let first = first_visible.unwrap_or(0);
         let last = (last_visible + 1).min(dimensions.len());
         first..last
+    }
+
+    /// How far below the top of the pages column page `index` starts.
+    fn page_top(&self, index: usize, container_width: f32) -> f32 {
+        self.page_dimensions()
+            .iter()
+            .take(index)
+            .map(|dim| Self::display_height(dim, container_width, self.zoom_level) + PAGE_GAP_PX)
+            .sum()
+    }
+
+    /// The page shown as current: the first one reaching below the canvas
+    /// gutter at the top of the viewport. That is the line `scroll_to_page`
+    /// puts a page's top on, so jumping to a page always shows its number.
+    fn current_page(&self, viewport_width: f32) -> usize {
+        let page_count = self.page_count();
+        if page_count == 0 {
+            return 0;
+        }
+        let offset = -self.scroll_handle.offset().y;
+        let max_offset = self.scroll_handle.max_offset().y;
+        // The last pages cannot be scrolled to the top of the viewport, so
+        // the end of the document counts as the last page; otherwise jumping
+        // to it would show the number of a page above it.
+        if max_offset > px(0.0) && offset >= max_offset - px(1.0) {
+            return page_count - 1;
+        }
+
+        let container_width = Self::page_fit_width(viewport_width);
+        let probe: f32 = offset.into();
+        let mut page_bottom = 0.0;
+        for (index, dim) in self.page_dimensions().iter().enumerate() {
+            page_bottom += Self::display_height(dim, container_width, self.zoom_level);
+            if page_bottom > probe {
+                return index;
+            }
+            page_bottom += PAGE_GAP_PX;
+        }
+        page_count - 1
+    }
+
+    /// Scrolls so page `index` sits one canvas gutter below the top of the
+    /// viewport, as the first page does at the start of the document.
+    fn scroll_to_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        let viewport_width: f32 = self.scroll_handle.bounds().size.width.into();
+        let top = self.page_top(index, Self::page_fit_width(viewport_width));
+        let offset = self.scroll_handle.offset();
+        self.scroll_handle.set_offset(point(offset.x, px(-top)));
+        cx.notify();
+    }
+
+    fn go_to_page(&mut self, _: &GoToPage, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page_count() == 0 {
+            return;
+        }
+        let focus_handle = self.page_input.focus_handle(cx);
+        window.focus(&focus_handle, cx);
+        self.page_input.update(cx, |editor, cx| {
+            editor.select_all(&SelectAll, window, cx);
+        });
+    }
+
+    fn confirm_page(&mut self, _: &menu::Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        let page_count = self.page_count();
+        let typed = self.page_input.read(cx).text(cx);
+        if let Ok(number) = typed.trim().parse::<usize>()
+            && page_count > 0
+        {
+            self.scroll_to_page(number.clamp(1, page_count) - 1, cx);
+        }
+        self.leave_page_input(window, cx);
+    }
+
+    fn cancel_page(&mut self, _: &menu::Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_page_input(window, cx);
+    }
+
+    fn leave_page_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.shown_page = None;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
     }
 
     fn buffered_range(&self, visible: Range<usize>) -> Range<usize> {
@@ -862,36 +982,41 @@ impl Render for PdfViewer {
             }
         };
 
-        let bounds = self.scroll_handle.bounds();
-        let vp_h: f32 = bounds.size.height.into();
-        let vp_w: f32 = bounds.size.width.into();
-        let vp_h = if vp_h > 0.0 { vp_h } else { 800.0 };
+        let vp_w: f32 = self.scroll_handle.bounds().size.width.into();
         let vp_w = if vp_w > 0.0 { vp_w } else { 600.0 };
 
         let zoom_percent = (self.zoom_level * 100.0).round() as u32;
-        let page_info = if self.page_count() > 0 {
-            let visible = self.visible_page_range(vp_h, vp_w);
-            let first = visible.start + 1;
-            let last = if visible.end > 0 { visible.end } else { 1 };
-            if first == last || visible.end - visible.start <= 1 {
-                format!(
-                    "Page {} of {}  ·  {}%",
-                    first,
-                    self.page_count(),
-                    zoom_percent,
-                )
-            } else {
-                format!(
-                    "Pages {}-{} of {}  ·  {}%",
-                    first,
-                    last,
-                    self.page_count(),
-                    zoom_percent,
-                )
+        let page_count = self.page_count();
+        // The box follows scrolling until someone types a different number
+        // into it. Focus alone does not freeze it: scrolling never moves focus
+        // out of the box, so a reader who clicked it once would otherwise be
+        // left with a stale number until pressing Enter or Escape.
+        if page_count > 0 {
+            let current_page = self.current_page(vp_w);
+            let typed = self.page_input.read(cx).text(cx);
+            let untouched = self
+                .shown_page
+                .is_some_and(|shown| typed == (shown + 1).to_string());
+            if self.shown_page.is_none() || (self.shown_page != Some(current_page) && untouched) {
+                self.shown_page = Some(current_page);
+                // Deferred past this frame: an editor whose text is replaced
+                // while the window is drawing laid out an empty line, so after
+                // the first page every number the box was given came out blank.
+                cx.defer_in(window, move |this, window, cx| {
+                    let focused = this.page_input.focus_handle(cx).is_focused(window);
+                    this.page_input.update(cx, |editor, cx| {
+                        editor.set_text((current_page + 1).to_string(), window, cx);
+                        // Keep "focus, then type to replace" working while the
+                        // number changes under a focused box.
+                        if focused {
+                            editor.select_all(&SelectAll, window, cx);
+                        }
+                    });
+                });
             }
-        } else {
-            "Loading...".to_string()
-        };
+        }
+        let page_digits = page_count.max(1).to_string().len() as f32;
+        let page_box_width = px(page_digits * 9.0 + 30.0);
 
         v_flex()
             .id("PdfViewer")
@@ -903,6 +1028,7 @@ impl Render for PdfViewer {
             .on_action(cx.listener(Self::fit_to_view))
             .on_action(cx.listener(Self::zoom_to_actual_size))
             .on_action(cx.listener(Self::copy_document_text))
+            .on_action(cx.listener(Self::go_to_page))
             // Take the space the pane leaves rather than asking for the
             // parent's full height: measured in a running window, a
             // `size_full` root put this view's bounds 45px below the pane's
@@ -921,7 +1047,35 @@ impl Render for PdfViewer {
                     .py_1()
                     .border_b_1()
                     .border_color(cx.theme().colors().border)
-                    .child(Label::new(page_info).size(LabelSize::Small)),
+                    .gap_1()
+                    .when(page_count == 0, |row| {
+                        row.child(Label::new("Loading...").size(LabelSize::Small))
+                    })
+                    .when(page_count > 0, |row| {
+                        row.child(Label::new("Page").size(LabelSize::Small))
+                            .child(
+                                div()
+                                    .id("pdf-page-input")
+                                    // Enter and Escape reach the box as menu
+                                    // actions; listening here rather than on
+                                    // the root keeps them from firing while the
+                                    // pages have focus.
+                                    .on_action(cx.listener(Self::confirm_page))
+                                    .on_action(cx.listener(Self::cancel_page))
+                                    .w(page_box_width)
+                                    .px_1()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(cx.theme().colors().border)
+                                    .bg(cx.theme().colors().editor_background)
+                                    .text_ui_sm(cx)
+                                    .child(self.page_input.clone()),
+                            )
+                            .child(
+                                Label::new(format!("of {page_count}  ·  {zoom_percent}%"))
+                                    .size(LabelSize::Small),
+                            )
+                    }),
             )
             // The scrollbar hangs off a wrapper, not the scroll container: a
             // child of the container is painted at the scroll offset, so the
@@ -1024,7 +1178,7 @@ impl Item for PdfViewer {
     fn clone_on_split(
         &self,
         _workspace_id: Option<WorkspaceId>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Option<Entity<Self>>>
     where
@@ -1033,6 +1187,7 @@ impl Item for PdfViewer {
         Task::ready(Some(cx.new(|cx| {
             let pdf_item = self.pdf_item.clone();
             Self::register_subscriptions(&pdf_item, cx);
+            let (page_input, page_input_subscription) = Self::new_page_input(window, cx);
             Self {
                 pdf_item,
                 project: self.project.clone(),
@@ -1068,6 +1223,9 @@ impl Item for PdfViewer {
                 selection_start: None,
                 selection_end: None,
                 is_selecting: false,
+                page_input,
+                shown_page: None,
+                _page_input_subscription: page_input_subscription,
             }
         })))
     }
@@ -1189,7 +1347,7 @@ mod rendered_page_tests {
 }
 
 #[cfg(test)]
-mod scrollbar_tests {
+mod navigation_tests {
     use super::*;
     use fs::FakeFs;
     use gpui::{Modifiers, TestAppContext, VisualTestContext};
@@ -1275,7 +1433,10 @@ mod scrollbar_tests {
         let (viewer, cx) =
             cx.add_window_view(|window, cx| PdfViewer::new(item, project, window, cx));
         cx.run_until_parked();
-        cx.update(|window, _| window.refresh());
+        viewer.update_in(cx, |viewer, window, cx| {
+            window.focus(&viewer.focus_handle, cx);
+            window.refresh();
+        });
         cx.run_until_parked();
         (viewer, cx, dir)
     }
@@ -1337,5 +1498,221 @@ mod scrollbar_tests {
             "a {drag:?} drag should scroll about {expected:?}, but scrolled {moved:?} \
              (from {start_offset:?} to {end_offset:?}, max {max_offset:?})"
         );
+    }
+
+    /// What the box displays, which is what the reader sees. The buffer can
+    /// hold the right number while the display shows something else.
+    fn shown_page_text(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> String {
+        let (buffer, display) = viewer.update(cx, |viewer, cx| {
+            viewer
+                .page_input
+                .update(cx, |editor, cx| (editor.text(cx), editor.display_text(cx)))
+        });
+        assert_eq!(display, buffer, "the box must display the number it holds");
+        display
+    }
+
+    fn scroll_offset(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> Pixels {
+        viewer.read_with(cx, |viewer, _| viewer.scroll_handle.offset().y)
+    }
+
+    fn page_top_offset(
+        viewer: &Entity<PdfViewer>,
+        index: usize,
+        cx: &mut VisualTestContext,
+    ) -> Pixels {
+        viewer.read_with(cx, |viewer, _| {
+            let width: f32 = viewer.scroll_handle.bounds().size.width.into();
+            px(-viewer.page_top(index, PdfViewer::page_fit_width(width)))
+        })
+    }
+
+    fn type_page(text: &str, cx: &mut VisualTestContext) {
+        cx.dispatch_action(GoToPage);
+        cx.simulate_input(text);
+    }
+
+    fn redraw(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) {
+        viewer.update_in(cx, |_, window, _| window.refresh());
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn typing_a_page_number_jumps_to_that_page(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        assert_eq!(shown_page_text(&viewer, cx), "1");
+
+        type_page("4", cx);
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+
+        assert_eq!(
+            scroll_offset(&viewer, cx),
+            page_top_offset(&viewer, 3, cx),
+            "page 4's top should sit one canvas gutter below the top of the view"
+        );
+        assert_eq!(shown_page_text(&viewer, cx), "4");
+        viewer.update_in(cx, |viewer, window, cx| {
+            assert!(
+                viewer.focus_handle(cx).is_focused(window),
+                "confirming hands focus back to the pages"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn page_numbers_out_of_range_go_to_the_nearest_page(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+
+        type_page("99", cx);
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 9, cx));
+        assert_eq!(shown_page_text(&viewer, cx), "10");
+
+        type_page("0", cx);
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        assert_eq!(shown_page_text(&viewer, cx), "1");
+    }
+
+    #[gpui::test]
+    async fn jumping_to_a_last_page_that_cannot_reach_the_top_still_shows_it(
+        cx: &mut TestAppContext,
+    ) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        viewer.update(cx, |viewer, cx| {
+            viewer.zoom_level = 0.2;
+            cx.notify();
+        });
+        redraw(&viewer, cx);
+        let max_offset = viewer.read_with(cx, |viewer, _| viewer.scroll_handle.max_offset().y);
+        assert!(
+            page_top_offset(&viewer, 9, cx) < -max_offset,
+            "zoomed out, the last page's top must lie beyond the end of the scroll range"
+        );
+
+        type_page("10", cx);
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), -max_offset);
+        assert_eq!(
+            shown_page_text(&viewer, cx),
+            "10",
+            "the end of the document counts as the last page, or the box would \
+             answer a jump to page 10 with the number of a page above it"
+        );
+    }
+
+    #[gpui::test]
+    async fn escape_and_non_numbers_leave_the_view_where_it_was(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+
+        type_page("7", cx);
+        cx.dispatch_action(menu::Cancel);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        assert_eq!(
+            shown_page_text(&viewer, cx),
+            "1",
+            "an abandoned number is replaced by the current page"
+        );
+
+        type_page("seven", cx);
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        assert_eq!(shown_page_text(&viewer, cx), "1");
+    }
+
+    #[gpui::test]
+    async fn the_page_box_follows_scrolling(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+
+        let sixth_page = page_top_offset(&viewer, 5, cx);
+        viewer.update(cx, |viewer, _| {
+            viewer.scroll_handle.set_offset(point(px(0.0), sixth_page));
+        });
+        redraw(&viewer, cx);
+        assert_eq!(shown_page_text(&viewer, cx), "6");
+
+        // Page six stays current until its bottom edge passes the line.
+        let seventh_page = page_top_offset(&viewer, 6, cx);
+        viewer.update(cx, |viewer, _| {
+            viewer
+                .scroll_handle
+                .set_offset(point(px(0.0), seventh_page + px(PAGE_GAP_PX + 1.0)));
+        });
+        redraw(&viewer, cx);
+        assert_eq!(shown_page_text(&viewer, cx), "6");
+    }
+
+    fn scroll_to(viewer: &Entity<PdfViewer>, offset: Pixels, cx: &mut VisualTestContext) {
+        viewer.update(cx, |viewer, cx| {
+            viewer.scroll_handle.set_offset(point(px(0.0), offset));
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn page_input_is_focused(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> bool {
+        viewer.update_in(cx, |viewer, window, cx| {
+            viewer.page_input.focus_handle(cx).is_focused(window)
+        })
+    }
+
+    #[gpui::test]
+    async fn a_focused_box_still_follows_scrolling(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        cx.dispatch_action(GoToPage);
+        assert!(page_input_is_focused(&viewer, cx));
+
+        let sixth_page = page_top_offset(&viewer, 5, cx);
+        scroll_to(&viewer, sixth_page, cx);
+        assert_eq!(
+            shown_page_text(&viewer, cx),
+            "6",
+            "scrolling does not move focus out of the box, so focus alone must \
+             not freeze the number"
+        );
+
+        cx.simulate_input("3");
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(
+            scroll_offset(&viewer, cx),
+            page_top_offset(&viewer, 2, cx),
+            "the number stays selected as it changes, so typing replaces it"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_typed_number_survives_scrolling(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        type_page("7", cx);
+
+        let sixth_page = page_top_offset(&viewer, 5, cx);
+        scroll_to(&viewer, sixth_page, cx);
+        assert_eq!(shown_page_text(&viewer, cx), "7");
+
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 6, cx));
+    }
+
+    #[gpui::test]
+    async fn clicking_the_pages_leaves_the_box(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        cx.dispatch_action(GoToPage);
+        assert!(page_input_is_focused(&viewer, cx));
+
+        let center = viewer.read_with(cx, |viewer, _| viewer.scroll_handle.bounds().center());
+        cx.simulate_mouse_down(center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(center, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(!page_input_is_focused(&viewer, cx));
+        assert_eq!(shown_page_text(&viewer, cx), "1");
     }
 }
