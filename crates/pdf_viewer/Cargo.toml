@@ -51,4 +51,6 @@ remote_server = { workspace = true, features = ["test-support"] }
 semver.workspace = true
 serde_json.workspace = true
 settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+theme_settings.workspace = true
 workspace = { workspace = true, features = ["test-support"] }
