@@ -107,13 +107,14 @@ anything else, check whether the fork touches the files involved at all:
 
 ## 5. Smoke-test the real app
 
-Every sync gets a GUI check, because the nextest gates are text-only: they never paint,
-so a rendering regression passes them. A concealment placeholder that painted a visible
-blank at every hidden marker got past them exactly that way. The check comes in two tiers.
+Claude runs this, every sync; do not hand it to the user. The nextest gates are
+text-only: they never paint, so a rendering regression passes them. A concealment
+placeholder that painted a visible blank at every hidden marker got past them exactly
+that way. Two automated layers cover what the tests cannot.
 
-**Always: the visual test runner.** It renders offscreen with real Metal, needs no human
-and no Screen Recording permission, so it runs in a background job too. It covers live
-preview rendering, link clicks and source reveal, the citation pipeline, and math:
+**Visual test runner.** It renders offscreen with real Metal, needs no human and no
+Screen Recording permission, so it runs in a background job too. It covers live preview
+rendering, link clicks and source reveal, the citation pipeline, and math.
 
 Its baselines are gitignored (`crates/zed/test_fixtures/visual_tests/`, upstream's
 choice), so a fresh worktree has none and every test "fails" with `Baseline not found`,
@@ -131,24 +132,40 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   && echo OK || echo FAILED
 ```
 
-A mismatch is a finding, not something to re-record: open the new screenshot in
-`target/visual_tests/` beside the baseline. Do not borrow baselines from another
-checkout; they are as old as whoever last recorded them and fail on unrelated changes.
+A mismatch is a finding, not something to re-record: open the `_diff.png` and the new
+screenshot in `target/visual_tests/`. The fork-relevant tests are `math_rendering`,
+`link_click`, `citation_pipeline`, `project_panel` and `workspace_with_editor`. The agent
+sidebar and settings tests drift with upstream's own UI and with machine state (an
+"Import Threads" banner appears once another release channel has thread data), so judge
+those from the diff image rather than the percentage. Do not borrow baselines from
+another checkout; they are as old as whoever last recorded them.
 
-**Also bundle and test by hand** when any of these holds, and otherwise offer it rather
-than doing it:
-
-- the merge touched what the fork patches for rendering or input: `crates/editor/src/element.rs`,
-  `display_map*`, `crates/gpui/`, `crates/workspace/`, or the `script/bundle-*` scripts;
-- a conflict was resolved in a fork-patched Rust file (a resolution can compile, pass the
-  tests and still be wrong on screen);
-- a release tag follows this merge.
-
-The runner does not cover the PDF viewer, Typst preview, or the project panel, so these
-are the cases where it is not enough. Installing over `/Applications/Suzuri.app` replaces
-the copy the user is using, so ask before doing it from a background job.
+**GUI smoke script.** The runner never opens a PDF, compiles Typst or touches the
+project panel. [`smoke.sh`](smoke.sh) launches the real app as an isolated
+nightly-channel instance (its own data dir, auto-update off, so it runs safely beside
+the user's open Suzuri), drives it with keymap chords, and checks window titles, the
+compiled PDF on disk and `Zed.log`. It prints PASS/FAIL per check and exits non-zero on
+any failure, leaving screenshots for review:
 
 ```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer cargo build -p zed \
+  && .claude/skills/sync-upstream/smoke.sh "$PWD/target/debug/zed" "$CLAUDE_JOB_DIR/tmp/smoke"
+```
+
+It takes keyboard focus for about a minute; do not run it while another job is driving
+the GUI. Look at `shots/01-note.png` yourself: titles prove the tab opened, not that live
+preview concealed its markers. The ERROR/WARN lines it lists come from every running
+instance and include network flakes (`tls handshake eof` on a GitHub download); a failure
+is a regression only if it repeats on a rerun.
+
+**Bundle** only when the merge touched `script/bundle-*`, a release tag follows, or the
+user asks for the build installed, then point `smoke.sh` at the installed app (its
+default) instead of the debug binary. Installing replaces the copy the user is running:
+quit it first with `osascript -e 'tell application id "app.suzuri.Suzuri" to quit'`
+(autosave is on) and relaunch it afterwards.
+
+```sh
+LK_CUSTOM_WEBRTC=$HOME/.cache/suzuri-webrtc/mac-arm64-release \
 MACOS_SIGNING_KEY=17F4C95D6660786229871DFD1B491A1AC2A326DB \
   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./script/bundle-mac \
   && rm -rf /Applications/Suzuri.app \
@@ -157,10 +174,9 @@ MACOS_SIGNING_KEY=17F4C95D6660786229871DFD1B491A1AC2A326DB \
 
 `MACOS_SIGNING_KEY` must be the certificate's SHA-1 hash, not its name: `bundle-mac`
 expands it unquoted, so a name with spaces word-splits and codesign dies mid-script.
-Wrap long builds with `&& echo OK || echo FAILED` — a trailing `; echo $?` hides failure.
-
-Then exercise the fork's features by hand: live preview reveal-at-cursor, an editable
-table, a PDF in the viewer, a Typst live preview, the panel's refresh button.
+`LK_CUSTOM_WEBRTC` skips the flaky ~1 GB WebRTC download; it must match the `WEBRTC_TAG`
+of the pinned livekit revision. Wrap long builds with `&& echo OK || echo FAILED` — a
+trailing `; echo $?` hides failure.
 
 ## 6. Land it
 
