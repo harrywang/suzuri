@@ -987,17 +987,30 @@ impl Render for PdfViewer {
 
         let zoom_percent = (self.zoom_level * 100.0).round() as u32;
         let page_count = self.page_count();
-        // The box follows scrolling only while nobody is typing in it.
-        if page_count > 0 && !self.page_input.focus_handle(cx).is_focused(window) {
+        // The box follows scrolling until someone types a different number
+        // into it. Focus alone does not freeze it: scrolling never moves focus
+        // out of the box, so a reader who clicked it once would otherwise be
+        // left with a stale number until pressing Enter or Escape.
+        if page_count > 0 {
             let current_page = self.current_page(vp_w);
-            if self.shown_page != Some(current_page) {
+            let typed = self.page_input.read(cx).text(cx);
+            let untouched = self
+                .shown_page
+                .is_some_and(|shown| typed == (shown + 1).to_string());
+            if self.shown_page.is_none() || (self.shown_page != Some(current_page) && untouched) {
                 self.shown_page = Some(current_page);
                 // Deferred past this frame: an editor whose text is replaced
                 // while the window is drawing laid out an empty line, so after
                 // the first page every number the box was given came out blank.
                 cx.defer_in(window, move |this, window, cx| {
+                    let focused = this.page_input.focus_handle(cx).is_focused(window);
                     this.page_input.update(cx, |editor, cx| {
                         editor.set_text((current_page + 1).to_string(), window, cx);
+                        // Keep "focus, then type to replace" working while the
+                        // number changes under a focused box.
+                        if focused {
+                            editor.select_all(&SelectAll, window, cx);
+                        }
                     });
                 });
             }
@@ -1633,5 +1646,73 @@ mod navigation_tests {
         });
         redraw(&viewer, cx);
         assert_eq!(shown_page_text(&viewer, cx), "6");
+    }
+
+    fn scroll_to(viewer: &Entity<PdfViewer>, offset: Pixels, cx: &mut VisualTestContext) {
+        viewer.update(cx, |viewer, cx| {
+            viewer.scroll_handle.set_offset(point(px(0.0), offset));
+            cx.notify();
+        });
+        cx.run_until_parked();
+    }
+
+    fn page_input_is_focused(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> bool {
+        viewer.update_in(cx, |viewer, window, cx| {
+            viewer.page_input.focus_handle(cx).is_focused(window)
+        })
+    }
+
+    #[gpui::test]
+    async fn a_focused_box_still_follows_scrolling(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        cx.dispatch_action(GoToPage);
+        assert!(page_input_is_focused(&viewer, cx));
+
+        let sixth_page = page_top_offset(&viewer, 5, cx);
+        scroll_to(&viewer, sixth_page, cx);
+        assert_eq!(
+            shown_page_text(&viewer, cx),
+            "6",
+            "scrolling does not move focus out of the box, so focus alone must \
+             not freeze the number"
+        );
+
+        cx.simulate_input("3");
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(
+            scroll_offset(&viewer, cx),
+            page_top_offset(&viewer, 2, cx),
+            "the number stays selected as it changes, so typing replaces it"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_typed_number_survives_scrolling(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        type_page("7", cx);
+
+        let sixth_page = page_top_offset(&viewer, 5, cx);
+        scroll_to(&viewer, sixth_page, cx);
+        assert_eq!(shown_page_text(&viewer, cx), "7");
+
+        cx.dispatch_action(menu::Confirm);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 6, cx));
+    }
+
+    #[gpui::test]
+    async fn clicking_the_pages_leaves_the_box(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        cx.dispatch_action(GoToPage);
+        assert!(page_input_is_focused(&viewer, cx));
+
+        let center = viewer.read_with(cx, |viewer, _| viewer.scroll_handle.bounds().center());
+        cx.simulate_mouse_down(center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(center, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        assert!(!page_input_is_focused(&viewer, cx));
+        assert_eq!(shown_page_text(&viewer, cx), "1");
     }
 }

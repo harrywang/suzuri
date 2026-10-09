@@ -394,12 +394,14 @@ impl PdfViewer {
     pub(crate) fn handle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if event.button != MouseButton::Left {
             return;
         }
+        // Clicking the document leaves the page box, as it does in a browser.
+        window.focus(&self.focus_handle, cx);
 
         log::debug!(
             "pdf_viewer: mouse_down at ({:.0},{:.0})",
