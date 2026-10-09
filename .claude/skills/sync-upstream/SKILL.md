@@ -1,6 +1,6 @@
 ---
 name: sync-upstream
-description: Merge zed-industries/zed into Suzuri — report drift, preview conflicts, merge on a branch, verify in the order that surfaces API drift first, then fast-forward main. Use when the user says "sync upstream", "merge upstream", "pull from zed", "how far behind are we", or types /sync-upstream.
+description: Merge zed-industries/zed into Suzuri — report drift, preview conflicts, merge on a branch, verify in the order that surfaces API drift first, smoke-test, then open a PR to merge with a merge commit. Use when the user says "sync upstream", "merge upstream", "pull from zed", "how far behind are we", or types /sync-upstream.
 ---
 
 # Sync with upstream Zed
@@ -178,14 +178,29 @@ expands it unquoted, so a name with spaces word-splits and codesign dies mid-scr
 of the pinned livekit revision. Wrap long builds with `&& echo OK || echo FAILED` — a
 trailing `; echo $?` hides failure.
 
-## 6. Land it
+## 6. Open a pull request
+
+Push the branch and open a PR; do not push to `main` yourself. The user merges it.
 
 ```sh
-git checkout main
-git merge --ff-only merge-upstream-<date>
-git push origin main
-git branch -d merge-upstream-<date>
+git push -u origin merge-upstream-<date>
+gh pr create --base main --head merge-upstream-<date> \
+  --title "Merge upstream Zed main (<date>)" --body-file <body.md>
 ```
+
+Open the body with this warning, because the repo squash-merges by convention:
+
+> **Merge with "Create a merge commit", not squash.** Squashing flattens the upstream
+> merge, and the next sync would re-merge every commit in it.
+
+A squash leaves `main` without upstream as a parent, so the next `git merge upstream/main`
+replays the whole range and conflicts all over again. Then give the commit count, a
+table of each conflict and how it was resolved, any change to the "Pending upstream"
+table in CLAUDE.md, and the step 4 and 5 results, with the permanently broken tests named
+as such. End with `Release Notes:` and `- N/A`.
+
+If `main` moves before the PR is merged, merge `origin/main` into the branch (as
+`merge-upstream-2026-09-29` did) rather than rebasing, which would rewrite the merge.
 
 Offer a release tag (`suzuri-vX.Y.Z`) only if the user wants the merge shipped — tagging
 triggers the full signed-and-notarized build, which takes hours on hosted runners.
