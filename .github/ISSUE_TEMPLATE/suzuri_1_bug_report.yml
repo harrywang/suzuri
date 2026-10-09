@@ -1,0 +1,70 @@
+name: Report a bug
+description: Report a problem with Suzuri.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Already reported? [Search existing issues](https://github.com/harrywang/suzuri/issues?q=is%3Aissue) and add a :+1: instead.
+
+        Want something new rather than a fix? Use **Request a feature**.
+  - type: textarea
+    attributes:
+      label: Reproduction steps
+      description: A step-by-step description of how to reproduce the bug. A small sample file (Markdown, PDF, Typst, notebook) helps a lot.
+      placeholder: |
+        1. Open a Markdown file containing ...
+        2. Click X
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Current vs. expected behavior
+      description: What happens (screenshots and videos are appreciated), and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Suzuri version and system specs
+      description: |
+        Open Suzuri → About Suzuri and use its copy button. Then run “zed: copy system specs into clipboard” from the command palette and paste that too.
+      placeholder: |
+        Suzuri 0.5.2 (Zed 1.17.0)
+        Commit: 61717f02e4a...
+        OS: macOS 15.1
+        Memory: 36 GiB
+        Architecture: aarch64
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Log file
+      description: |
+        Run `zed: open log` from the command palette to see the last 1000 lines.
+
+        ⚠️ **Review the log for secrets (API keys, tokens, etc.) and redact them before posting.**
+      value: |
+        <details><summary>Zed.log</summary>
+
+        ```log
+
+        ```
+
+        </details>
+    validations:
+      required: false
+  - type: textarea
+    attributes:
+      label: Relevant settings
+      description: "Run `zed: open settings file` and paste any settings related to the problem."
+      value: |
+        <details><summary>settings.json</summary>
+
+        ```json
+
+        ```
+
+        </details>
+    validations:
+      required: false

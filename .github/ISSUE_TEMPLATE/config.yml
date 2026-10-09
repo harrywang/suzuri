@@ -1,9 +1,11 @@
 # yaml-language-server: $schema=https://www.schemastore.org/github-issue-config.json
+# SUZURI: Suzuri's own issue chooser. Zed's templates and links point at
+# zed-industries/zed, so Zed's 10_/11_ templates are deleted; keep them deleted on merge.
 blank_issues_enabled: false
 contact_links:
-  - name: Feature request
-    url: https://github.com/zed-industries/zed/discussions/new?category=feature-requests
-    about: To request a feature, open a new discussion under one of the appropriate categories.
-  - name: Our Discord community
-    url: https://discord.com/invite/zedindustries
-    about: Join our Discord server for real-time discussion and user support.
+  - name: Suzuri documentation
+    url: https://docs.suzuri.ai/
+    about: Guides for live preview, citations, typesetting and the PDF viewer.
+  - name: A bug that also happens in Zed
+    url: https://docs.suzuri.ai/relationship-to-zed
+    about: Suzuri is built on Zed. A problem that also happens in a clean Zed install belongs in Zed's issue tracker.

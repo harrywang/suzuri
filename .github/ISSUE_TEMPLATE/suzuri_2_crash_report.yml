@@ -1,0 +1,47 @@
+name: Report a crash
+description: Suzuri is crashing, freezing or hanging.
+labels: ["crash"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        If Suzuri quits right after every launch, a file it reopens is the usual cause. Suzuri reopens that file with live preview off on the next launch, and leaves it out after a second crash. Please still report it so the underlying bug gets fixed.
+  - type: textarea
+    attributes:
+      label: Reproduction steps
+      description: A step-by-step description of how to trigger the crash. Attach the file that was open when it happened, if you can share it.
+      placeholder: |
+        1. Open a Markdown file containing ...
+        2. Perform an action
+        3. Suzuri crashes
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Suzuri version and system specs
+      description: |
+        Open Suzuri → About Suzuri and use its copy button. Then run “zed: copy system specs into clipboard” from the command palette and paste that too.
+      placeholder: |
+        Suzuri 0.5.2 (Zed 1.17.0)
+        Commit: 61717f02e4a...
+        OS: macOS 15.1
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Log file
+      description: |
+        Suzuri writes the panic and its backtrace to the log. Run `zed: reveal log in file manager` and attach `Zed.log`, or `Zed.log.old` if Suzuri has restarted since.
+
+        ⚠️ **Review the log for secrets (API keys, tokens, etc.) and redact them before posting.**
+      value: |
+        <details><summary>Zed.log</summary>
+
+        ```log
+
+        ```
+
+        </details>
+    validations:
+      required: false

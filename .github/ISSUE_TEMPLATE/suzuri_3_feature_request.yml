@@ -1,0 +1,22 @@
+name: Request a feature
+description: Suggest something new, or a change to how Suzuri works.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    attributes:
+      label: What are you trying to do?
+      description: The writing, reading or research task this would help with, and what gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: What would you like Suzuri to do?
+      description: The behavior you have in mind. Screenshots or examples from other tools (Obsidian, Zotero, a PDF reader) are welcome.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Alternatives
+      description: Workarounds you use now, or other ways this could work.
+    validations:
+      required: false
