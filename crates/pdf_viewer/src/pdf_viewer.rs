@@ -29,8 +29,8 @@ use file_icons::FileIcons;
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, Font,
     IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, Styled, Subscription, Task, Window, actions, div,
-    img, point, px,
+    ScrollHandle, ScrollWheelEvent, SharedString, Styled, Subscription, Task, TextAlign,
+    TextStyleRefinement, Window, actions, div, img, point, px,
 };
 use project::Project;
 use ui::WithScrollbar;
@@ -207,7 +207,15 @@ impl PdfViewer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> (Entity<Editor>, Subscription) {
-        let page_input = cx.new(|cx| Editor::single_line(window, cx));
+        let page_input = cx.new(|cx| {
+            let mut editor = Editor::single_line(window, cx);
+            editor.set_text_style_refinement(TextStyleRefinement {
+                color: Some(cx.theme().colors().text),
+                text_align: Some(TextAlign::Center),
+                ..Default::default()
+            });
+            editor
+        });
         let subscription = cx.subscribe_in(
             &page_input,
             window,
@@ -984,13 +992,18 @@ impl Render for PdfViewer {
             let current_page = self.current_page(vp_w);
             if self.shown_page != Some(current_page) {
                 self.shown_page = Some(current_page);
-                self.page_input.update(cx, |editor, cx| {
-                    editor.set_text((current_page + 1).to_string(), window, cx);
+                // Deferred past this frame: an editor whose text is replaced
+                // while the window is drawing laid out an empty line, so after
+                // the first page every number the box was given came out blank.
+                cx.defer_in(window, move |this, window, cx| {
+                    this.page_input.update(cx, |editor, cx| {
+                        editor.set_text((current_page + 1).to_string(), window, cx);
+                    });
                 });
             }
         }
         let page_digits = page_count.max(1).to_string().len() as f32;
-        let page_box_width = px(page_digits * 8.0 + 14.0);
+        let page_box_width = px(page_digits * 9.0 + 30.0);
 
         v_flex()
             .id("PdfViewer")
@@ -1474,8 +1487,16 @@ mod navigation_tests {
         );
     }
 
+    /// What the box displays, which is what the reader sees. The buffer can
+    /// hold the right number while the display shows something else.
     fn shown_page_text(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> String {
-        viewer.read_with(cx, |viewer, cx| viewer.page_input.read(cx).text(cx))
+        let (buffer, display) = viewer.update(cx, |viewer, cx| {
+            viewer
+                .page_input
+                .update(cx, |editor, cx| (editor.text(cx), editor.display_text(cx)))
+        });
+        assert_eq!(display, buffer, "the box must display the number it holds");
+        display
     }
 
     fn scroll_offset(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> Pixels {
