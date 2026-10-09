@@ -1704,6 +1704,8 @@
       "cmd-0": "pdf_viewer::ResetZoom",
       "cmd-1": "pdf_viewer::ZoomToActualSize",
       "cmd-shift-0": "pdf_viewer::FitToView",
+      "ctrl-g": "pdf_viewer::GoToPage",
+      "cmd-alt-g": "pdf_viewer::GoToPage",
     },
   },
   {

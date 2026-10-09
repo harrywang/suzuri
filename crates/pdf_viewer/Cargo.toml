@@ -18,10 +18,12 @@ doctest = false
 [dependencies]
 anyhow.workspace = true
 db.workspace = true
+editor.workspace = true
 file_icons.workspace = true
 gpui.workspace = true
 image = { workspace = true }
 log.workspace = true
+menu.workspace = true
 paths.workspace = true
 project.workspace = true
 serde.workspace = true
