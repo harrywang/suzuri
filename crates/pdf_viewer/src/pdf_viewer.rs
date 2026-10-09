@@ -923,23 +923,33 @@ impl Render for PdfViewer {
                     .border_color(cx.theme().colors().border)
                     .child(Label::new(page_info).size(LabelSize::Small)),
             )
+            // The scrollbar hangs off a wrapper, not the scroll container: a
+            // child of the container is painted at the scroll offset, so the
+            // thumb scrolled away with the first page and its track's hit area
+            // drifted, which made any drag leap to the last page.
             .child(
-                div()
-                    .id("pdf-scroll-container")
+                v_flex()
                     .flex_1()
-                    // The canvas behind the pages. Deliberately darker than
-                    // `editor_background`: white pages on a white canvas have
-                    // no visible edges, so breaks and margins disappear —
-                    // Word and Preview grey the desk for the same reason.
-                    .bg(Self::canvas_color(cx))
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll_handle)
-                    .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
-                    .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-                    .cursor(CursorStyle::IBeam)
-                    .child(content)
+                    .min_h_0()
+                    .child(
+                        div()
+                            .id("pdf-scroll-container")
+                            .flex_1()
+                            // The canvas behind the pages. Deliberately darker
+                            // than `editor_background`: white pages on a white
+                            // canvas have no visible edges, so breaks and
+                            // margins disappear — Word and Preview grey the
+                            // desk for the same reason.
+                            .bg(Self::canvas_color(cx))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.scroll_handle)
+                            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+                            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+                            .cursor(CursorStyle::IBeam)
+                            .child(content),
+                    )
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
     }
@@ -1175,5 +1185,157 @@ mod rendered_page_tests {
     fn taking_an_empty_cache_returns_nothing() {
         let mut pages = RenderedPages::default();
         assert!(take_rendered_pages(&mut pages).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+    use fs::FakeFs;
+    use gpui::{Modifiers, TestAppContext, VisualTestContext};
+    use project::{ProjectItem as _, ProjectPath};
+    use serde_json::json;
+
+    /// A document of `page_count` blank Letter pages, with a cross-reference
+    /// table whose offsets are real.
+    fn blank_pdf(page_count: usize) -> String {
+        let kids = (0..page_count)
+            .map(|index| format!("{} 0 R", index + 3))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut objects = vec![
+            "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+            format!("<< /Type /Pages /Kids [{kids}] /Count {page_count} >>"),
+        ];
+        objects.extend(
+            (0..page_count)
+                .map(|_| "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string()),
+        );
+
+        let mut pdf = "%PDF-1.7\n".to_string();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", index + 1));
+        }
+        let xref_offset = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf
+    }
+
+    async fn open_viewer(
+        cx: &mut TestAppContext,
+    ) -> (Entity<PdfViewer>, &mut VisualTestContext, tempfile::TempDir) {
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            let client = client::Client::new(
+                Arc::new(clock::FakeSystemClock::new()),
+                http_client::FakeHttpClient::with_404_response(),
+                cx,
+            );
+            Project::init(&client, cx);
+        });
+
+        // The item reads the bytes with `std::fs`, not the project's `Fs`, so
+        // the document has to exist on disk at the path the worktree reports.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let pdf = blank_pdf(10);
+        std::fs::write(dir.path().join("doc.pdf"), &pdf).expect("write the PDF");
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(dir.path(), json!({ "doc.pdf": pdf })).await;
+        let project = Project::test(fs, [dir.path()], cx).await;
+
+        let project_path = project.read_with(cx, |project, cx| {
+            let worktree = project.worktrees(cx).next().expect("a worktree");
+            ProjectPath {
+                worktree_id: worktree.read(cx).id(),
+                path: util::rel_path::rel_path("doc.pdf").into(),
+            }
+        });
+        let item = cx
+            .update(|cx| PdfItem::try_open(&project, &project_path, cx))
+            .expect("the viewer claims a .pdf")
+            .await
+            .expect("the PDF loads");
+
+        let (viewer, cx) =
+            cx.add_window_view(|window, cx| PdfViewer::new(item, project, window, cx));
+        cx.run_until_parked();
+        cx.update(|window, _| window.refresh());
+        cx.run_until_parked();
+        (viewer, cx, dir)
+    }
+
+    /// The scrollbar used to be a child of the scroll container, so it was
+    /// painted at the scroll offset: away from the first page its thumb was
+    /// off screen, and a press where the thumb should be landed on a track
+    /// that had drifted with the content, sending the view to the last page.
+    #[gpui::test]
+    async fn dragging_the_thumb_mid_document_scrolls_by_the_drag(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+
+        let (bounds, max_offset) = viewer.read_with(cx, |viewer, _| {
+            (
+                viewer.scroll_handle.bounds(),
+                viewer.scroll_handle.max_offset().y,
+            )
+        });
+        assert!(
+            max_offset > px(0.0),
+            "ten pages must overflow the window, max offset was {max_offset:?}"
+        );
+
+        let start_offset = -max_offset / 2.0;
+        viewer.update_in(cx, |viewer, window, _| {
+            viewer
+                .scroll_handle
+                .set_offset(point(px(0.0), start_offset));
+            window.refresh();
+        });
+        cx.run_until_parked();
+
+        // Mirrors `ScrollbarState::thumb_ranges` for a regular-style vertical
+        // track: 4px of padding around a 6px thumb on the right edge.
+        let viewport = bounds.size.height;
+        let track_top = bounds.top() + px(4.0);
+        let track_length = viewport - px(8.0);
+        let thumb_fraction =
+            (viewport * (viewport / (viewport + max_offset))).max(px(25.0)) / viewport;
+        let thumb_length = track_length * thumb_fraction;
+        let thumb_center = point(
+            bounds.right() - px(7.0),
+            track_top + (track_length - thumb_length) * 0.5 + thumb_length / 2.0,
+        );
+
+        let drag = px(20.0);
+        let dragged_to = point(thumb_center.x, thumb_center.y + drag);
+        cx.simulate_mouse_move(thumb_center, None, Modifiers::none());
+        cx.simulate_mouse_down(thumb_center, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(dragged_to, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(dragged_to, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+
+        let end_offset = viewer.read_with(cx, |viewer, _| viewer.scroll_handle.offset().y);
+        let moved = start_offset - end_offset;
+        let expected = drag * (max_offset / (track_length - thumb_length));
+        assert!(
+            moved > expected * 0.5 && moved < expected * 1.5,
+            "a {drag:?} drag should scroll about {expected:?}, but scrolled {moved:?} \
+             (from {start_offset:?} to {end_offset:?}, max {max_offset:?})"
+        );
     }
 }
