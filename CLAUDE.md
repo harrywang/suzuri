@@ -35,7 +35,7 @@ The fork's own changes are small and additive:
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
-| Document menu (citations, export) and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
+| Document menu (formatting, citations, export; see "Document menu") and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | In-app updates from GitHub releases (see "Cutting a release") | `crates/suzuri_update/`, `crates/auto_update/src/auto_update.rs` (`init`, `get_release_asset`, `release_notes_url`, the macOS and Linux installers), `crates/auto_update_ui/src/auto_update_ui.rs` (app name), `crates/release_channel/src/lib.rs` (`poll_for_updates`) |
 | Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
@@ -329,6 +329,34 @@ take upstream's `flags.rs` wholesale — nothing else is required, because the n
 editor itself was never forked. Items 2 and 3 are worth upstreaming as a PR; until they
 land, they are the only part of this that needs conflict resolution, and
 `notebook_ui.rs` is actively developed upstream, so expect to redo hunk 3 occasionally.
+
+## Document menu
+
+**Document is the only top-level menu Suzuri adds.** Separate Insert or Format menus,
+Obsidian-style, were considered and rejected. A new writing command goes into Document
+or its Format submenu.
+
+**Grey out what cannot apply.** macOS enables a menu item when `cx.is_action_available`
+finds a listener on the focused dispatch path, so a handler that is always registered
+and checks applicability only when it runs leaves the item enabled and answers with a
+toast. Register the listener per render, and only while the command can act:
+`Editor::register_action_renderer` for editor commands (`markdown_writing::register`),
+`Workspace::register_action_renderer` for workspace ones (`markdown_export::init`,
+`citations`). Both are upstream APIs, so no vendor lines. The check runs every frame,
+so keep it cheap: resolve a path, never copy the buffer's text.
+
+Workspace action listeners are rendered by `MultiWorkspace`, not `Workspace`. A test
+that roots its window at `Workspace::test_new` sees every workspace action as
+unavailable; root it at `workspace::MultiWorkspace::test_new`, as
+`citation_actions_are_available_only_where_they_apply` does. Call
+`window.draw(cx).clear(cx)` before asserting on `is_action_available`.
+
+**No `ctrl-alt` shortcuts on Windows.** Windows sends <kbd>AltGr</kbd> as Ctrl+Alt,
+and AltGr+0 types `}` on German and similar layouts, so a `ctrl-alt-0` binding would
+fire on every brace. The citation and heading shortcuts bind `cmd-alt-*` on macOS and
+`ctrl-alt-*` on Linux only. Also taken: `cmd-1`…`cmd-9` (pane switching) and
+`ctrl-1`…`ctrl-9` (tab switching), which is why headings use Google Docs'
+`cmd-alt` digits rather than Typora's `cmd` digits.
 
 ## Adding a setting
 
