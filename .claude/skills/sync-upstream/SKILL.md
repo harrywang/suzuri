@@ -106,6 +106,36 @@ anything else, check whether the fork touches the files involved at all:
 
 ## 5. Smoke-test the real app
 
+Every sync gets a GUI check, because the nextest gates are text-only: they never paint,
+so a rendering regression passes them. A concealment placeholder that painted a visible
+blank at every hidden marker got past them exactly that way. The check comes in two tiers.
+
+**Always: the visual test runner.** It renders offscreen with real Metal, needs no human
+and no Screen Recording permission, so it runs in a background job too. It covers live
+preview rendering, link clicks and source reveal, the citation pipeline, and math:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cargo run -p zed --bin zed_visual_test_runner --features visual-tests \
+  && echo OK || echo FAILED
+```
+
+A baseline mismatch is a finding, not something to re-record. Look at the diff image
+first, and run with `UPDATE_BASELINE=1` only when the change is upstream's intended look.
+
+**Also bundle and test by hand** when any of these holds, and otherwise offer it rather
+than doing it:
+
+- the merge touched what the fork patches for rendering or input: `crates/editor/src/element.rs`,
+  `display_map*`, `crates/gpui/`, `crates/workspace/`, or the `script/bundle-*` scripts;
+- a conflict was resolved in a fork-patched Rust file (a resolution can compile, pass the
+  tests and still be wrong on screen);
+- a release tag follows this merge.
+
+The runner does not cover the PDF viewer, Typst preview, or the project panel, so these
+are the cases where it is not enough. Installing over `/Applications/Suzuri.app` replaces
+the copy the user is using, so ask before doing it from a background job.
+
 ```sh
 MACOS_SIGNING_KEY=17F4C95D6660786229871DFD1B491A1AC2A326DB \
   DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer ./script/bundle-mac \
