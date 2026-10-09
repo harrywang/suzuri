@@ -48,7 +48,8 @@ Summarize for the user before merging: N commits, which conflicts, which risky A
 
 ## 2. Merge on a branch
 
-Never merge straight onto `main`.
+Never merge straight onto `main`. Record the visual-test baselines (step 5) after creating
+the branch and before running `git merge`, because they have to show the pre-merge app.
 
 ```sh
 git checkout -b merge-upstream-$(date +%Y-%m-%d)
@@ -114,14 +115,25 @@ blank at every hidden marker got past them exactly that way. The check comes in 
 and no Screen Recording permission, so it runs in a background job too. It covers live
 preview rendering, link clicks and source reveal, the citation pipeline, and math:
 
+Its baselines are gitignored (`crates/zed/test_fixtures/visual_tests/`, upstream's
+choice), so a fresh worktree has none and every test "fails" with `Baseline not found`,
+which proves nothing. Record them from the pre-merge commit, **before step 2's
+`git merge`**, in the branch's own worktree, then compare after verifying:
+
 ```sh
+# Before merging: record what main looks like.
+UPDATE_BASELINE=1 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+
+# After step 4: compare the merge against it.
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
   cargo run -p zed --bin zed_visual_test_runner --features visual-tests \
   && echo OK || echo FAILED
 ```
 
-A baseline mismatch is a finding, not something to re-record. Look at the diff image
-first, and run with `UPDATE_BASELINE=1` only when the change is upstream's intended look.
+A mismatch is a finding, not something to re-record: open the new screenshot in
+`target/visual_tests/` beside the baseline. Do not borrow baselines from another
+checkout; they are as old as whoever last recorded them and fail on unrelated changes.
 
 **Also bundle and test by hand** when any of these holds, and otherwise offer it rather
 than doing it:
