@@ -4046,7 +4046,11 @@ enum CellPiece {
     Math(MathKey),
 }
 
-fn render_cell_pieces(pieces: &[CellPiece], style: &MarkdownStyle) -> AnyElement {
+fn render_cell_pieces(
+    cell_id: SharedString,
+    pieces: &[CellPiece],
+    style: &MarkdownStyle,
+) -> AnyElement {
     // `min_w_0` is load-bearing: as a flex item the markdown container would
     // otherwise take its min-content width, which for text measured without a
     // definite width is the whole unwrapped line. The cell itself still
@@ -4068,6 +4072,10 @@ fn render_cell_pieces(pieces: &[CellPiece], style: &MarkdownStyle) -> AnyElement
                     space_before,
                     space_after,
                 } => div()
+                    .debug_selector({
+                        let cell_id = cell_id.clone();
+                        move || format!("{cell_id}-piece-{index}")
+                    })
                     .min_w_0()
                     .when(*space_before && index > 0, |this| this.ml(rems(0.3)))
                     .when(*space_after && index + 1 < pieces.len(), |this| {
@@ -4077,6 +4085,7 @@ fn render_cell_pieces(pieces: &[CellPiece], style: &MarkdownStyle) -> AnyElement
                     .into_any_element(),
                 CellPiece::Math(key) => {
                     let key = key.clone();
+                    let piece_id = SharedString::from(format!("{cell_id}-piece-{index}"));
                     at_editor_font_size(move |font_size, cx| {
                         match cx
                             .try_global::<MathCache>()
@@ -4090,6 +4099,7 @@ fn render_cell_pieces(pieces: &[CellPiece], style: &MarkdownStyle) -> AnyElement
                             }) => {
                                 let math_em = font_size * MATH_FONT_SCALE;
                                 svg()
+                                    .debug_selector(move || piece_id.to_string())
                                     .flex_none()
                                     .data(document)
                                     .text_color(cx.theme().colors().editor_foreground)
@@ -4098,7 +4108,7 @@ fn render_cell_pieces(pieces: &[CellPiece], style: &MarkdownStyle) -> AnyElement
                                     .into_any_element()
                             }
                             entry => math_source_fallback(
-                                ElementId::Name(key.source.clone()),
+                                ElementId::Name(piece_id),
                                 format!("${}$", key.source).into(),
                                 entry,
                                 font_size,
@@ -4387,7 +4397,17 @@ fn render_table_block(
                     // whole unwrapped line. The cell itself still shrinks to
                     // its column share, so long content spills over the border
                     // instead of wrapping.
-                    .child(render_cell_pieces(pieces, &style))
+                    .child(render_cell_pieces(
+                        format!(
+                            "mdlp-cell-{}-{column}",
+                            data_row
+                                .map(|row| row.to_string())
+                                .unwrap_or_else(|| "h".into())
+                        )
+                        .into(),
+                        pieces,
+                        &style,
+                    ))
                     .cursor_text()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         cx.stop_propagation();

@@ -6286,4 +6286,21 @@ async fn test_table_cell_math_is_rendered(cx: &mut TestAppContext) {
         mixed.size,
         plain.size
     );
+
+    let formula = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-1-piece-0")
+        .expect("formula rendered");
+    let label = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-1-piece-1")
+        .expect("label rendered");
+    assert!(
+        (formula.center().y - label.center().y).abs() <= gpui::px(2.),
+        "a formula must sit on the line of the text beside it, got formula={formula:?} label={label:?}"
+    );
+    assert!(
+        formula.right() <= label.left(),
+        "the label must follow the formula, got formula={formula:?} label={label:?}"
+    );
 }
