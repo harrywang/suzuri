@@ -1,9 +1,9 @@
 <!--
-  Suzuri app icon: the master mark (assets/images/suzuri_logo.svg) on a cream
-  tile. The tile follows Apple's macOS icon grid (824 px square, 185.4 px
-  corners, centred on a 1024 canvas) and everything outside it is transparent.
-  macOS clips an opaque canvas to its own tile shape, so a filled margin shows
-  up as a border in the Dock; Linux and Windows draw the margin as-is.
+  Suzuri app icon for Linux and Windows: the master mark
+  (assets/images/suzuri_logo.svg) on a cream rounded tile (824 px square,
+  185.4 px corners, centred on a 1024 canvas), transparent outside it. These
+  platforms draw the icon as-is, so the margin must be transparent. The macOS
+  bundle uses app-icon-suzuri-macos.svg instead; see why there.
 
   Regenerate app-icon-suzuri.png (512), app-icon-suzuri@2x.png (1024), and
   windows/app-icon-suzuri.ico (16, 32, 48, 256) from this file.
