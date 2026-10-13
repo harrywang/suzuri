@@ -2742,6 +2742,54 @@ async fn test_inline_math_conceals_and_reveals(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_tall_inline_math_grows_its_row(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    let math_row_heights = |cx: &mut EditorTestContext| {
+        cx.update_editor(|editor, _, cx| {
+            let display = editor.display_snapshot(cx);
+            (0..4)
+                .map(|row| {
+                    display
+                        .line_style_for_row(editor::display_map::DisplayRow(row))
+                        .map(|style| style.line_height)
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+
+    // A matrix is several rows tall; unless its row grows, the image paints
+    // over the lines above and below it.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+        $\begin{bmatrix} a \\ b \\ c \\ d \end{bmatrix}$
+        short $E = mc^2$ here
+        last line
+    "});
+    cx.executor().run_until_parked();
+    let heights = math_row_heights(&mut cx);
+    assert!(
+        heights[1].is_some_and(|height| height > 2.0),
+        "the matrix row must grow to hold it: {heights:?}"
+    );
+    assert_eq!(
+        [heights[0], heights[2], heights[3]],
+        [None, None, None],
+        "rows without tall math keep the base height"
+    );
+
+    // Revealed for editing, the formula is one line of LaTeX again.
+    cx.set_state(indoc::indoc! {r"
+        plain line
+        $\begin{bmatrix} aˇ \\ b \\ c \\ d \end{bmatrix}$
+        short $E = mc^2$ here
+        last line
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(math_row_heights(&mut cx), [None, None, None, None]);
+}
+
+#[gpui::test]
 async fn test_inline_math_requires_tight_delimiters(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
 

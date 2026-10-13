@@ -12,6 +12,7 @@
 use std::{
     any::TypeId,
     borrow::Cow,
+    collections::BTreeMap,
     ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
@@ -295,6 +296,10 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         recompute(editor, cx);
     }));
 
+    // A formula's height is known only once its render finishes, after the
+    // decorations pass that concealed it.
+    subscriptions.push(cx.observe_global::<MathCache>(apply_math_line_styles));
+
     let weak_editor = cx.weak_entity();
     subscriptions.push(
         editor.register_action::<ToggleLivePreview>(move |_, _window, cx| {
@@ -573,6 +578,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         last_resize_at: None,
         image_move: None,
         callout_collapse: Vec::new(),
+        concealed_math: Vec::new(),
+        math_line_styles: BTreeMap::new(),
         _subscriptions: subscriptions,
     });
 
@@ -631,6 +638,11 @@ struct LivePreviewAddon {
     /// overriding the `+`/`-` their syntax asks for. Anchored, so the state
     /// follows the callout as text above it changes.
     callout_collapse: Vec<(Range<Anchor>, bool)>,
+    /// Inline formulas concealed behind their rendered image this pass,
+    /// whose rows `apply_math_line_styles` grows to fit.
+    concealed_math: Vec<(Range<Anchor>, MathKey)>,
+    /// Line styles `apply_math_line_styles` last applied, by key.
+    math_line_styles: BTreeMap<usize, Vec<Range<Anchor>>>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1488,6 +1500,80 @@ fn apply_heading_line_styles(
     }
 }
 
+/// Key range for the line styles of rows holding tall inline math, one key per
+/// row height. `LineStyleMap` gives a row shared by several keys the style of
+/// the lowest, so the key counts down from the end of the range as the height
+/// grows: the tallest formula on a row decides its height. The range sits
+/// above the heading keys, so a heading keeps its own line style.
+const MATH_LINE_STYLE_START: usize = 200;
+const MATH_LINE_STYLE_END: usize = 1000;
+const MATH_LINE_MAX_STEPS: usize = MATH_LINE_STYLE_END - MATH_LINE_STYLE_START;
+/// Row heights are rounded up to this fraction of a row, which bounds the
+/// number of keys and keeps a formula from touching the rows around it.
+const MATH_LINE_STEPS_PER_ROW: f32 = 8.0;
+
+/// Grows each row holding a concealed inline formula taller than the line,
+/// such as a matrix, so the formula does not paint over the rows around it.
+fn apply_math_line_styles(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon::<LivePreviewAddon>() else {
+        return;
+    };
+    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+    // Every term of the ratio scales with the font size, so the settings'
+    // size serves the minimap too, which shares this display map.
+    let font_size = theme_settings.buffer_font_size(cx);
+    let line_height = font_size * theme_settings.line_height();
+    let mut desired: BTreeMap<usize, Vec<Range<Anchor>>> = BTreeMap::new();
+    if let Some(cache) = cx.try_global::<MathCache>() {
+        for (range, key) in &addon.concealed_math {
+            let Some(MathEntry::Ready {
+                baseline_fraction,
+                width_em,
+                height_em,
+                ..
+            }) = cache.entries.get(key)
+            else {
+                continue;
+            };
+            let layout =
+                InlineMathLayout::new(*baseline_fraction, *width_em, *height_em, font_size, cx);
+            let rows = layout.element_height() / line_height;
+            if !rows.is_finite() || rows <= 1.0 {
+                continue;
+            }
+            let steps = ((rows * MATH_LINE_STEPS_PER_ROW).ceil() as usize).min(MATH_LINE_MAX_STEPS);
+            desired
+                .entry(MATH_LINE_STYLE_END - steps)
+                .or_default()
+                .push(range.clone());
+        }
+    }
+    if desired == addon.math_line_styles {
+        return;
+    }
+    let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+        return;
+    };
+    let previous = std::mem::replace(&mut addon.math_line_styles, desired.clone());
+    for key in previous.keys() {
+        if !desired.contains_key(key) {
+            editor.clear_highlights(HighlightKey::MarkdownLivePreview(*key), cx);
+        }
+    }
+    for (key, ranges) in desired {
+        let steps = MATH_LINE_STYLE_END - key;
+        editor.style_lines(
+            HighlightKey::MarkdownLivePreview(key),
+            ranges,
+            editor::display_map::LineStyle {
+                font_scale: 1.0,
+                line_height: steps as f32 / MATH_LINE_STEPS_PER_ROW,
+            },
+            cx,
+        );
+    }
+}
+
 /// A block widget `apply_decorations` wants on screen this pass, paired with
 /// everything the reuse check compares against the block already applied
 /// there.
@@ -1556,6 +1642,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
 
     let weak_editor = cx.weak_entity();
     let mut concealments = Vec::new();
+    let mut concealed_math = Vec::new();
     for marker in &markers.inline {
         let start = marker.range.start.to_point(&snapshot);
         let end = marker.range.end.to_point(&snapshot);
@@ -1587,13 +1674,12 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         // runs every frame; by the time it draws, the cache holds at least a
         // pending entry.
         if let InlineKind::Math { source, style } = &marker.kind {
-            request_math_render(
-                MathKey {
-                    source: source.clone(),
-                    style: *style,
-                },
-                cx,
-            );
+            let key = MathKey {
+                source: source.clone(),
+                style: *style,
+            };
+            request_math_render(key.clone(), cx);
+            concealed_math.push((marker.range.clone(), key));
         }
         concealments.push(Concealment {
             range: marker.range.clone(),
@@ -1636,6 +1722,10 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         });
     }
     editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), concealments, cx);
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.concealed_math = concealed_math;
+    }
+    apply_math_line_styles(editor, cx);
 
     // --- Block widgets ---
 
@@ -2121,6 +2211,10 @@ fn clear_decorations(
     cx: &mut Context<Editor>,
 ) {
     editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), Vec::new(), cx);
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.concealed_math.clear();
+    }
+    apply_math_line_styles(editor, cx);
     if !applied_blocks.is_empty() {
         let block_ids = applied_blocks
             .into_iter()
@@ -2489,10 +2583,15 @@ const MATH_FONT_SCALE: f32 = 1.21;
 /// Called from `apply_decorations` rather than from the placeholder closure:
 /// kicking off work during render would spawn a task on every frame.
 fn request_math_render(key: MathKey, cx: &mut App) {
-    if cx.default_global::<MathCache>().entries.contains_key(&key) {
+    // Read without `default_global`, which notifies `MathCache` observers on
+    // every call: a cache hit must not wake every editor's math line styles.
+    if cx
+        .try_global::<MathCache>()
+        .is_some_and(|cache| cache.entries.contains_key(&key))
+    {
         return;
     }
-    cx.global_mut::<MathCache>()
+    cx.default_global::<MathCache>()
         .entries
         .insert(key.clone(), MathEntry::Pending);
 
@@ -2663,6 +2762,68 @@ fn placeholder_display_text(label: &SharedString) -> SharedString {
     }
 }
 
+/// Geometry of a rendered inline formula, shared by the placeholder that draws
+/// it and by the line style that makes its row tall enough to hold it.
+struct InlineMathLayout {
+    width: Pixels,
+    height: Pixels,
+    pad_top: Pixels,
+    pad_bottom: Pixels,
+}
+
+impl InlineMathLayout {
+    fn new(
+        baseline_fraction: f32,
+        width_em: f32,
+        height_em: f32,
+        font_size: Pixels,
+        cx: &App,
+    ) -> Self {
+        let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+        let line_height = font_size * theme_settings.line_height();
+        let text_system = cx.text_system();
+        let font_id = text_system.resolve_font(&theme_settings.buffer_font);
+        let ascent = text_system.ascent(font_id, font_size);
+        // `TextSystem::descent` is negative on macOS (a signed offset below
+        // the baseline), while the painted baseline's formula
+        // (`gpui::paint_line`) works in magnitudes — feeding the signed value
+        // into `baseline_offset` lands 2×descent too low, so compute the
+        // baseline from magnitudes directly.
+        let descent = text_system.descent(font_id, font_size).abs();
+        let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
+
+        let math_em = font_size * MATH_FONT_SCALE;
+        let height = math_em * height_em;
+        let width = math_em * width_em;
+        // The editor centers inline elements in the line (element top lands at
+        // `(line_height - height) / 2`), while text baselines sit at
+        // `baseline_offset`. Shift the image by the difference so the
+        // formula's baseline lands exactly on the text's. Text is centered in
+        // the line too, so the shift does not depend on the line's height and
+        // stays right on a row grown by `apply_math_line_styles`.
+        let formula_ascent = height * (1.0 - baseline_fraction);
+        let shift = text_baseline - (line_height - height) / 2.0 - formula_ascent;
+        // The centering offsets a padded element by half its padding, so
+        // doubling the needed shift as one-sided padding moves the image by
+        // exactly `shift` without relying on inset positioning.
+        let (pad_top, pad_bottom) = if shift >= gpui::px(0.) {
+            (shift * 2.0, gpui::px(0.))
+        } else {
+            (gpui::px(0.), shift * -2.0)
+        };
+        Self {
+            width,
+            height,
+            pad_top,
+            pad_bottom,
+        }
+    }
+
+    fn element_height(&self) -> Pixels {
+        self.height + self.pad_top + self.pad_bottom
+    }
+}
+
 fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPlaceholder {
     // Pure hides collapse to zero-width text; bullets and checkboxes keep the
     // default placeholder text, whose visual is replaced by the rendered
@@ -2800,25 +2961,11 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
             Arc::new(move |fold_id, _, _| {
                 let source = source.clone();
                 at_editor_font_size(move |font_size, cx| {
-                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
-                    let buffer_font = theme_settings.buffer_font.clone();
                     let text_color = cx.theme().colors().editor_foreground;
                     let key = MathKey {
                         source: source.clone(),
                         style,
                     };
-                    let line_height = font_size * theme_settings.line_height();
-                    let text_system = cx.text_system().clone();
-                    let font_id = text_system.resolve_font(&buffer_font);
-                    let ascent = text_system.ascent(font_id, font_size);
-                    // `TextSystem::descent` is negative on macOS (a signed offset
-                    // below the baseline), while the painted baseline's formula
-                    // (`gpui::paint_line`) works in magnitudes — feeding the
-                    // signed value into `baseline_offset` lands 2×descent too
-                    // low, so compute the baseline from magnitudes directly.
-                    let descent = text_system.descent(font_id, font_size).abs();
-                    let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
-
                     match cx
                         .try_global::<MathCache>()
                         .and_then(|cache| cache.entries.get(&key))
@@ -2829,37 +2976,24 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                             width_em,
                             height_em,
                         }) => {
-                            let math_em = font_size * MATH_FONT_SCALE;
-                            let height = math_em * *height_em;
-                            let width = math_em * *width_em;
-                            // The editor centers inline elements in the line
-                            // (element top lands at `(line_height - height) / 2`),
-                            // while text baselines sit at `baseline_offset`. Shift
-                            // the image by the difference so the formula's
-                            // baseline lands exactly on the text's.
-                            let formula_ascent = height * (1.0 - *baseline_fraction);
-                            let shift =
-                                text_baseline - (line_height - height) / 2.0 - formula_ascent;
-                            // The centering offsets a padded element by half its
-                            // padding, so doubling the needed shift as one-sided
-                            // padding moves the image by exactly `shift` without
-                            // relying on inset positioning.
-                            let (pad_top, pad_bottom) = if shift >= gpui::px(0.) {
-                                (shift * 2.0, gpui::px(0.))
-                            } else {
-                                (gpui::px(0.), shift * -2.0)
-                            };
+                            let layout = InlineMathLayout::new(
+                                *baseline_fraction,
+                                *width_em,
+                                *height_em,
+                                font_size,
+                                cx,
+                            );
                             div()
-                                .h(height + pad_top + pad_bottom)
-                                .w(width)
-                                .pt(pad_top)
-                                .pb(pad_bottom)
+                                .h(layout.element_height())
+                                .w(layout.width)
+                                .pt(layout.pad_top)
+                                .pb(layout.pad_bottom)
                                 .child(
                                     svg()
                                         .data(document)
                                         .text_color(text_color)
-                                        .h(height)
-                                        .w(width),
+                                        .h(layout.height)
+                                        .w(layout.width),
                                 )
                                 .into_any_element()
                         }
