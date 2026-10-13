@@ -127,6 +127,19 @@ else
     echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
 fi
 
+# SUZURI: begin. macOS 26 shades an .icns-only icon with automatic glass, which
+# turns the flat ink pebble into a soft grey gradient in the Dock. An asset
+# catalog compiled from AppIcon.icon draws it flat there; older macOS ignores
+# CFBundleIconName and keeps using the .icns cargo-bundle made. Regenerate with:
+#   xcrun actool crates/zed/resources/AppIcon.icon --compile <dir> --app-icon AppIcon \
+#     --platform macosx --minimum-deployment-target 10.15 --output-partial-info-plist <dir>/p.plist
+#   cp <dir>/Assets.car crates/zed/resources/AppIcon.car
+if [[ "$channel" == "dev" ]]; then
+    cp "crates/zed/resources/AppIcon.car" "${app_path}/Contents/Resources/Assets.car"
+    /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "${app_path}/Contents/Info.plist"
+fi
+# SUZURI: end
+
 if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" && -n "${APPLE_TEAM_ID:-}" ]]; then
     can_code_sign=true
 

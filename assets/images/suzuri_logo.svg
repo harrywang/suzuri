@@ -10,6 +10,8 @@
   Derived assets to regenerate when this changes:
   - crates/zed/resources/app-icon-suzuri.svg (pebble on cream tile), then the
     app-icon-suzuri.png + @2x and windows/app-icon-suzuri.ico rendered from it
+  - crates/zed/resources/AppIcon.icon/Assets/pebble.svg (macOS 26), then
+    AppIcon.car compiled from it (command in script/bundle-mac)
 -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" color="#17130F" role="img" aria-labelledby="sm-t sm-d">
   <title id="sm-t">Suzuri</title>
