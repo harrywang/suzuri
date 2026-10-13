@@ -227,8 +227,10 @@ fn icon_path() -> std::path::PathBuf {
         "stable" => "",
         "preview" => "-preview",
         "nightly" => "-nightly",
-        "dev" => "-dev",
-        _ => "-dev",
+        // SUZURI: begin. dev is Suzuri's release channel; X11 shows this embedded icon.
+        "dev" => "-suzuri",
+        _ => "-suzuri",
+        // SUZURI: end
     };
 
     #[cfg(windows)]
