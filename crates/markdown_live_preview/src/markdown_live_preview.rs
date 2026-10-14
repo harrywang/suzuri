@@ -4227,18 +4227,35 @@ fn render_cell_pieces(
                         {
                             Some(MathEntry::Ready {
                                 svg: document,
+                                baseline_fraction,
                                 width_em,
                                 height_em,
-                                ..
                             }) => {
-                                let math_em = font_size * MATH_FONT_SCALE;
-                                svg()
+                                // The row centers its pieces, as the editor
+                                // centers inline elements in a line, so the
+                                // placeholder's padding puts the formula's
+                                // baseline on the text's here too.
+                                let layout = InlineMathLayout::new(
+                                    *baseline_fraction,
+                                    *width_em,
+                                    *height_em,
+                                    font_size,
+                                    cx,
+                                );
+                                div()
                                     .debug_selector(move || piece_id.to_string())
                                     .flex_none()
-                                    .data(document)
-                                    .text_color(cx.theme().colors().editor_foreground)
-                                    .w(math_em * *width_em)
-                                    .h(math_em * *height_em)
+                                    .h(layout.element_height())
+                                    .w(layout.width)
+                                    .pt(layout.pad_top)
+                                    .pb(layout.pad_bottom)
+                                    .child(
+                                        svg()
+                                            .data(document)
+                                            .text_color(cx.theme().colors().editor_foreground)
+                                            .h(layout.height)
+                                            .w(layout.width),
+                                    )
                                     .into_any_element()
                             }
                             entry => math_source_fallback(
