@@ -10864,6 +10864,7 @@ dependencies = [
  "multi_buffer",
  "pretty_assertions",
  "project",
+ "pulldown-cmark 0.13.4",
  "settings",
  "suzuri_recovery",
  "tempfile",

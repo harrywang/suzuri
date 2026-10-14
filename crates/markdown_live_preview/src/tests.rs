@@ -6247,3 +6247,108 @@ async fn test_a_csl_file_in_the_project_drives_rendering(cx: &mut TestAppContext
         "https://www.zotero.org/styles/some-society"
     );
 }
+
+#[test]
+fn test_split_cell_math() {
+    let describe = |text: &str| {
+        split_cell_math(text)
+            .into_iter()
+            .map(|segment| match segment {
+                CellSegment::Text {
+                    text,
+                    space_before,
+                    space_after,
+                } => format!("text({text}, {space_before}, {space_after})"),
+                CellSegment::Math(source) => format!("math({source})"),
+            })
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(describe("452600"), ["text(452600, false, false)"]);
+    assert_eq!(describe("$i$"), ["math(i)"]);
+    assert_eq!(
+        describe("$x_1^{(i)}$ (population)"),
+        ["math(x_1^{(i)})", "text((population), true, false)"]
+    );
+    assert_eq!(
+        describe("cost $x$, then $$y$$"),
+        [
+            "text(cost, false, true)",
+            "math(x)",
+            "text(, then, false, true)",
+            "math(y)",
+        ]
+    );
+    // Code spans, escaped dollars and loose delimiters stay text.
+    assert_eq!(describe("`$x$`"), ["text(`$x$`, false, false)"]);
+    assert_eq!(
+        describe(r"\$5 and \$10"),
+        [r"text(\$5 and \$10, false, false)"]
+    );
+    assert_eq!(describe("$ a $"), ["text($ a $, false, false)"]);
+}
+
+#[gpui::test]
+async fn test_table_cell_math_is_rendered(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+
+        | $i$ | $x_1^{(i)}$ (population) |
+        | --- | --- |
+        | 1 | 322 |
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    let rendered = cx.update(|_, cx| {
+        let mut sources = cx
+            .try_global::<MathCache>()
+            .map(|cache| {
+                cache
+                    .entries
+                    .iter()
+                    .filter(|(_, entry)| matches!(entry, MathEntry::Ready { .. }))
+                    .map(|(key, _)| key.source.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        sources.sort();
+        sources
+    });
+    assert_eq!(rendered, ["i", "x_1^{(i)}"]);
+
+    // The formula and the text after it share one line, not one line each.
+    let mixed = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-1")
+        .expect("header cell rendered");
+    let plain = cx
+        .cx
+        .debug_bounds("mdlp-cell-0-1")
+        .expect("data cell rendered");
+    assert!(
+        mixed.size.height < plain.size.height * 1.5,
+        "a cell with math must stay one line tall, got mixed={:?} plain={:?}",
+        mixed.size,
+        plain.size
+    );
+
+    let formula = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-1-piece-0")
+        .expect("formula rendered");
+    let label = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-1-piece-1")
+        .expect("label rendered");
+    assert!(
+        (formula.center().y - label.center().y).abs() <= gpui::px(2.),
+        "a formula must sit on the line of the text beside it, got formula={formula:?} label={label:?}"
+    );
+    assert!(
+        formula.right() <= label.left(),
+        "the label must follow the formula, got formula={formula:?} label={label:?}"
+    );
+}

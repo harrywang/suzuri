@@ -1935,17 +1935,13 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                 )
             }
             BlockRenderKind::Table(structure) => {
-                let cell_markdown = |range: &Range<Anchor>, cx: &mut Context<Editor>| {
-                    let start = range.start.to_offset(&snapshot);
-                    let end = range.end.to_offset(&snapshot);
-                    let text: String = snapshot.text_for_range(start..end).collect();
-                    let text = wikilink_display_text(text.trim()).into_owned();
+                let cell_markdown = |text: &str, cx: &mut Context<Editor>| {
                     cx.new(|cx| {
                         // A pipe table row cannot contain a newline, so `<br>`
                         // is the only way to break a line inside a cell; that
                         // needs the HTML parser other blocks already enable.
                         Markdown::new_with_options(
-                            SharedString::from(text),
+                            SharedString::from(text.to_string()),
                             language_registry.clone(),
                             None,
                             markdown::MarkdownOptions {
@@ -1956,15 +1952,43 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                         )
                     })
                 };
-                let header_markdown: Vec<Entity<Markdown>> = structure
+                let cell_pieces = |range: &Range<Anchor>, cx: &mut Context<Editor>| {
+                    let start = range.start.to_offset(&snapshot);
+                    let end = range.end.to_offset(&snapshot);
+                    let text: String = snapshot.text_for_range(start..end).collect();
+                    let text = wikilink_display_text(text.trim()).into_owned();
+                    split_cell_math(&text)
+                        .into_iter()
+                        .map(|piece| match piece {
+                            CellSegment::Text {
+                                text,
+                                space_before,
+                                space_after,
+                            } => CellPiece::Text {
+                                markdown: cell_markdown(text, cx),
+                                space_before,
+                                space_after,
+                            },
+                            CellSegment::Math(source) => {
+                                let key = MathKey {
+                                    source: SharedString::from(source.to_string()),
+                                    style: MathStyle::Inline,
+                                };
+                                request_math_render(key.clone(), cx);
+                                CellPiece::Math(key)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let header_markdown: Vec<Vec<CellPiece>> = structure
                     .header
                     .iter()
-                    .map(|range| cell_markdown(range, cx))
+                    .map(|range| cell_pieces(range, cx))
                     .collect();
-                let rows_markdown: Vec<Vec<Entity<Markdown>>> = structure
+                let rows_markdown: Vec<Vec<Vec<CellPiece>>> = structure
                     .rows
                     .iter()
-                    .map(|row| row.iter().map(|range| cell_markdown(range, cx)).collect())
+                    .map(|row| row.iter().map(|range| cell_pieces(range, cx)).collect())
                     .collect();
                 let column_weights = table_column_weights(structure, &snapshot);
                 render_table_block(
@@ -4062,10 +4086,181 @@ fn apply_table_structural_change(
 /// The editable table widget: rendered grid, click-to-edit cells, and
 /// add-row/add-column affordances.
 #[allow(clippy::too_many_arguments)]
+/// A run of a table cell's text: Markdown, or an inline formula, which the
+/// `markdown` crate does not render.
+enum CellSegment<'a> {
+    Text {
+        text: &'a str,
+        space_before: bool,
+        space_after: bool,
+    },
+    Math(&'a str),
+}
+
+/// Splits a cell's text around its `$...$` formulas, with the same tight
+/// delimiter rule as the editor's inline math. pulldown-cmark finds them, so
+/// a `$` inside a code span or escaped as `\$` stays text.
+fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
+    let mut formulas = Vec::new();
+    let parser = pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::ENABLE_MATH);
+    for (event, range) in parser.into_offset_iter() {
+        // A cell is one line, so `$$...$$` renders inline there, as it does
+        // mid-line in the editor; only single-`$` math needs tight delimiters.
+        let source = match event {
+            pulldown_cmark::Event::InlineMath(source) => {
+                if source.starts_with(char::is_whitespace) || source.ends_with(char::is_whitespace)
+                {
+                    continue;
+                }
+                source
+            }
+            pulldown_cmark::Event::DisplayMath(source) => source,
+            _ => continue,
+        };
+        if source.trim().is_empty() {
+            continue;
+        }
+        let delimiter = text.get(range.clone()).map_or(1, |construct| {
+            construct.len() - construct.trim_start_matches('$').len()
+        });
+        let (Some(source_start), Some(source_end)) = (
+            range.start.checked_add(delimiter),
+            range.end.checked_sub(delimiter),
+        ) else {
+            continue;
+        };
+        if source_start < source_end {
+            formulas.push((range, source_start..source_end));
+        }
+    }
+    if formulas.is_empty() {
+        return vec![CellSegment::Text {
+            text,
+            space_before: false,
+            space_after: false,
+        }];
+    }
+
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (construct, source) in formulas {
+        if let Some(between) = text.get(cursor..construct.start) {
+            push_cell_text(&mut segments, between);
+        }
+        if let Some(source) = text.get(source) {
+            segments.push(CellSegment::Math(source));
+        }
+        cursor = construct.end;
+    }
+    if let Some(rest) = text.get(cursor..) {
+        push_cell_text(&mut segments, rest);
+    }
+    segments
+}
+
+fn push_cell_text<'a>(segments: &mut Vec<CellSegment<'a>>, text: &'a str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    segments.push(CellSegment::Text {
+        text: trimmed,
+        space_before: text.starts_with(char::is_whitespace),
+        space_after: text.ends_with(char::is_whitespace),
+    });
+}
+
+/// What a table cell draws: its Markdown runs and the formulas between them.
+enum CellPiece {
+    Text {
+        markdown: Entity<Markdown>,
+        space_before: bool,
+        space_after: bool,
+    },
+    Math(MathKey),
+}
+
+fn render_cell_pieces(
+    cell_id: SharedString,
+    pieces: &[CellPiece],
+    style: &MarkdownStyle,
+) -> AnyElement {
+    // `min_w_0` is load-bearing: as a flex item the markdown container would
+    // otherwise take its min-content width, which for text measured without a
+    // definite width is the whole unwrapped line. The cell itself still
+    // shrinks to its column share, so long content spills over the border
+    // instead of wrapping.
+    if let [CellPiece::Text { markdown, .. }] = pieces {
+        return div()
+            .min_w_0()
+            .child(MarkdownElement::new(markdown.clone(), style.clone()))
+            .into_any_element();
+    }
+    h_flex()
+        .min_w_0()
+        .flex_wrap()
+        .children(pieces.iter().enumerate().map(|(index, piece)| {
+            match piece {
+                CellPiece::Text {
+                    markdown,
+                    space_before,
+                    space_after,
+                } => div()
+                    .debug_selector({
+                        let cell_id = cell_id.clone();
+                        move || format!("{cell_id}-piece-{index}")
+                    })
+                    .min_w_0()
+                    .when(*space_before && index > 0, |this| this.ml(rems(0.3)))
+                    .when(*space_after && index + 1 < pieces.len(), |this| {
+                        this.mr(rems(0.3))
+                    })
+                    .child(MarkdownElement::new(markdown.clone(), style.clone()))
+                    .into_any_element(),
+                CellPiece::Math(key) => {
+                    let key = key.clone();
+                    let piece_id = SharedString::from(format!("{cell_id}-piece-{index}"));
+                    at_editor_font_size(move |font_size, cx| {
+                        match cx
+                            .try_global::<MathCache>()
+                            .and_then(|cache| cache.entries.get(&key))
+                        {
+                            Some(MathEntry::Ready {
+                                svg: document,
+                                width_em,
+                                height_em,
+                                ..
+                            }) => {
+                                let math_em = font_size * MATH_FONT_SCALE;
+                                svg()
+                                    .debug_selector(move || piece_id.to_string())
+                                    .flex_none()
+                                    .data(document)
+                                    .text_color(cx.theme().colors().editor_foreground)
+                                    .w(math_em * *width_em)
+                                    .h(math_em * *height_em)
+                                    .into_any_element()
+                            }
+                            entry => math_source_fallback(
+                                ElementId::Name(piece_id),
+                                format!("${}$", key.source).into(),
+                                entry,
+                                font_size,
+                                cx,
+                            ),
+                        }
+                    })
+                    .into_any_element()
+                }
+            }
+        }))
+        .into_any_element()
+}
+
 fn render_table_block(
     structure: TableStructure,
-    header_markdown: Vec<Entity<Markdown>>,
-    rows_markdown: Vec<Vec<Entity<Markdown>>>,
+    header_markdown: Vec<Vec<CellPiece>>,
+    rows_markdown: Vec<Vec<Vec<CellPiece>>>,
     column_weights: Vec<f32>,
     editor: WeakEntity<Editor>,
     table_range: Range<Anchor>,
@@ -4190,7 +4385,7 @@ fn render_table_block(
             .fold(handle_width, |total, weight| total + column_width(*weight));
 
         let render_cell = |cell_range: &Range<Anchor>,
-                           markdown: &Entity<Markdown>,
+                           pieces: &[CellPiece],
                            column: usize,
                            data_row: Option<usize>| {
             let is_header = data_row.is_none();
@@ -4336,11 +4531,17 @@ fn render_table_block(
                     // whole unwrapped line. The cell itself still shrinks to
                     // its column share, so long content spills over the border
                     // instead of wrapping.
-                    .child(
-                        div()
-                            .min_w_0()
-                            .child(MarkdownElement::new(markdown.clone(), style.clone())),
-                    )
+                    .child(render_cell_pieces(
+                        format!(
+                            "mdlp-cell-{}-{column}",
+                            data_row
+                                .map(|row| row.to_string())
+                                .unwrap_or_else(|| "h".into())
+                        )
+                        .into(),
+                        pieces,
+                        &style,
+                    ))
                     .cursor_text()
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         cx.stop_propagation();
@@ -4568,20 +4769,16 @@ fn render_table_block(
                     })
                     .on_drag_move::<TableRowDrag>(row_track_drag(None))
                     .child(row_handle(None))
-                    .child(
-                        h_flex()
-                            .items_stretch()
-                            .children(header_markdown.iter().enumerate().map(
-                                |(column, markdown)| {
-                                    let empty = Range {
-                                        start: Anchor::Min,
-                                        end: Anchor::Min,
-                                    };
-                                    let range = structure.header.get(column).unwrap_or(&empty);
-                                    render_cell(range, markdown, column, None)
-                                },
-                            )),
-                    ),
+                    .child(h_flex().items_stretch().children(
+                        header_markdown.iter().enumerate().map(|(column, pieces)| {
+                            let empty = Range {
+                                start: Anchor::Min,
+                                end: Anchor::Min,
+                            };
+                            let range = structure.header.get(column).unwrap_or(&empty);
+                            render_cell(range, pieces, column, None)
+                        }),
+                    )),
             );
         for (row_index, row_markdown) in rows_markdown.iter().enumerate() {
             grid =
@@ -4604,7 +4801,7 @@ fn render_table_block(
                         .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
                         .child(row_handle(Some(row_index)))
                         .child(h_flex().items_stretch().children(
-                            row_markdown.iter().enumerate().map(|(column, markdown)| {
+                            row_markdown.iter().enumerate().map(|(column, pieces)| {
                                 let empty = Range {
                                     start: Anchor::Min,
                                     end: Anchor::Min,
@@ -4614,7 +4811,7 @@ fn render_table_block(
                                     .get(row_index)
                                     .and_then(|row| row.get(column))
                                     .unwrap_or(&empty);
-                                render_cell(range, markdown, column, Some(row_index))
+                                render_cell(range, pieces, column, Some(row_index))
                             }),
                         )),
                 );

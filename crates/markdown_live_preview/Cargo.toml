@@ -27,6 +27,7 @@ markdown.workspace = true
 math_render.workspace = true
 multi_buffer.workspace = true
 project.workspace = true
+pulldown-cmark.workspace = true
 settings.workspace = true
 suzuri_recovery.workspace = true
 text.workspace = true
