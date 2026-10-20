@@ -5323,11 +5323,12 @@ async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) 
         gpui::Modifiers::none(),
     );
     cx.executor().run_until_parked();
-    cx.cx.simulate_event(gpui::ScrollWheelEvent {
+    cx.cx.simulate_event(gpui::ScrollEvent {
         position: container.center(),
         delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(-600.), gpui::px(0.))),
         modifiers: gpui::Modifiers::none(),
         touch_phase: gpui::TouchPhase::Moved,
+        source: gpui::ScrollSource::Pointer,
     });
     cx.executor().run_until_parked();
     cx.update_editor(|_, _, cx| cx.notify());

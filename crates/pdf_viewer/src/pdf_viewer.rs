@@ -29,7 +29,7 @@ use file_icons::FileIcons;
 use gpui::{
     AnyElement, App, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, Font,
     IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
-    ScrollHandle, ScrollWheelEvent, SharedString, Styled, Subscription, Task, TextAlign,
+    ScrollEvent, ScrollHandle, SharedString, Styled, Subscription, Task, TextAlign,
     TextStyleRefinement, Window, actions, div, img, point, px,
 };
 use project::Project;
@@ -875,7 +875,7 @@ impl PdfViewer {
     // trackpad / scroll wheel is not forwarded through the scroll container.
     fn handle_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1097,7 +1097,7 @@ impl Render for PdfViewer {
                             .bg(Self::canvas_color(cx))
                             .overflow_y_scroll()
                             .track_scroll(&self.scroll_handle)
-                            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+                            .on_scroll(cx.listener(Self::handle_scroll_wheel))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
                             .on_mouse_move(cx.listener(Self::handle_mouse_move))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
