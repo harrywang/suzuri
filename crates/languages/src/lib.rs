@@ -13,7 +13,7 @@ pub use language::*;
 
 use crate::{
     json::JsonTaskProvider,
-    python::{BasedPyrightLspAdapter, RuffLspAdapter},
+    python::{BasedPyrightLspAdapter, PyreflyLspAdapter, RuffLspAdapter},
 };
 
 mod bash;
@@ -75,6 +75,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     let python_lsp_adapter = Arc::new(python::PyrightLspAdapter::new(node.clone()));
     let basedpyright_lsp_adapter = Arc::new(BasedPyrightLspAdapter::new(node.clone()));
     let ruff_lsp_adapter = Arc::new(RuffLspAdapter::new(fs.clone()));
+    let pyrefly_lsp_adapter = Arc::new(PyreflyLspAdapter::new(fs.clone()));
     let python_toolchain_provider = Arc::new(python::PythonToolchainProvider::new(fs.clone()));
     let rust_context_provider = Arc::new(rust::RustContextProvider);
     let rust_lsp_adapter = Arc::new(rust::RustLspAdapter);
@@ -174,6 +175,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
                 ty_lsp_adapter,
                 py_lsp_adapter,
                 python_lsp_adapter,
+                pyrefly_lsp_adapter,
             ],
             context: Some(python_context_provider),
             toolchain: Some(python_toolchain_provider),
