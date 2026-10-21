@@ -1096,6 +1096,11 @@ impl Render for PdfViewer {
                             // desk for the same reason.
                             .bg(Self::canvas_color(cx))
                             .overflow_y_scroll()
+                            // `handle_scroll_wheel` pans on horizontal deltas. Without
+                            // this, GPUI also feeds them to the vertical scroll, since
+                            // the container has no horizontal overflow, and a
+                            // shift-scroll moves the page diagonally.
+                            .restrict_scroll_to_axis()
                             .track_scroll(&self.scroll_handle)
                             .on_scroll(cx.listener(Self::handle_scroll_wheel))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
@@ -1498,6 +1503,31 @@ mod navigation_tests {
             "a {drag:?} drag should scroll about {expected:?}, but scrolled {moved:?} \
              (from {start_offset:?} to {end_offset:?}, max {max_offset:?})"
         );
+    }
+
+    /// Shift+wheel arrives as a horizontal-only delta, which the scroll
+    /// container also turned into vertical scrolling, so the page moved
+    /// diagonally instead of panning (#131).
+    #[gpui::test]
+    async fn horizontal_scrolling_pans_without_scrolling_down(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        viewer.update(cx, |viewer, cx| {
+            viewer.zoom_level = 2.0;
+            cx.notify();
+        });
+        redraw(&viewer, cx);
+
+        let center = viewer.read_with(cx, |viewer, _| viewer.scroll_handle.bounds().center());
+        cx.simulate_event(ScrollEvent {
+            position: center,
+            delta: ScrollDelta::Pixels(point(px(-40.0), px(0.0))),
+            modifiers: Modifiers::shift(),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        assert_eq!(viewer.read_with(cx, |viewer, _| viewer.pan_x), px(-40.0));
     }
 
     /// What the box displays, which is what the reader sees. The buffer can
