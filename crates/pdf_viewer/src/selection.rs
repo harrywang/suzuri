@@ -4,7 +4,7 @@ use gpui::{
 };
 
 use super::pdf_renderer;
-use super::{CopyDocumentText, PAGE_CANVAS_MARGIN_PX, PAGE_GAP_PX, PdfViewer, TextPosition};
+use super::{CopyDocumentText, PdfViewer, TextPosition};
 
 impl PdfViewer {
     pub(crate) fn extract_all_text(&mut self, cx: &mut Context<Self>) {
@@ -183,168 +183,44 @@ impl PdfViewer {
         }
     }
 
+    /// The page under a window position and the point on it, in PDF units.
+    ///
+    /// Reads the bounds each page was laid out at rather than recomputing the
+    /// layout: layout rounds every page to whole pixels, so summing float page
+    /// heights drifts further from the painted pages the deeper the document
+    /// goes, and selection landed lines away from the cursor (#134).
+    pub(crate) fn point_to_page_point(
+        &self,
+        window_position: Point<Pixels>,
+    ) -> Option<(usize, f32, f32)> {
+        let page_bounds = self.page_bounds.borrow();
+        let (&page_index, bounds) = page_bounds
+            .iter()
+            .find(|(_, bounds)| bounds.contains(&window_position))?;
+        let page_width = self.page_dimensions().get(page_index)?.width;
+        if page_width <= 0.0 {
+            return None;
+        }
+        let scale = f32::from(bounds.size.width) / page_width;
+        let local = window_position - bounds.origin;
+        let pdf_x = f32::from(local.x) / scale;
+        let pdf_y = f32::from(local.y) / scale;
+
+        log::debug!(
+            "pdf_viewer: hit test — page {} pdf coords ({:.1}, {:.1})",
+            page_index + 1,
+            pdf_x,
+            pdf_y
+        );
+
+        Some((page_index, pdf_x, pdf_y))
+    }
+
     pub(crate) fn point_to_text_position(
         &self,
         window_position: Point<Pixels>,
     ) -> Option<TextPosition> {
-        let dimensions = self.page_dimensions();
-        if dimensions.is_empty() {
-            log::debug!("pdf_viewer: hit test — no page dimensions");
-            return None;
-        }
-
-        let bounds = self.scroll_handle.bounds();
-        let scroll_offset = self.scroll_handle.offset();
-
-        // The fit width, not the raw viewport width: layout fits pages inside
-        // the canvas gutters, and using the raw width here would inflate
-        // fit_scale by ~2% — a barely visible error on page 1 that accumulates
-        // through `display_height` into whole lines of offset by the last page.
-        let container_width: f32 = {
-            let w: f32 = bounds.size.width.into();
-            if w > 0.0 {
-                Self::page_fit_width(w)
-            } else {
-                log::debug!("pdf_viewer: hit test — container_width=0");
-                return None;
-            }
-        };
-        let viewport_height: f32 = {
-            let h: f32 = bounds.size.height.into();
-            if h > 0.0 { h } else { 800.0 }
-        };
-
-        let window_x: f32 = window_position.x.into();
-        let window_y: f32 = window_position.y.into();
-        let bounds_origin_x: f32 = bounds.origin.x.into();
-        let bounds_origin_y: f32 = bounds.origin.y.into();
-        let scroll_offset_y: f32 = scroll_offset.y.into();
-
-        let content_y = (window_y - bounds_origin_y) + scroll_offset_y.abs();
-
-        // Mirrors the vertical gutter and centering logic in `render` — the
-        // pages column starts PAGE_CANVAS_MARGIN_PX plus the centering pad
-        // below the content origin, and the two computations must agree or
-        // every hit lands offset into the wrong line.
-        let total_content_h = self.total_content_height(container_width);
-        let viewport_avail = viewport_height - 2.0 * PAGE_CANVAS_MARGIN_PX;
-        let centering_pad = if total_content_h < viewport_avail {
-            (viewport_avail - total_content_h) / 2.0
-        } else {
-            0.0
-        };
-
-        let content_y_adjusted = content_y - PAGE_CANVAS_MARGIN_PX - centering_pad;
-
-        log::debug!(
-            "pdf_viewer: hit test — window=({:.0},{:.0}) bounds_origin=({:.0},{:.0}) \
-             scroll_y={:.0} content_y={:.0} centering_pad={:.0} content_y_adjusted={:.0} \
-             container_width={:.0} viewport_height={:.0} total_content_h={:.0} \
-             text_layouts_count={} zoom={:.2}",
-            window_x,
-            window_y,
-            bounds_origin_x,
-            bounds_origin_y,
-            scroll_offset_y,
-            content_y,
-            centering_pad,
-            content_y_adjusted,
-            container_width,
-            viewport_height,
-            total_content_h,
-            self.text_layouts.len(),
-            self.zoom_level,
-        );
-
-        if content_y_adjusted < 0.0 {
-            log::debug!("pdf_viewer: hit test — above content (content_y_adjusted < 0)");
-            return None;
-        }
-
-        let mut accumulated_y = 0.0_f32;
-        let mut target_page = None;
-
-        for (index, dim) in dimensions.iter().enumerate() {
-            let page_height = Self::display_height(dim, container_width, self.zoom_level);
-            let page_top = accumulated_y;
-            let page_bottom = accumulated_y + page_height;
-
-            if content_y_adjusted >= page_top && content_y_adjusted < page_bottom {
-                target_page = Some((index, dim, page_top));
-                break;
-            }
-
-            accumulated_y = page_bottom + PAGE_GAP_PX;
-
-            if content_y_adjusted < accumulated_y {
-                log::debug!(
-                    "pdf_viewer: hit test — in gap between pages {} and {}",
-                    index + 1,
-                    index + 2
-                );
-                return None;
-            }
-        }
-
-        let (page_index, page_dim, page_top_y) = match target_page {
-            Some(t) => t,
-            None => {
-                log::debug!("pdf_viewer: hit test — below all pages");
-                return None;
-            }
-        };
-
-        let page_local_y = content_y_adjusted - page_top_y;
-
-        let fit_scale = if page_dim.width > 0.0 {
-            container_width / page_dim.width
-        } else {
-            1.0
-        };
-        let scale = fit_scale * self.zoom_level;
-        let page_display_width = page_dim.width * scale;
-
-        // Centering, unlike scale, is relative to the full viewport: the flex
-        // column centres pages in the raw width, with the canvas gutters
-        // emerging from the leftover space. `container_width` here is the fit
-        // width, so the raw width is recovered by adding the gutters back.
-        let raw_container_width = container_width + 2.0 * PAGE_CANVAS_MARGIN_PX;
-        let page_left_in_container = (raw_container_width - page_display_width) / 2.0;
-        let pan_x_f32: f32 = self.pan_x.into();
-        let content_x = (window_x - bounds_origin_x) - page_left_in_container - pan_x_f32;
-
-        log::debug!(
-            "pdf_viewer: hit test — page {} (dim={:.0}x{:.0}) fit_scale={:.3} scale={:.3} \
-             page_display_width={:.0} page_left={:.0} pan_x={:.0} content_x={:.0} page_local_y={:.0}",
-            page_index + 1,
-            page_dim.width,
-            page_dim.height,
-            fit_scale,
-            scale,
-            page_display_width,
-            page_left_in_container,
-            pan_x_f32,
-            content_x,
-            page_local_y,
-        );
-
-        if content_x < 0.0 || content_x > page_display_width {
-            log::debug!(
-                "pdf_viewer: hit test — outside page horizontally (content_x={:.0}, page_width={:.0})",
-                content_x,
-                page_display_width
-            );
-            return None;
-        }
-
-        let pdf_x = content_x / scale;
-        let pdf_y = page_local_y / scale;
-
-        log::debug!(
-            "pdf_viewer: hit test — pdf coords ({:.1}, {:.1})",
-            pdf_x,
-            pdf_y
-        );
+        let (page_index, pdf_x, pdf_y) = self.point_to_page_point(window_position)?;
 
         let layout = match self.text_layouts.get(&page_index) {
             Some(l) => l,
