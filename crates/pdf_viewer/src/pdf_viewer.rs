@@ -17,9 +17,11 @@ use hayro::vello_cpu::color::palette::css::WHITE;
 pub use pdf_item::{PdfItem, is_pdf_path};
 pub use toolbar::PdfViewToolbarControls;
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::Path;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -27,10 +29,10 @@ use std::time::Duration;
 use editor::{Editor, EditorEvent, actions::SelectAll};
 use file_icons::FileIcons;
 use gpui::{
-    AnyElement, App, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable, Font,
-    IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
+    AnyElement, App, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable,
+    Font, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
     ScrollEvent, ScrollHandle, SharedString, Styled, Subscription, Task, TextAlign,
-    TextStyleRefinement, Window, actions, div, img, point, px,
+    TextStyleRefinement, Window, actions, canvas, div, img, point, px,
 };
 use project::Project;
 use ui::WithScrollbar;
@@ -115,6 +117,9 @@ pub struct PdfViewer {
     /// The window's device-pixel ratio, captured each frame in `render`.
     display_scale: f32,
     pan_x: Pixels,
+    /// Where each page was laid out in the last frame, in window coordinates.
+    /// Hit-testing reads these instead of recomputing the layout.
+    page_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
     text_layouts: HashMap<usize, PageTextLayout>,
     text_extraction_task: Task<()>,
     selection_start: Option<TextPosition>,
@@ -254,6 +259,7 @@ impl PdfViewer {
             render_scale: SCREEN_SCALE_FACTOR,
             display_scale: SCREEN_SCALE_FACTOR,
             pan_x: px(0.0),
+            page_bounds: Rc::default(),
             text_layouts: HashMap::new(),
             text_extraction_task: Task::ready(()),
             selection_start: None,
@@ -777,6 +783,7 @@ impl PdfViewer {
         let highlights = self.selection_highlights_for_page(index, fit_scale);
 
         div()
+            .debug_selector(|| format!("pdf-page-{index}"))
             .relative()
             .w(display_width)
             .h(display_height)
@@ -786,6 +793,21 @@ impl PdfViewer {
             // page off the canvas; the hairline crisps its edge.
             .shadow_md()
             .child(page_content)
+            .child(
+                canvas(
+                    {
+                        let page_bounds = self.page_bounds.clone();
+                        move |bounds, _, _| {
+                            page_bounds.borrow_mut().insert(index, bounds);
+                        }
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full(),
+            )
             .children(highlights)
             // The outline is an overlay rather than a border on this div so
             // the page box keeps the exact size the rendered bitmap and the
@@ -953,8 +975,7 @@ impl Render for PdfViewer {
             };
 
             // Centering happens inside the space left after the canvas
-            // gutters; the hit-test in selection.rs mirrors this exact
-            // computation, so the two must change together.
+            // gutters.
             let viewport_avail = viewport_h - 2.0 * PAGE_CANVAS_MARGIN_PX;
             let centering_pad = if total_content_h < viewport_avail {
                 (viewport_avail - total_content_h) / 2.0
@@ -963,13 +984,18 @@ impl Render for PdfViewer {
             };
             let vertical_gutter = PAGE_CANVAS_MARGIN_PX + centering_pad;
 
-            let mut pages_column = v_flex().gap(px(PAGE_GAP_PX)).items_center();
-            pages_column = pages_column.child(div().h(px(vertical_gutter)));
+            // Padding, not spacer children: the column's gap would also
+            // separate a spacer from the first page, pushing every page down
+            // by a gap that `page_top` and `scroll_to_page` do not count.
+            let mut pages_column = v_flex()
+                .gap(px(PAGE_GAP_PX))
+                .items_center()
+                .py(px(vertical_gutter));
+            self.page_bounds.borrow_mut().clear();
             for (index, dim) in dimensions.iter().enumerate() {
                 pages_column =
                     pages_column.child(self.render_page_element(index, dim, container_width, cx));
             }
-            pages_column = pages_column.child(div().h(px(vertical_gutter)));
 
             if self.pan_x != px(0.0) {
                 div()
@@ -1223,6 +1249,7 @@ impl Item for PdfViewer {
                 render_scale: self.render_scale,
                 display_scale: self.display_scale,
                 pan_x: self.pan_x,
+                page_bounds: Rc::default(),
                 text_layouts: self.text_layouts.clone(),
                 text_extraction_task: Task::ready(()),
                 selection_start: None,
@@ -1528,6 +1555,81 @@ mod navigation_tests {
 
         assert_eq!(scroll_offset(&viewer, cx), px(0.0));
         assert_eq!(viewer.read_with(cx, |viewer, _| viewer.pan_x), px(-40.0));
+    }
+
+    /// Selection used to recompute where pages sit instead of asking the
+    /// layout. It missed the column gap above the first page and drifted with
+    /// the layout's pixel rounding, so text below the cursor got selected,
+    /// by an amount that changed with scrolling (#134).
+    #[gpui::test]
+    async fn hit_testing_lands_under_the_cursor_wherever_the_view_is_scrolled(
+        cx: &mut TestAppContext,
+    ) {
+        const PAGES: [&str; 10] = [
+            "pdf-page-0",
+            "pdf-page-1",
+            "pdf-page-2",
+            "pdf-page-3",
+            "pdf-page-4",
+            "pdf-page-5",
+            "pdf-page-6",
+            "pdf-page-7",
+            "pdf-page-8",
+            "pdf-page-9",
+        ];
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        let mut probes = 0;
+        for zoom in [1.0, 2.0] {
+            for fraction in [0.0, 0.1, 0.25, 0.5, 0.75, 1.0] {
+                viewer.update(cx, |viewer, cx| {
+                    viewer.zoom_level = zoom;
+                    viewer.pan_x = if zoom > 1.0 { px(-100.0) } else { px(0.0) };
+                    cx.notify();
+                });
+                redraw(&viewer, cx);
+                let max_offset =
+                    viewer.read_with(cx, |viewer, _| viewer.scroll_handle.max_offset().y);
+                viewer.update(cx, |viewer, _| {
+                    viewer
+                        .scroll_handle
+                        .set_offset(point(px(0.0), -max_offset * fraction));
+                });
+                redraw(&viewer, cx);
+
+                let view = viewer.read_with(cx, |viewer, _| viewer.scroll_handle.bounds());
+                for (index, selector) in PAGES.iter().enumerate() {
+                    let page = cx.debug_bounds(selector).expect("every page is laid out");
+                    let probe = point(
+                        page.left().max(view.left()) + px(10.0),
+                        page.top().max(view.top()) + px(10.0),
+                    );
+                    if !view.contains(&probe) || !page.contains(&probe) {
+                        continue;
+                    }
+                    let (page_width, hit) = viewer.read_with(cx, |viewer, _| {
+                        (
+                            viewer.page_dimensions()[index].width,
+                            viewer.point_to_page_point(probe),
+                        )
+                    });
+                    let scale = f32::from(page.size.width) / page_width;
+                    let expected = (
+                        index,
+                        f32::from(probe.x - page.left()) / scale,
+                        f32::from(probe.y - page.top()) / scale,
+                    );
+                    let (hit_page, hit_x, hit_y) = hit.expect("the probe is on a page");
+                    assert!(
+                        hit_page == expected.0
+                            && (hit_x - expected.1).abs() < 0.01
+                            && (hit_y - expected.2).abs() < 0.01,
+                        "zoom {zoom}, scrolled {fraction}: hit {hit:?}, expected {expected:?}"
+                    );
+                    probes += 1;
+                }
+            }
+        }
+        assert!(probes >= 12, "only {probes} probes landed in the view");
     }
 
     /// What the box displays, which is what the reader sees. The buffer can
