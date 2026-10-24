@@ -504,7 +504,13 @@ fn render_setting_import_button(
 
 fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl IntoElement {
     let import_state = SettingsImportState::global(cx);
-    let imports: [(SharedString, &dyn Action, bool); 2] = [
+    // SUZURI: begin. A Zed import, since Suzuri no longer shares Zed's settings.
+    let imports: [(SharedString, &dyn Action, bool); 3] = [
+        (
+            "Zed".into(),
+            &suzuri_migration::ImportZedSettings { skip_prompt: false },
+            suzuri_migration::zed_settings_imported(cx),
+        ),
         (
             "VS Code".into(),
             &ImportVsCodeSettings { skip_prompt: false },
@@ -517,7 +523,7 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
         ),
     ];
 
-    let [vscode, cursor] = imports.map(|(label, action, imported)| {
+    let [zed, vscode, cursor] = imports.map(|(label, action, imported)| {
         *tab_index += 1;
         render_setting_import_button(*tab_index - 1, label, action, imported)
     });
@@ -536,7 +542,8 @@ fn render_import_settings_section(tab_index: &mut isize, cx: &mut App) -> impl I
                         .color(Color::Muted),
                 ),
         )
-        .child(h_flex().gap_1().child(vscode).child(cursor))
+        .child(h_flex().gap_1().child(zed).child(vscode).child(cursor))
+    // SUZURI: end
 }
 
 pub(crate) const FEATURED_AGENT_IDS: &[&str] =
