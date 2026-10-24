@@ -263,11 +263,25 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
 /// config folder. Replaced files are kept beside the new ones with
 /// [`IMPORT_BACKUP_SUFFIX`]. Returns how many files were imported.
 fn import_zed_config(legacy_config_dir: &Path, config_dir: &Path) -> Result<usize> {
+    // A user who linked Suzuri's config folder to Zed's, as the docs suggest
+    // for sharing, has nothing to import, and copying a file onto itself
+    // would truncate it.
+    if let (Ok(legacy), Ok(current)) = (
+        fs::canonicalize(legacy_config_dir),
+        fs::canonicalize(config_dir),
+    ) && legacy == current
+    {
+        anyhow::bail!(
+            "{} is a link to {}, so Suzuri already uses Zed's settings",
+            config_dir.display(),
+            legacy_config_dir.display()
+        );
+    }
+
     let mut imported = 0;
     for name in IMPORTED_CONFIG_FILES {
         let source = legacy_config_dir.join(name);
-        if source.is_file() {
-            import_file(&source, &config_dir.join(name))?;
+        if source.is_file() && import_file(&source, &config_dir.join(name))? {
             imported += 1;
         }
     }
@@ -281,8 +295,9 @@ fn import_zed_config(legacy_config_dir: &Path, config_dir: &Path) -> Result<usiz
         {
             let entry = entry?;
             let source = entry.path();
-            if source.is_file() {
-                import_file(&source, &config_dir.join(name).join(entry.file_name()))?;
+            if source.is_file()
+                && import_file(&source, &config_dir.join(name).join(entry.file_name()))?
+            {
                 imported += 1;
             }
         }
@@ -290,21 +305,33 @@ fn import_zed_config(legacy_config_dir: &Path, config_dir: &Path) -> Result<usiz
     Ok(imported)
 }
 
-fn import_file(source: &Path, destination: &Path) -> Result<()> {
+/// Returns `false` when `destination` already is `source`, through a link.
+fn import_file(source: &Path, destination: &Path) -> Result<bool> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    if destination.exists() {
+    if let Ok(metadata) = fs::symlink_metadata(destination) {
+        if let (Ok(source), Ok(current)) = (fs::canonicalize(source), fs::canonicalize(destination))
+            && source == current
+        {
+            return Ok(false);
+        }
         let mut backup = destination.as_os_str().to_owned();
         backup.push(IMPORT_BACKUP_SUFFIX);
         fs::copy(destination, &backup)
             .with_context(|| format!("backing up {}", destination.display()))?;
+        // Copying onto a link would write through it into whatever file it
+        // points at, such as a dotfiles repository, so the link is replaced.
+        if metadata.file_type().is_symlink() {
+            fs::remove_file(destination)
+                .with_context(|| format!("removing {}", destination.display()))?;
+        }
     }
     // `fs::copy` follows a symlinked source, so a settings file Zed reads from
     // dotfiles arrives as a plain copy instead of a link Suzuri would share.
     fs::copy(source, destination)
         .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
-    Ok(())
+    Ok(true)
 }
 
 #[derive(Default)]
@@ -505,17 +532,7 @@ impl KeychainCredentials {
         let total = stored.len();
         let mut unmoved = StoredCredentials::default();
         for (url, (username, password)) in stored {
-            // An existing keychain entry is left alone: on macOS it may belong
-            // to Zed, which keys credentials by the same URLs.
-            let existing = cx.update(|cx| cx.read_credentials(&url)).await;
-            let result = match existing {
-                Ok(Some(_)) => Ok(()),
-                Ok(None) => {
-                    cx.update(|cx| cx.write_credentials(&url, &username, &password))
-                        .await
-                }
-                Err(error) => Err(error),
-            };
+            let result = write_if_missing(&url, &username, &password, cx).await;
             if let Err(error) = result {
                 log::error!(
                     "could not move the credentials for {url} into the keychain: {error:#}"
@@ -549,6 +566,27 @@ impl KeychainCredentials {
                 .with_context(|| format!("writing {}", self.legacy_file.display()))
         }
     }
+}
+
+/// Writes to the keychain unless it already has an entry for `url`, which on
+/// macOS may belong to Zed: Zed keys credentials by the same URLs.
+#[cfg(target_os = "macos")]
+async fn write_if_missing(url: &str, username: &str, password: &[u8], cx: &AsyncApp) -> Result<()> {
+    // Reading an item another app created asks the user for permission, once
+    // per item. `SecItemAdd` detects the duplicate without reading the secret,
+    // so moving several keys does not open a dialog for each.
+    cx.update(|cx| cx.write_credentials_if_not_exists(url, username, password))
+        .await?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn write_if_missing(url: &str, username: &str, password: &[u8], cx: &AsyncApp) -> Result<()> {
+    if cx.update(|cx| cx.read_credentials(url)).await?.is_none() {
+        cx.update(|cx| cx.write_credentials(url, username, password))
+            .await?;
+    }
+    Ok(())
 }
 
 impl CredentialsProvider for KeychainCredentials {
@@ -742,6 +780,78 @@ mod tests {
         assert_eq!(read(&folders.config.join("settings.json")), "zed");
         assert!(!folders.config.join("half-copied").exists());
         assert!(!stale_staging.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_never_writes_through_links() {
+        let folders = Folders::new();
+        let dotfiles = folders
+            .legacy_config
+            .parent()
+            .expect("parent")
+            .join("dotfiles");
+        write(&dotfiles.join("settings.json"), "dotfiles settings");
+        write(&folders.legacy_config.join("keymap.json"), "zed keymap");
+        std::os::unix::fs::symlink(
+            dotfiles.join("settings.json"),
+            folders.legacy_config.join("settings.json"),
+        )
+        .expect("symlink");
+        fs::create_dir_all(&folders.config).expect("config");
+        std::os::unix::fs::symlink(
+            dotfiles.join("settings.json"),
+            folders.config.join("settings.json"),
+        )
+        .expect("symlink");
+        std::os::unix::fs::symlink(
+            folders.legacy_config.join("keymap.json"),
+            folders.config.join("keymap.json"),
+        )
+        .expect("symlink");
+
+        let imported = import_zed_config(&folders.legacy_config, &folders.config).expect("import");
+        assert_eq!(imported, 0);
+        assert_eq!(read(&dotfiles.join("settings.json")), "dotfiles settings");
+        assert_eq!(
+            read(&folders.legacy_config.join("keymap.json")),
+            "zed keymap"
+        );
+
+        fs::remove_dir_all(&folders.config).expect("remove config");
+        std::os::unix::fs::symlink(&folders.legacy_config, &folders.config).expect("symlink");
+        assert!(import_zed_config(&folders.legacy_config, &folders.config).is_err());
+        assert_eq!(
+            read(&folders.legacy_config.join("keymap.json")),
+            "zed keymap"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_replaces_a_link_instead_of_writing_through_it() {
+        let folders = Folders::new();
+        let dotfiles = folders
+            .legacy_config
+            .parent()
+            .expect("parent")
+            .join("dotfiles");
+        write(&dotfiles.join("settings.json"), "dotfiles settings");
+        write(&folders.legacy_config.join("settings.json"), "zed settings");
+        fs::create_dir_all(&folders.config).expect("config");
+        std::os::unix::fs::symlink(
+            dotfiles.join("settings.json"),
+            folders.config.join("settings.json"),
+        )
+        .expect("symlink");
+
+        import_zed_config(&folders.legacy_config, &folders.config).expect("import");
+        assert_eq!(read(&dotfiles.join("settings.json")), "dotfiles settings");
+        assert_eq!(read(&folders.config.join("settings.json")), "zed settings");
+        assert_eq!(
+            read(&folders.config.join("settings.json.before-zed-import")),
+            "dotfiles settings"
+        );
     }
 
     #[cfg(unix)]
