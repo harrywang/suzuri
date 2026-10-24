@@ -5350,6 +5350,67 @@ async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+async fn test_vertical_wheel_over_wide_table_scrolls_the_document(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
+    let header: String = (0..7).map(|i| format!("| Column {i} ")).collect::<String>() + "|";
+    let separator = "| --- ".repeat(7) + "|";
+    let row: String = (0..7).map(|_| format!("| {long} ")).collect::<String>() + "|";
+    let trailing = "more text\n\n".repeat(100);
+    cx.set_state(&format!(
+        "ˇplain line\n\n{header}\n{separator}\n{row}\n\n{trailing}"
+    ));
+    cx.executor().run_until_parked();
+
+    let container = cx
+        .cx
+        .debug_bounds("mdlp-table-scroll")
+        .expect("scroll container rendered");
+    let first_cell_before = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-0")
+        .expect("first header cell rendered");
+
+    // A plain wheel over the table is a vertical-only delta. It must scroll
+    // the document, not get converted into horizontal table scrolling (#137).
+    cx.cx.simulate_mouse_move(
+        container.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::none(),
+    );
+    cx.executor().run_until_parked();
+    cx.cx.simulate_event(gpui::ScrollEvent {
+        position: container.center(),
+        delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-10.))),
+        modifiers: gpui::Modifiers::none(),
+        touch_phase: gpui::TouchPhase::Moved,
+        source: gpui::ScrollSource::Pointer,
+    });
+    cx.executor().run_until_parked();
+    cx.update_editor(|_, _, cx| cx.notify());
+    cx.executor().run_until_parked();
+
+    let editor_scroll = cx.update_editor(|editor, _, cx| editor.scroll_position(cx));
+    assert!(
+        editor_scroll.y > 0.0,
+        "the wheel should scroll the document: {editor_scroll:?}"
+    );
+    let first_cell_after = cx
+        .cx
+        .debug_bounds("mdlp-cell-h-0")
+        .expect("first header cell rendered");
+    let container_after = cx
+        .cx
+        .debug_bounds("mdlp-table-scroll")
+        .expect("scroll container rendered");
+    assert_eq!(
+        first_cell_after.origin.x - container_after.origin.x,
+        first_cell_before.origin.x - container.origin.x,
+        "the table must not scroll sideways on a vertical wheel"
+    );
+}
+
+#[gpui::test]
 async fn test_link_label_wider_than_the_wrap_width_does_not_panic(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     // A link's label stands in for its source as the placeholder's display
