@@ -11,7 +11,9 @@
 //!    snippets on request, the way VS Code and Cursor settings are imported.
 //! 3. A shipped build stores credentials in the system keychain instead of the
 //!    plain-text `development_credentials` file Zed uses for its own dev
-//!    builds, moving whatever that file holds into the keychain.
+//!    builds, moving whatever that file holds into the keychain. Its keychain
+//!    items are named apart from Zed's (see [`keychain_key`]), so the two apps
+//!    never read or overwrite each other's API keys or sign-in.
 //!
 //! Zed's folders are only ever read, never changed: Zed may still be installed,
 //! and an older Suzuri build must keep working after a rollback.
@@ -354,9 +356,16 @@ pub fn init(cx: &mut App) {
     // same test `ReleaseChannel::poll_for_updates` uses. A source build keeps
     // Zed's file-based provider to avoid keychain prompts on every rebuild.
     if ReleaseChannel::global(cx) == ReleaseChannel::Dev && option_env!("ZED_BUNDLE").is_some() {
-        cx.set_global(ZedCredentialsProvider(Arc::new(KeychainCredentials::new(
+        let credentials = Arc::new(KeychainCredentials::new(
             paths::config_dir().join(DEVELOPMENT_CREDENTIALS_FILE_NAME),
-        ))));
+        ));
+        cx.set_global(ZedCredentialsProvider(credentials.clone()));
+        // Moved right away rather than on first use, so plain-text keys do not
+        // sit in the config folder of someone who never opens the agent panel.
+        cx.spawn(async move |cx| {
+            credentials.unmoved_credentials(cx).await;
+        })
+        .detach();
     }
 
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
@@ -485,6 +494,9 @@ type StoredCredentials = HashMap<String, (String, Vec<u8>)>;
 /// entries into the keychain and deletes the file. Entries the keychain refuses
 /// stay in the file, and are still served from it, so nothing is lost on a
 /// machine without a working keychain.
+///
+/// Zed's copy of that file, in Zed's config folder, is left alone: a rollback
+/// to an older Suzuri reads it, and so does a Zed built from source.
 struct KeychainCredentials {
     legacy_file: PathBuf,
     /// `None` until the first access has moved the file's entries; afterwards,
@@ -532,7 +544,10 @@ impl KeychainCredentials {
         let total = stored.len();
         let mut unmoved = StoredCredentials::default();
         for (url, (username, password)) in stored {
-            let result = write_if_missing(&url, &username, &password, cx).await;
+            let key = keychain_key(&url);
+            let result = cx
+                .update(|cx| cx.write_credentials(&key, &username, &password))
+                .await;
             if let Err(error) = result {
                 log::error!(
                     "could not move the credentials for {url} into the keychain: {error:#}"
@@ -568,25 +583,12 @@ impl KeychainCredentials {
     }
 }
 
-/// Writes to the keychain unless it already has an entry for `url`, which on
-/// macOS may belong to Zed: Zed keys credentials by the same URLs.
-#[cfg(target_os = "macos")]
-async fn write_if_missing(url: &str, username: &str, password: &[u8], cx: &AsyncApp) -> Result<()> {
-    // Reading an item another app created asks the user for permission, once
-    // per item. `SecItemAdd` detects the duplicate without reading the secret,
-    // so moving several keys does not open a dialog for each.
-    cx.update(|cx| cx.write_credentials_if_not_exists(url, username, password))
-        .await?;
-    Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-async fn write_if_missing(url: &str, username: &str, password: &[u8], cx: &AsyncApp) -> Result<()> {
-    if cx.update(|cx| cx.read_credentials(url)).await?.is_none() {
-        cx.update(|cx| cx.write_credentials(url, username, password))
-            .await?;
-    }
-    Ok(())
+/// The keychain item name for `url`. Zed names its items by the bare URL, so
+/// without a prefix Suzuri would share Zed's API keys and sign-in, and reading
+/// an item Zed created would make macOS ask for permission. No Suzuri release
+/// before this one wrote to the keychain, so nothing is stored under bare URLs.
+fn keychain_key(url: &str) -> String {
+    format!("suzuri:{url}")
 }
 
 impl CredentialsProvider for KeychainCredentials {
@@ -601,7 +603,8 @@ impl CredentialsProvider for KeychainCredentials {
                 return Ok(Some(credentials.clone()));
             }
             drop(unmoved);
-            cx.update(|cx| cx.read_credentials(url)).await
+            let key = keychain_key(url);
+            cx.update(|cx| cx.read_credentials(&key)).await
         })
     }
 
@@ -614,7 +617,8 @@ impl CredentialsProvider for KeychainCredentials {
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
         Box::pin(async move {
             let mut unmoved = self.unmoved_credentials(cx).await;
-            cx.update(|cx| cx.write_credentials(url, username, password))
+            let key = keychain_key(url);
+            cx.update(|cx| cx.write_credentials(&key, username, password))
                 .await?;
             if let Some(unmoved) = unmoved.as_mut()
                 && unmoved.remove(url).is_some()
@@ -637,7 +641,8 @@ impl CredentialsProvider for KeychainCredentials {
             {
                 self.persist(unmoved)?;
             }
-            cx.update(|cx| cx.delete_credentials(url)).await
+            let key = keychain_key(url);
+            cx.update(|cx| cx.delete_credentials(&key)).await
         })
     }
 }
@@ -915,5 +920,21 @@ mod tests {
             "mine"
         );
         assert!(!folders.config.join("development_credentials").exists());
+    }
+
+    #[gpui::test]
+    async fn moves_file_credentials_into_the_keychain(cx: &mut gpui::TestAppContext) {
+        let root = tempfile::tempdir().expect("temp dir");
+        let file = root.path().join(DEVELOPMENT_CREDENTIALS_FILE_NAME);
+        write(
+            &file,
+            r#"{"https://api.anthropic.com":["Bearer",[115,107]]}"#,
+        );
+
+        let credentials = KeychainCredentials::new(file.clone());
+        let unmoved = credentials.unmoved_credentials(&cx.to_async()).await;
+
+        assert_eq!(unmoved.as_ref().map(|unmoved| unmoved.len()), Some(0));
+        assert!(!file.exists(), "the plain-text file should be deleted");
     }
 }
