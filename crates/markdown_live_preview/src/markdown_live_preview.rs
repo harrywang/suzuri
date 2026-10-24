@@ -5013,6 +5013,12 @@ fn render_table_block(
                                     .debug_selector(|| "mdlp-table-scroll".into())
                                     .max_w(grid_max_width)
                                     .overflow_x_scroll()
+                                    // Without this, GPUI turns a vertical wheel
+                                    // delta into horizontal scrolling because the
+                                    // container has no vertical overflow, so
+                                    // scrolling the document past a wide table
+                                    // swept the table sideways (#137).
+                                    .restrict_scroll_to_axis()
                                     .child(grid),
                             )
                             .child(
