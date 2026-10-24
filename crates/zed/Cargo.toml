@@ -208,6 +208,7 @@ sidebar.workspace = true
 smol.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
+suzuri_migration.workspace = true
 suzuri_recovery.workspace = true
 suzuri_update.workspace = true
 svg_preview.workspace = true

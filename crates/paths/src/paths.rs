@@ -15,7 +15,9 @@ pub const EDITORCONFIG_NAME: &str = ".editorconfig";
 /// and state directory paths.
 ///
 /// Forks should change this to avoid colliding with Zed's user data.
-pub const APP_NAME: &str = "Zed";
+// SUZURI: Suzuri keeps its own settings and data instead of sharing Zed's
+// (suzuri#140). `suzuri_migration` copies an existing user's state over once.
+pub const APP_NAME: &str = "Suzuri";
 
 /// Lowercased form of [`APP_NAME`], for use in XDG-style paths on
 /// Linux/FreeBSD and the macOS `~/.config` fallback.

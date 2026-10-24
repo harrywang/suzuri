@@ -39,6 +39,7 @@ The fork's own changes are small and additive:
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | In-app updates from GitHub releases (see "Cutting a release") | `crates/suzuri_update/`, `crates/auto_update/src/auto_update.rs` (`init`, `get_release_asset`, `release_notes_url`, the macOS and Linux installers), `crates/auto_update_ui/src/auto_update_ui.rs` (app name), `crates/release_channel/src/lib.rs` (`poll_for_updates`) |
 | Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
+| Own config and data folders, separate from Zed's (`APP_NAME = "Suzuri"`, binary still `zed`): one-time copy of an existing user's state, Import from Zed, keychain credentials in shipped builds (see "Own folders") | `crates/suzuri_migration/`, `crates/paths/src/paths.rs` (`APP_NAME`), `crates/zed/src/main.rs` (assert removed, two calls), `crates/onboarding/src/basics_page.rs` and `Cargo.toml` (Zed import button) |
 | Remote server provisioning on the dev channel (SSH/Docker/WSL remotes; see "Cutting a release") | `crates/auto_update/src/auto_update.rs` (`get_release_asset`), `crates/remote/src/transport/ssh.rs`, `docker.rs`, `wsl.rs` (`ensure_server_binary`) |
 | Issue chooser (Bug, Crash, Feature request; labels, since a user-owned repo has no issue types). Zed's `10_`/`11_` templates are deleted: a merge that brings them back as a modify/delete conflict resolves by keeping them deleted | `.github/ISSUE_TEMPLATE/config.yml`, `.github/ISSUE_TEMPLATE/suzuri_*.yml` |
 | Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
@@ -431,7 +432,7 @@ The dev channel installs no crash handler (`should_install_crash_handler` is fal
 upstream's fallback prints a panic to stderr and exits. A Dock launch has no stderr, and
 session restore then reopens whatever caused the panic, which is how one bad file turned
 into an app that quit a fraction of a second after every launch (#56). `suzuri_recovery`
-replaces that fallback: the panic and backtrace go into `Zed.log`, and a small
+replaces that fallback: the panic and backtrace go into `Suzuri.log` (`~/Library/Logs/Suzuri/` on macOS), and a small
 `suzuri-recovery.json` in the data dir records the file most recently activated in any
 pane. A panic within 30 seconds of that activation blames the file. On the next launch a
 blamed file opens with live preview off (strike one); after two consecutive crashing
@@ -441,3 +442,25 @@ of the workspace's own pane handler; that order is load-bearing, because the sta
 reads the newly active editor's display map inside that handler, which is exactly where
 a layout panic fires. To reproduce a Dock-style crash and see the log line, run a
 source build with `ZED_RELEASE_CHANNEL=nightly` beside the installed app.
+
+## Own folders
+
+Suzuri's `paths::APP_NAME` is "Suzuri", so its settings live in `~/.config/suzuri`,
+its data in `~/Library/Application Support/Suzuri` (XDG `suzuri` on Linux,
+`%APPDATA%`/`%LOCALAPPDATA%\Suzuri` on Windows), and its log in
+`~/Library/Logs/Suzuri/Suzuri.log`. Until 0.5.8 it shared all of Zed's, which is
+why upstream's binary-name assert in `main.rs` is gone: the binary stays `zed`.
+Project `.zed/` folders and `~/.zed_server` on SSH hosts are deliberately shared.
+
+`suzuri_migration::migrate_from_zed` runs before `init_paths` and copies a Suzuri
+user's state (the whole config folder, plus `db/0-dev`, `db/0-global`, `threads`,
+`extensions`, `typeset_compilers`, `prompts`, `suzuri-recovery.json`) when Suzuri's
+config folder does not exist yet and Zed's data folder shows Suzuri used it
+(`db/0-dev` or the recovery file). Zed's folders are never modified. A Zed-only user
+gets a clean start and the welcome page's **Zed** import button.
+
+Shipped builds (dev channel with `ZED_BUNDLE`) replace Zed's dev-only
+plain-text `development_credentials` provider with the keychain, moving the file's
+entries in at startup. Keychain items are named `suzuri:<url>` so they never collide
+with Zed's bare-URL items, which also spares macOS permission prompts. A `cargo run`
+build keeps the file provider.

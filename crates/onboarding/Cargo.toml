@@ -34,6 +34,8 @@ project.workspace = true
 schemars.workspace = true
 serde.workspace = true
 settings.workspace = true
+# SUZURI: the welcome page offers `suzuri_migration::ImportZedSettings`.
+suzuri_migration.workspace = true
 telemetry.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
