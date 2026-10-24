@@ -461,4 +461,6 @@ gets a clean start and the welcome page's **Zed** import button.
 
 Shipped builds (dev channel with `ZED_BUNDLE`) replace Zed's dev-only
 plain-text `development_credentials` provider with the keychain, moving the file's
-entries in on first access. A `cargo run` build keeps the file provider.
+entries in at startup. Keychain items are named `suzuri:<url>` so they never collide
+with Zed's bare-URL items, which also spares macOS permission prompts. A `cargo run`
+build keeps the file provider.
