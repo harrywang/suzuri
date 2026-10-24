@@ -230,6 +230,23 @@ jobs:
       - name: Install build dependencies
         run: ./script/linux
 
+      # bundle-linux copies the builder's libstdc++.so.6 into the tarball, and
+      # the editor's DT_RPATH ($ORIGIN/../lib, see .cargo/bundle-config.toml)
+      # makes that copy win for every library the process loads, Mesa's
+      # Vulkan and GL drivers included. A copy older than the host's leaves
+      # those drivers unloadable, so no window can open (#136). Zed's 20.04
+      # builders get a current runtime from the toolchain PPA in script/linux;
+      # its 22.04 branch skips the PPA, so upgrade the runtime here.
+      - name: Upgrade the libstdc++ runtime bundled into the tarball
+        run: |
+          curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x1E9377A2BA9EF27F' | \
+            sed -n '/-----BEGIN PGP PUBLIC KEY BLOCK-----/,/-----END PGP PUBLIC KEY BLOCK-----/p' | \
+            sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/ubuntu-toolchain-r-test.gpg
+          echo "deb https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu $(lsb_release -cs) main" | \
+            sudo tee /etc/apt/sources.list.d/ubuntu-toolchain-r-test.list > /dev/null
+          sudo apt-get update
+          sudo apt-get install -y --only-upgrade libstdc++6
+
       # The prebuilt libwebrtc archive contains SME-enabled libyuv routines
       # (rotate_sme.o) that call __arm_tpidr2_save, a helper only GCC 14+
       # libgcc or LLVM 17+ compiler-rt provide. Zed's own ARM builds get it
@@ -269,6 +286,18 @@ jobs:
 
       - name: Build tarball
         run: ./script/bundle-linux
+
+      # GLIBCXX_3.4.35 is what Zed's own tarball bundles; anything older has
+      # already failed on current Arch and Ubuntu (#136).
+      - name: Check the bundled libstdc++ is current
+        run: |
+          bundled=$(tar -xzOf target/release/suzuri-linux-${{ matrix.arch }}.tar.gz suzuri.app/lib/libstdc++.so.6 | \
+            strings | grep -E '^GLIBCXX_3\.4\.[0-9]+$' | sort -V | tail -n 1)
+          echo "Bundled libstdc++ provides up to ${bundled}"
+          if [ "$(printf '%s\n' GLIBCXX_3.4.35 "${bundled}" | sort -V | head -n 1)" != GLIBCXX_3.4.35 ]; then
+            echo "::error::The tarball bundles libstdc++ up to ${bundled:-nothing}, older than GLIBCXX_3.4.35; host GPU drivers would fail to load."
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v6
         with:
