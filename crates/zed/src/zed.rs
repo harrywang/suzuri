@@ -1276,7 +1276,8 @@ fn register_actions(
         })
         .register_action(|_, _: &install_cli::RegisterZedScheme, window, cx| {
             cx.spawn_in(window, async move |workspace, cx| {
-                install_cli::register_zed_scheme(cx).await?;
+                // SUZURI: Suzuri claims its own scheme; zed:// stays with Zed (suzuri#140).
+                cx.update(|_, cx| cx.register_url_scheme("suzuri"))?.await?;
                 workspace.update_in(cx, |workspace, _, cx| {
                     struct RegisterZedScheme;
 
@@ -1284,7 +1285,7 @@ fn register_actions(
                         Toast::new(
                             NotificationId::unique::<RegisterZedScheme>(),
                             format!(
-                                "zed:// links will now open in {}.",
+                                "suzuri:// links will now open in {}.",
                                 ReleaseChannel::global(cx).display_name()
                             ),
                         ),

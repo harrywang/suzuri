@@ -246,6 +246,10 @@ fi
 
 mkdir -p "${zed_dir}/share/applications"
 envsubst < "crates/zed/resources/zed.desktop.in" > "${zed_dir}/share/applications/$APP_ID.desktop"
+# SUZURI: Suzuri handles suzuri:// links and leaves zed:// to Zed (suzuri#140).
+if [[ "$channel" == "dev" ]]; then
+  sed -i "s|x-scheme-handler/zed;|x-scheme-handler/suzuri;|" "${zed_dir}/share/applications/$APP_ID.desktop"
+fi
 chmod +x "${zed_dir}/share/applications/$APP_ID.desktop"
 
 # Copy generated licenses so they'll end up in archive too

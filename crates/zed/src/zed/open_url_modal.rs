@@ -54,7 +54,11 @@ impl OpenUrlModal {
         }
 
         // Handle zed:// URLs internally.
-        if url.starts_with("zed://") || url.starts_with("zed-cli://") {
+        // SUZURI: also Suzuri's own URL scheme (suzuri#140).
+        if url.starts_with("zed://")
+            || url.starts_with("suzuri://")
+            || url.starts_with("zed-cli://")
+        {
             OpenListener::global(cx).open(RawOpenRequest {
                 urls: vec![url],
                 ..Default::default()

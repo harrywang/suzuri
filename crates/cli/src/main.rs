@@ -31,7 +31,15 @@ use walkdir::WalkDir;
 
 use std::io::IsTerminal;
 
-const URL_PREFIX: [&'static str; 5] = ["zed://", "http://", "https://", "file://", "ssh://"];
+// SUZURI: suzuri:// is Suzuri's own URL scheme (suzuri#140).
+const URL_PREFIX: [&'static str; 6] = [
+    "zed://",
+    "suzuri://",
+    "http://",
+    "https://",
+    "file://",
+    "ssh://",
+];
 
 struct Detect;
 

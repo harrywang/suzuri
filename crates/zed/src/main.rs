@@ -1823,6 +1823,8 @@ fn parse_url_arg(arg: &str, cx: &App) -> String {
         Err(_) => {
             if arg.starts_with("file://")
                 || arg.starts_with("zed://")
+                // SUZURI: Suzuri's own URL scheme (suzuri#140).
+                || arg.starts_with("suzuri://")
                 || arg.starts_with("zed-cli://")
                 || arg.starts_with("ssh://")
                 || parse_zed_link(arg, cx).is_some()

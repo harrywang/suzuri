@@ -364,6 +364,8 @@ function BuildInstaller {
         "Version"        = "$env:RELEASE_VERSION"
         "SourceDir"      = "$env:ZED_WORKSPACE"
         "AppxFullName"   = $appAppxFullName
+        # SUZURI: dev is Suzuri, which registers suzuri:// and leaves zed:// to Zed.
+        "UrlScheme"      = $(if ($channel -eq "dev") { "suzuri" } else { "zed" })
     }
 
     $defs = @()

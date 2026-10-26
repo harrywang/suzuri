@@ -300,7 +300,8 @@ identifier = "app.suzuri.Suzuri"
 name = "Suzuri"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+# SUZURI: its own scheme, so zed:// links on the web keep opening Zed (suzuri#140).
+osx_url_schemes = ["suzuri"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]

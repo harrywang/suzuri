@@ -464,3 +464,10 @@ plain-text `development_credentials` provider with the keychain, moving the file
 entries in at startup. Keychain items are named `suzuri:<url>` so they never collide
 with Zed's bare-URL items, which also spares macOS permission prompts. A `cargo run`
 build keeps the file provider.
+
+Suzuri registers the `suzuri://` URL scheme, not `zed://`, so links on the web keep
+opening Zed (`crates/zed/Cargo.toml` bundle metadata, `script/bundle-linux`, `zed.iss`
+via `bundle-windows.ps1`, and `cli: register zed scheme`). `OpenListener` rewrites an
+incoming `suzuri://` to `zed://`, so every upstream handler applies unchanged. A
+`zed://` link clicked in a note stays in Suzuri, but other in-app links that go through
+`cx.open_url` (terminal, plain markdown) reach whichever app owns `zed://`.
