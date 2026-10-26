@@ -2124,7 +2124,13 @@ mod tests {
             (RelPath::from_unix_str("src").unwrap(), false),
         ];
         paths.sort_by(|&a, &b| {
-            compare_rel_paths_by(a, b, SortMode::DirectoriesFirst, SortOrder::Extension)
+            compare_rel_paths_by(
+                a,
+                b,
+                SortMode::DirectoriesFirst,
+                SortOrder::Extension,
+                SortDirection::Ascending,
+            )
         });
         assert_eq!(
             paths,
@@ -2154,7 +2160,13 @@ mod tests {
             (RelPath::from_unix_str("b.py").unwrap(), true),
         ];
         paths.sort_by(|&a, &b| {
-            compare_rel_paths_by(a, b, SortMode::FilesFirst, SortOrder::Extension)
+            compare_rel_paths_by(
+                a,
+                b,
+                SortMode::FilesFirst,
+                SortOrder::Extension,
+                SortDirection::Ascending,
+            )
         });
         assert_eq!(
             paths,
@@ -2175,7 +2187,15 @@ mod tests {
             (RelPath::from_unix_str("m").unwrap(), false),
             (RelPath::from_unix_str("b").unwrap(), true),
         ];
-        paths.sort_by(|&a, &b| compare_rel_paths_by(a, b, SortMode::Mixed, SortOrder::Extension));
+        paths.sort_by(|&a, &b| {
+            compare_rel_paths_by(
+                a,
+                b,
+                SortMode::Mixed,
+                SortOrder::Extension,
+                SortDirection::Ascending,
+            )
+        });
         assert_eq!(
             paths,
             vec![
