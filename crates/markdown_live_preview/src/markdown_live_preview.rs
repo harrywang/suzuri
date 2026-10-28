@@ -5935,7 +5935,18 @@ fn open_markdown_link(
                 .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
     });
     if has_scheme {
-        cx.open_url(destination);
+        // Through the OS, a zed:// link would reach Zed itself, since Suzuri
+        // registers suzuri:// instead. Both are Suzuri's own commands here.
+        if destination.starts_with("zed://") || destination.starts_with("suzuri://") {
+            window.dispatch_action(
+                Box::new(zed_actions::OpenZedUrl {
+                    url: destination.into(),
+                }),
+                cx,
+            );
+        } else {
+            cx.open_url(destination);
+        }
         return;
     }
 

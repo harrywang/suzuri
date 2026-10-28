@@ -208,6 +208,7 @@ sidebar.workspace = true
 smol.workspace = true
 snippet_provider.workspace = true
 snippets_ui.workspace = true
+suzuri_migration.workspace = true
 suzuri_recovery.workspace = true
 suzuri_update.workspace = true
 svg_preview.workspace = true
@@ -299,7 +300,8 @@ identifier = "app.suzuri.Suzuri"
 name = "Suzuri"
 osx_minimum_system_version = "10.15.7"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+# SUZURI: its own scheme, so zed:// links on the web keep opening Zed (suzuri#140).
+osx_url_schemes = ["suzuri"]
 
 [package.metadata.bundle-nightly]
 icon = ["resources/app-icon-nightly@2x.png", "resources/app-icon-nightly.png"]

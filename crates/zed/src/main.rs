@@ -5,15 +5,9 @@ mod reliability;
 mod watcher_debug;
 mod zed;
 
-// Ensure the binary name stays in sync with APP_NAME so that the paths used
-// at runtime (data dir, config dir, etc.) match what the binary is called.
-const _: () = assert!(
-    paths::APP_NAME_LOWERCASE
-        .as_bytes()
-        .eq_ignore_ascii_case(env!("CARGO_BIN_NAME").as_bytes()),
-    "paths::APP_NAME_LOWERCASE must match the binary name. \
-     Forks: update APP_NAME in crates/paths/src/paths.rs when renaming the binary.",
-);
+// SUZURI: upstream asserts here that `paths::APP_NAME` matches the binary name.
+// Suzuri's `APP_NAME` is "Suzuri" while the binary stays `zed`, which the bundle
+// scripts, CLI installer, release workflow, and remote server naming rely on.
 
 use agent_ui::AgentPanel;
 use anyhow::{Context as _, Result};
@@ -280,6 +274,12 @@ fn main() {
         }
     }
 
+    // SUZURI: copy an existing user's state out of Zed's folders before anything
+    // creates Suzuri's. A custom data dir is the user's own, so it is left alone.
+    if args.user_data_dir.is_none() {
+        suzuri_migration::migrate_from_zed();
+    }
+
     let file_errors = init_paths();
     if !file_errors.is_empty() {
         files_not_created_on_launch(file_errors);
@@ -492,6 +492,9 @@ fn main() {
         zed_actions::init();
 
         release_channel::init(app_version, cx);
+        // SUZURI: must follow the release channel and precede every credentials
+        // read, since it replaces the credentials provider in shipped builds.
+        suzuri_migration::init(cx);
         gpui_tokio::init(cx);
         if let Some(app_commit_sha) = app_commit_sha {
             AppCommitSha::set_global(app_commit_sha, cx);
@@ -1820,6 +1823,8 @@ fn parse_url_arg(arg: &str, cx: &App) -> String {
         Err(_) => {
             if arg.starts_with("file://")
                 || arg.starts_with("zed://")
+                // SUZURI: Suzuri's own URL scheme (suzuri#140).
+                || arg.starts_with("suzuri://")
                 || arg.starts_with("zed-cli://")
                 || arg.starts_with("ssh://")
                 || parse_zed_link(arg, cx).is_some()

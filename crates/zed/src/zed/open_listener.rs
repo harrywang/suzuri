@@ -155,6 +155,12 @@ impl OpenRequest {
         }
 
         for url in request.urls {
+            // SUZURI: suzuri:// is Suzuri's registered scheme (suzuri#140); every
+            // handler below matches zed://, which Suzuri still accepts.
+            let url = match url.strip_prefix("suzuri://") {
+                Some(rest) => format!("zed://{rest}"),
+                None => url,
+            };
             if let Some(server_name) = url.strip_prefix("zed-cli://") {
                 this.kind = Some(OpenRequestKind::CliConnection(connect_to_cli(server_name)?));
             } else if let Some(action_index) = url.strip_prefix("zed-dock-action://") {
@@ -1631,6 +1637,36 @@ mod tests {
                 request.is_focus_app_only(),
                 "expected is_focus_app_only for {url}"
             );
+        }
+    }
+
+    // SUZURI: Suzuri registers suzuri:// with the OS (suzuri#140), so those
+    // links must reach the same handlers as zed://.
+    #[gpui::test]
+    fn test_parse_suzuri_scheme_urls(cx: &mut TestAppContext) {
+        let _app_state = init_test(cx);
+        let parse = |url: &str, cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                OpenRequest::parse(
+                    RawOpenRequest {
+                        urls: vec![url.into()],
+                        ..Default::default()
+                    },
+                    cx,
+                )
+                .unwrap()
+            })
+        };
+
+        assert!(matches!(
+            parse("suzuri://", cx).kind,
+            Some(OpenRequestKind::FocusApp)
+        ));
+        match parse("suzuri://settings/theme", cx).kind {
+            Some(OpenRequestKind::Setting { setting_path }) => {
+                assert_eq!(setting_path.as_deref(), Some("theme"))
+            }
+            kind => panic!("expected a setting request, got {kind:?}"),
         }
     }
 

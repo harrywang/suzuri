@@ -1826,6 +1826,16 @@ async fn test_clicking_a_wikilink_opens_the_note(cx: &mut TestAppContext) {
     cx.update(|window, cx| open_markdown_link(&link, "Missing.md", window, cx));
     cx.run_until_parked();
     assert_eq!(active_file(cx).as_deref(), Some("Method.md"));
+
+    // A web link goes to the browser, but an app link stays in the app: the
+    // OS would hand zed:// to Zed, since Suzuri registers suzuri:// instead.
+    cx.update(|window, cx| open_markdown_link(&link, "https://example.com", window, cx));
+    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+    for app_link in ["zed://settings/theme", "suzuri://settings/theme"] {
+        cx.update(|window, cx| open_markdown_link(&link, app_link, window, cx));
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url().as_deref(), Some("https://example.com"));
+    }
 }
 
 #[test]

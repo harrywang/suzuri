@@ -12532,6 +12532,7 @@ dependencies = [
  "schemars 1.0.4",
  "serde",
  "settings",
+ "suzuri_migration",
  "telemetry",
  "theme",
  "theme_settings",
@@ -18080,6 +18081,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "suzuri_migration"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "credentials_provider",
+ "futures 0.3.34",
+ "gpui",
+ "log",
+ "notifications",
+ "paths",
+ "release_channel",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ui",
+ "util",
+ "workspace",
+ "zed_credentials_provider",
+]
+
+[[package]]
 name = "suzuri_recovery"
 version = "0.1.0"
 dependencies = [
@@ -23361,6 +23384,7 @@ dependencies = [
  "smol",
  "snippet_provider",
  "snippets_ui",
+ "suzuri_migration",
  "suzuri_recovery",
  "suzuri_update",
  "svg_preview",
