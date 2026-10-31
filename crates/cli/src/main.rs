@@ -858,19 +858,21 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
     }
 
     let blue = console::Style::new().blue();
+    // SUZURI: begin. The CLI installs as `suzuri` (see install_cli), so the prompt says so.
     let items = [
         format!(
-            "Add to existing Zed window ({})",
-            blue.apply_to("zed --existing")
+            "Add to existing Suzuri window ({})",
+            blue.apply_to("suzuri --existing")
         ),
-        format!("Open a new window ({})", blue.apply_to("zed --classic")),
+        format!("Open a new window ({})", blue.apply_to("suzuri --classic")),
     ];
 
     let prompt = format!(
         "Configure default behavior for {}\n{}",
-        blue.apply_to("zed <path>"),
-        console::style("You can change this later in Zed settings"),
+        blue.apply_to("suzuri <path>"),
+        console::style("You can change this later in Suzuri settings"),
     );
+    // SUZURI: end
 
     let selection = dialoguer::Select::new()
         .with_prompt(&prompt)
