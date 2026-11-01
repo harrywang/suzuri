@@ -2151,7 +2151,7 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             placement,
             height: Some(marker.height_estimate),
             style: BlockStyle::Flex,
-            render,
+            render: clip_block_to_text_area(render, weak_editor.clone()),
             priority: 0,
         });
         pending_applied.push((
@@ -2194,6 +2194,102 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
         addon.applied_blocks = new_applied_blocks;
         addon.markdown_blocks = markdown_blocks;
+    }
+}
+
+/// `Flex` blocks span the gutter and scroll horizontally with the text, and
+/// the editor paints them after the line numbers without the text area's
+/// clip. Content scrolled left would cover the gutter (#149), so clip each
+/// block where the editor clips its text lines.
+fn clip_block_to_text_area(render: RenderBlock, editor: WeakEntity<Editor>) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let child = render(block_cx);
+        let gutter_width = block_cx.margins.gutter.width;
+        let text_left = editor.upgrade().and_then(|editor| {
+            editor
+                .read(block_cx.app)
+                .last_bounds()
+                .map(|bounds| bounds.left() + gutter_width)
+        });
+        match text_left {
+            Some(text_left) => ClipLeft { text_left, child }.into_any_element(),
+            None => child,
+        }
+    })
+}
+
+struct ClipLeft {
+    text_left: gpui::Pixels,
+    child: gpui::AnyElement,
+}
+
+impl ClipLeft {
+    fn mask(&self, window: &Window) -> gpui::ContentMask<gpui::Pixels> {
+        let mut bounds = window.content_mask().bounds;
+        let right = bounds.right();
+        bounds.origin.x = bounds.origin.x.max(self.text_left);
+        bounds.size.width = (right - bounds.origin.x).max(gpui::Pixels::ZERO);
+        gpui::ContentMask { bounds }
+    }
+}
+
+impl IntoElement for ClipLeft {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl gpui::Element for ClipLeft {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        (self.child.request_layout(window, cx), ())
+    }
+
+    // The mask also applies here so the clipped part's hitboxes leave
+    // clicks on the gutter to the gutter.
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        let mask = self.mask(window);
+        window.with_content_mask(Some(mask), |window| self.child.prepaint(window, cx));
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<gpui::Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let mask = self.mask(window);
+        window.with_content_mask(Some(mask), |window| self.child.paint(window, cx));
     }
 }
 
