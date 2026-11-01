@@ -1768,6 +1768,13 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
         if source.trim().is_empty() {
             continue;
         }
+        // The widget renders its slice as a document of its own, where a
+        // list item's indentation reads differently: four columns turn a
+        // nested fenced code block into an indented one, fences and all.
+        // The widget is already drawn at the block's indent, so drop it.
+        if matches!(marker.kind, BlockRenderKind::Markdown) {
+            source = dedent_block_source(&source, marker.indent_columns);
+        }
         // Reference links/images inside a widget resolve against the whole
         // document's definitions, which live outside the widget's slice.
         if matches!(
@@ -3231,6 +3238,7 @@ fn render_markdown_block(
                             &source_click_editor,
                             &range,
                             source_index,
+                            indent_columns,
                             window,
                             cx,
                         )
@@ -3240,14 +3248,62 @@ fn render_markdown_block(
     })
 }
 
+/// Bytes of leading whitespace that move `line` `columns` columns left,
+/// stopping early at its first non-blank character.
+fn indent_bytes(line: &str, columns: u32) -> usize {
+    let mut width = 0;
+    let mut bytes = 0;
+    for character in line.chars() {
+        if width >= columns {
+            break;
+        }
+        match character {
+            ' ' => width += 1,
+            '\t' => width += 4,
+            _ => break,
+        }
+        bytes += character.len_utf8();
+    }
+    bytes
+}
+
+fn dedent_block_source(source: &str, columns: u32) -> String {
+    if columns == 0 {
+        return source.to_string();
+    }
+    source
+        .split_inclusive('\n')
+        .map(|line| &line[indent_bytes(line, columns)..])
+        .collect()
+}
+
+/// Maps an index into `dedent_block_source(original, columns)` back to the
+/// same character in `original`.
+fn index_before_dedent(original: &str, columns: u32, dedented_index: usize) -> usize {
+    let mut original_offset = 0;
+    let mut dedented_offset = 0;
+    for line in original.split_inclusive('\n') {
+        let stripped = indent_bytes(line, columns);
+        let kept = line.len() - stripped;
+        if dedented_index < dedented_offset + kept {
+            return original_offset + stripped + (dedented_index - dedented_offset);
+        }
+        original_offset += line.len();
+        dedented_offset += kept;
+    }
+    original_offset + (dedented_index - dedented_offset)
+}
+
 /// Reveals a widget's source with the cursor at `source_index`, an index into
 /// the markdown string the widget renders, which starts at the block's start
-/// offset. Returns false when the editor is gone so the widget can fall back
-/// to its own text selection.
+/// offset, with up to `indent_columns` of each line's indentation removed.
+/// Returns false when the editor is gone so the widget can fall back to its
+/// own text selection.
 fn reveal_at_source_index(
     editor: &WeakEntity<Editor>,
     range: &Range<Anchor>,
     source_index: usize,
+    indent_columns: u32,
     window: &mut Window,
     cx: &mut App,
 ) -> bool {
@@ -3256,6 +3312,14 @@ fn reveal_at_source_index(
             let snapshot = editor.buffer().read(cx).snapshot(cx);
             let start = range.start.to_offset(&snapshot).0;
             let end = range.end.to_offset(&snapshot).0;
+            let source_index = if indent_columns == 0 {
+                source_index
+            } else {
+                let original: String = snapshot
+                    .text_for_range(MultiBufferOffset(start)..MultiBufferOffset(end))
+                    .collect();
+                index_before_dedent(&original, indent_columns, source_index)
+            };
             // The widget's mini-document can carry appended reference
             // definitions past the block's own text; clamp to the block.
             let offset = snapshot.clip_offset(
@@ -6287,6 +6351,7 @@ fn render_embed_block(
                                         &source_click_editor,
                                         &source_range,
                                         0,
+                                        0,
                                         window,
                                         cx,
                                     )
@@ -6422,6 +6487,7 @@ fn render_callout_block(
                                     reveal_at_source_index(
                                         &source_click_editor,
                                         &source_range,
+                                        0,
                                         0,
                                         window,
                                         cx,
