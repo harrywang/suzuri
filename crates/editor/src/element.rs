@@ -11190,18 +11190,41 @@ pub fn layout_line(
     window: &mut Window,
     cx: &mut App,
 ) -> LineWithInvisibles {
-    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    // SUZURI: begin. Native line typography must share row geometry with editor input and
+    // painting. Sticky scroll stacks rows at the base line height, so it shapes with the
+    // base style through `layout_line_with_style` instead.
     let row_style = snapshot.style_for_row(row, style, window.rem_size());
+    layout_line_with_style(
+        row,
+        snapshot,
+        &row_style,
+        text_width,
+        is_row_soft_wrapped,
+        window,
+        cx,
+    )
+}
+
+pub(crate) fn layout_line_with_style(
+    row: DisplayRow,
+    snapshot: &EditorSnapshot,
+    style: &EditorStyle,
+    text_width: Pixels,
+    is_row_soft_wrapped: impl Copy + Fn(usize) -> bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> LineWithInvisibles {
+    // SUZURI: end
     let use_tree_sitter =
         !snapshot.semantic_tokens_enabled || snapshot.use_tree_sitter_for_syntax(row, cx);
     let language_aware = LanguageAwareStyling {
         tree_sitter: use_tree_sitter,
         diagnostics: snapshot.display_snapshot.diagnostics_visible(),
     };
-    let chunks = snapshot.highlighted_chunks(row..row + DisplayRow(1), language_aware, &row_style);
+    let chunks = snapshot.highlighted_chunks(row..row + DisplayRow(1), language_aware, style);
     LineWithInvisibles::from_chunks(
         chunks,
-        |_| Cow::Borrowed(&row_style),
+        |_| Cow::Borrowed(style),
         MAX_LINE_LEN,
         1,
         &snapshot.mode,
@@ -13568,6 +13591,20 @@ mod tests {
                     assert_eq!(streamed.width, single.width);
                     assert_eq!(streamed.line_height, single.line_height);
                 }
+
+                // Sticky scroll stacks rows at the base line height, so its copy of a
+                // styled row must keep the base typography.
+                let sticky = layout_line_with_style(
+                    DisplayRow(1),
+                    &snapshot,
+                    &style,
+                    px(500.),
+                    |_| false,
+                    window,
+                    cx,
+                );
+                assert_eq!(sticky.font_size, layouts[0].font_size);
+                assert_eq!(sticky.line_height, layouts[0].line_height);
             })
             .unwrap();
     }

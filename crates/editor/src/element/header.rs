@@ -28,7 +28,7 @@ use util::ResultExt;
 use workspace::{ItemHandle, ItemSettings, OpenInTerminal, OpenTerminal, RevealInProjectPanel};
 
 use super::{
-    BlockLayout, EditorElement, EditorLayout, LineWithInvisibles, layout_line,
+    BlockLayout, EditorElement, EditorLayout, LineWithInvisibles, layout_line_with_style,
     render_breadcrumb_text,
 };
 use crate::{
@@ -256,7 +256,9 @@ impl EditorElement {
             offset,
         } in rows.into_iter().rev()
         {
-            let mut line = layout_line(
+            // SUZURI: Every sticky row is stacked, masked, and hit-tested at the base line
+            // height, so a scaled heading must not bring its own typography here.
+            let mut line = layout_line_with_style(
                 sticky_row,
                 snapshot,
                 &self.style,

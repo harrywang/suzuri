@@ -27,7 +27,7 @@ The fork's own changes are small and additive:
 | PDF viewer (adopted from zed#51040) | `crates/pdf_viewer/` |
 | Live Typst/LaTeX preview | `crates/typeset_preview/` |
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs`, `crates/editor/src/selections_collection.rs` |
-| Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
+| Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/element/header.rs` (sticky scroll keeps base typography), `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
 | Native heading search reveal and Vim integration regressions | `crates/editor/src/editor.rs` (`selection_is_from_search`), `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
 | Optional plain block quote geometry | `crates/markdown/src/markdown.rs` (style overrides preserve shared renderer defaults) |
 | Editable preview navigation | `crates/editor/src/editor.rs` (`RowMotion`, `Addon::blocks_to_reveal_before`; the logic lives in the addon), `crates/vim/src/motion.rs`, `crates/vim/src/vim.rs` (Vim motions bypass editor actions) |
