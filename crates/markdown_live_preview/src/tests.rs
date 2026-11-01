@@ -2377,6 +2377,153 @@ async fn test_move_and_delete_rows_columns(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_copy_and_cut_selected_table_unit(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | one | a \\| b |
+        | two | 2 |
+    "});
+    cx.executor().run_until_parked();
+    let range = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Table(_) => Some(block.range.clone()),
+                _ => None,
+            })
+            .expect("table")
+    });
+    let select = |cx: &mut EditorTestContext, unit: TableUnit| {
+        let table_range = range.clone();
+        cx.update_editor(|editor, _, _| {
+            editor
+                .addon_mut::<LivePreviewAddon>()
+                .unwrap()
+                .selected_table_unit = Some(TableUnitSelection { table_range, unit });
+        });
+    };
+    let clipboard = |cx: &mut EditorTestContext| {
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default()
+    };
+
+    select(&mut cx, TableUnit::Row(0));
+    cx.dispatch_action(editor::actions::Copy);
+    assert_eq!(clipboard(&mut cx), "one\ta | b");
+
+    select(&mut cx, TableUnit::Column(1));
+    cx.dispatch_action(editor::actions::Copy);
+    assert_eq!(clipboard(&mut cx), "B\na | b\n2");
+
+    select(&mut cx, TableUnit::Row(1));
+    cx.dispatch_action(editor::actions::Cut);
+    cx.executor().run_until_parked();
+    assert_eq!(clipboard(&mut cx), "two\t2");
+    let text = cx.buffer_text();
+    assert!(!text.contains("two"), "cut row should be gone: {text}");
+    assert!(text.contains("| one |"), "{text}");
+}
+
+#[gpui::test]
+async fn test_drag_across_cells_selects_copies_and_clears(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {"
+        ˇplain line
+
+        | A | B |
+        | --- | --- |
+        | one | a \\| b |
+        | two | 2 |
+    "});
+    cx.executor().run_until_parked();
+    let bounds = |cx: &mut EditorTestContext, selector: &'static str| {
+        cx.cx.debug_bounds(selector).expect("cell rendered")
+    };
+
+    // A click without a drag still edits the cell.
+    let first = bounds(&mut cx, "mdlp-cell-h-0").center();
+    cx.cx
+        .simulate_mouse_down(first, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx
+        .simulate_mouse_up(first, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        let addon = editor.addon::<LivePreviewAddon>().unwrap();
+        assert!(addon.active_cell.is_some(), "click should edit the cell");
+        assert!(addon.selected_cells.is_none());
+    });
+
+    let from = bounds(&mut cx, "mdlp-cell-h-0").center();
+    let to = bounds(&mut cx, "mdlp-cell-0-1").center();
+    cx.cx
+        .simulate_mouse_down(from, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx
+        .simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+    // Shrinking back over an already-highlighted cell still moves the head.
+    let shrink_to = bounds(&mut cx, "mdlp-cell-h-1").center();
+    cx.cx
+        .simulate_mouse_move(shrink_to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        let addon = editor.addon::<LivePreviewAddon>().unwrap();
+        let selection = addon.selected_cells.as_ref().expect("cells selected");
+        assert_eq!(selection.head, (0, 1));
+    });
+    cx.cx
+        .simulate_mouse_move(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx
+        .simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        let addon = editor.addon::<LivePreviewAddon>().unwrap();
+        assert!(
+            addon.active_cell.is_none(),
+            "dragging out should end editing"
+        );
+        let selection = addon.selected_cells.as_ref().expect("cells selected");
+        assert_eq!((selection.anchor, selection.head), ((0, 0), (1, 1)));
+    });
+
+    cx.dispatch_action(editor::actions::Copy);
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default(),
+        "A\tB\none\ta | b"
+    );
+
+    cx.dispatch_action(editor::actions::Delete);
+    cx.executor().run_until_parked();
+    let text = cx.buffer_text();
+    assert!(!text.contains("one"), "{text}");
+    assert!(!text.contains("| A |"), "{text}");
+    assert!(
+        text.contains("| two | 2 |"),
+        "untouched row must stay: {text}"
+    );
+
+    // Moving with the button up after the release must not select.
+    cx.dispatch_action(editor::actions::Cancel);
+    let elsewhere = bounds(&mut cx, "mdlp-cell-1-0").center();
+    cx.cx
+        .simulate_mouse_move(elsewhere, None, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, _| {
+        let addon = editor.addon::<LivePreviewAddon>().unwrap();
+        assert!(addon.selected_cells.is_none());
+        assert!(addon.cell_press.is_none(), "mouse up clears the press");
+    });
+}
+
+#[gpui::test]
 async fn test_drag_row_reorders_via_mouse(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     cx.set_state(indoc::indoc! {"
@@ -2809,6 +2956,7 @@ async fn test_inline_math_requires_tight_delimiters(cx: &mut TestAppContext) {
         ˇplain line
         $ a = b $
         it costs $5 and $10 today
+        between $5/$6 and $7
     "});
     cx.executor().run_until_parked();
     pretty_assertions::assert_eq!(
@@ -2817,6 +2965,7 @@ async fn test_inline_math_requires_tight_delimiters(cx: &mut TestAppContext) {
             plain line
             $ a = b $
             it costs $5 and $10 today
+            between $5/$6 and $7
         "}
     );
 }
@@ -6358,6 +6507,11 @@ fn test_split_cell_math() {
         [r"text(\$5 and \$10, false, false)"]
     );
     assert_eq!(describe("$ a $"), ["text($ a $, false, false)"]);
+    // A closing `$` followed by a digit is a price, not a delimiter.
+    assert_eq!(
+        describe("($0.20 / $0.80 per 1M) ≈ **$1.00**"),
+        ["text(($0.20 / $0.80 per 1M) ≈ **$1.00**, false, false)"]
+    );
 }
 
 #[gpui::test]

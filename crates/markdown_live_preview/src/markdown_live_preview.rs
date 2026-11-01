@@ -28,9 +28,9 @@ use editor::{
     },
 };
 use gpui::{
-    App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
-    HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
-    RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
+    App, AppContext as _, ClipboardItem, Context, ElementId, Empty, Entity, Focusable as _,
+    FontWeight, HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent,
+    Resource, RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
     TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, rems, svg,
 };
 use language::LanguageName;
@@ -264,6 +264,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                     if !resizing {
                         addon.selected_image = None;
                     }
+                    addon.selected_cells = None;
                 }
                 apply_decorations(editor, cx);
             }
@@ -333,12 +334,59 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         }),
     );
 
+    // Copy/Cut take a selected table row/column as text; cell editing and
+    // source selection can't span cells, so this is the only way to copy one.
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(
+        editor.register_action::<editor::actions::Copy>(move |_, _window, cx| {
+            if !copy_selected_table_cells(&weak_editor, cx)
+                && !copy_selected_table_unit(&weak_editor, cx)
+            {
+                cx.propagate();
+            }
+        }),
+    );
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(
+        editor.register_action::<editor::actions::Cut>(move |_, _window, cx| {
+            let cut_cells = copy_selected_table_cells(&weak_editor, cx)
+                && clear_selected_table_cells(&weak_editor, cx);
+            if !cut_cells
+                && !(copy_selected_table_unit(&weak_editor, cx)
+                    && delete_selected_table_unit(&weak_editor, cx))
+            {
+                cx.propagate();
+            }
+        }),
+    );
+
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(
+        editor.register_action::<editor::actions::Cancel>(move |_, _window, cx| {
+            let cleared = weak_editor
+                .update(cx, |editor, cx| {
+                    let addon = editor.addon_mut::<LivePreviewAddon>()?;
+                    let had_selection = addon.selected_cells.take().is_some()
+                        | addon.selected_table_unit.take().is_some();
+                    cx.notify();
+                    had_selection.then_some(())
+                })
+                .ok()
+                .flatten()
+                .is_some();
+            if !cleared {
+                cx.propagate();
+            }
+        }),
+    );
+
     // Backspace/Delete removes a selected table row/column (Obsidian-style)
     // instead of editing text; without a selection they pass through.
     let weak_editor = cx.weak_entity();
     subscriptions.push(editor.register_action::<editor::actions::Backspace>(
         move |_, _window, cx| {
-            if !delete_selected_table_unit(&weak_editor, cx)
+            if !clear_selected_table_cells(&weak_editor, cx)
+                && !delete_selected_table_unit(&weak_editor, cx)
                 && !delete_adjacent_citation(&weak_editor, false, cx)
                 && !delete_adjacent_to_block(&weak_editor, false, cx)
             {
@@ -349,7 +397,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
     let weak_editor = cx.weak_entity();
     subscriptions.push(
         editor.register_action::<editor::actions::Delete>(move |_, _window, cx| {
-            if !delete_selected_table_unit(&weak_editor, cx)
+            if !clear_selected_table_cells(&weak_editor, cx)
+                && !delete_selected_table_unit(&weak_editor, cx)
                 && !delete_adjacent_citation(&weak_editor, true, cx)
                 && !delete_adjacent_to_block(&weak_editor, true, cx)
             {
@@ -571,6 +620,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         active_cell: None,
         active_property: None,
         selected_table_unit: None,
+        selected_cells: None,
+        cell_press: None,
         drag_source: None,
         drop_boundary: None,
         handle_press: None,
@@ -611,6 +662,10 @@ struct LivePreviewAddon {
     /// Properties card.
     active_property: Option<ActivePropertyEdit>,
     selected_table_unit: Option<TableUnitSelection>,
+    selected_cells: Option<TableCellSelection>,
+    /// The table cell the left button went down on, so dragging out of it
+    /// into another cell starts a cell selection. Cleared on mouse up.
+    cell_press: Option<(Range<Anchor>, TableCellPosition)>,
     /// Unit being dragged (outlined in place, Obsidian-style) and the unit
     /// the pointer is currently over (gets the insertion line). Rendered
     /// only while a drag is active.
@@ -1150,6 +1205,36 @@ enum TableUnit {
 struct TableUnitSelection {
     table_range: Range<Anchor>,
     unit: TableUnit,
+}
+
+/// A cell as (grid row, column), where grid row 0 is the header and grid row
+/// `i + 1` is data row `i`.
+type TableCellPosition = (usize, usize);
+
+/// A rectangle of cells selected by dragging across them, Notion-style.
+struct TableCellSelection {
+    table_range: Range<Anchor>,
+    anchor: TableCellPosition,
+    head: TableCellPosition,
+}
+
+impl TableCellSelection {
+    fn grid_rows(&self) -> std::ops::RangeInclusive<usize> {
+        self.anchor.0.min(self.head.0)..=self.anchor.0.max(self.head.0)
+    }
+
+    fn columns(&self) -> std::ops::RangeInclusive<usize> {
+        self.anchor.1.min(self.head.1)..=self.anchor.1.max(self.head.1)
+    }
+}
+
+impl TableStructure {
+    fn cell_at(&self, (grid_row, column): TableCellPosition) -> Option<&Range<Anchor>> {
+        match grid_row.checked_sub(1) {
+            None => self.header.get(column),
+            Some(row) => self.rows.get(row)?.get(column),
+        }
+    }
 }
 
 /// The single-line editor mounted over a table cell.
@@ -3513,6 +3598,7 @@ fn start_cell_edit(
     main_editor.update(cx, |editor, cx| {
         if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
             addon.selected_table_unit = None;
+            addon.selected_cells = None;
             addon.active_cell = Some(ActiveTableCell {
                 cell_range,
                 editor: cell_editor,
@@ -3526,6 +3612,66 @@ fn start_cell_edit(
 fn refocus_main_editor(editor: &Editor, window: &mut Window, cx: &mut Context<Editor>) {
     let focus_handle = editor.focus_handle(cx);
     window.focus(&focus_handle, cx);
+}
+
+/// Drags the cell selection's head to `position` once the pointer, pressed
+/// in a cell of this table, has left that cell. The cell editor the press
+/// opened is committed and focus returns to the main editor, where Copy, Cut
+/// and Delete act on the selection.
+fn extend_cell_selection(
+    weak_editor: &WeakEntity<Editor>,
+    table_range: &Range<Anchor>,
+    position: TableCellPosition,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    weak_editor
+        .update(cx, |editor, cx| {
+            let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+                return;
+            };
+            let Some(anchor) = addon
+                .cell_press
+                .as_ref()
+                .filter(|(press_table, _)| press_table.start == table_range.start)
+                .map(|(_, anchor)| *anchor)
+            else {
+                return;
+            };
+            match &mut addon.selected_cells {
+                Some(selection) if selection.anchor == anchor => {
+                    if selection.head == position {
+                        return;
+                    }
+                    selection.head = position;
+                }
+                _ => {
+                    if anchor == position {
+                        return;
+                    }
+                    addon.selected_table_unit = None;
+                    addon.selected_cells = Some(TableCellSelection {
+                        table_range: table_range.clone(),
+                        anchor,
+                        head: position,
+                    });
+                    commit_active_cell(editor, cx);
+                    refocus_main_editor(editor, window, cx);
+                }
+            }
+            cx.notify();
+        })
+        .log_err();
+}
+
+fn clear_cell_press(weak_editor: &WeakEntity<Editor>, cx: &mut App) {
+    weak_editor
+        .update(cx, |editor, _| {
+            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                addon.cell_press = None;
+            }
+        })
+        .log_err();
 }
 
 /// Records the insertion boundary the pointer indicates, notifying only on
@@ -3707,6 +3853,141 @@ fn delete_adjacent_citation(weak_editor: &WeakEntity<Editor>, forward: bool, cx:
         });
         true
     })
+}
+
+/// The selected cell rectangle with its table re-parsed from live text.
+fn selected_cells_in_table(
+    editor: &Editor,
+    cx: &App,
+) -> Option<(
+    std::ops::RangeInclusive<usize>,
+    std::ops::RangeInclusive<usize>,
+    TableStructure,
+)> {
+    let selection = editor
+        .addon::<LivePreviewAddon>()?
+        .selected_cells
+        .as_ref()?;
+    let (_, structure) = fresh_table_at(editor, &selection.table_range, cx)?;
+    Some((selection.grid_rows(), selection.columns(), structure))
+}
+
+/// Copies the dragged cell rectangle as tab-separated rows, which
+/// spreadsheets paste as cells. Returns false when no cells are selected.
+fn copy_selected_table_cells(weak_editor: &WeakEntity<Editor>, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    let Some(text) = editor.read_with(cx, |editor, cx| {
+        let (grid_rows, columns, structure) = selected_cells_in_table(editor, cx)?;
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let text = grid_rows
+            .map(|grid_row| {
+                columns
+                    .clone()
+                    .map(|column| {
+                        structure
+                            .cell_at((grid_row, column))
+                            .map(|range| table_cell_text(range, &snapshot))
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(text)
+    }) else {
+        return false;
+    };
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    true
+}
+
+/// Empties every cell in the dragged rectangle, keeping the table's shape.
+/// Returns false when no cells are selected.
+fn clear_selected_table_cells(weak_editor: &WeakEntity<Editor>, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    editor.update(cx, |editor, cx| {
+        let Some((grid_rows, columns, structure)) = selected_cells_in_table(editor, cx) else {
+            return false;
+        };
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let edits = grid_rows
+            .flat_map(|grid_row| columns.clone().map(move |column| (grid_row, column)))
+            .filter_map(|position| structure.cell_at(position))
+            .filter(|range| !(range.start == Anchor::Min && range.end == Anchor::Min))
+            .map(|range| {
+                (
+                    range.start.to_offset(&snapshot)..range.end.to_offset(&snapshot),
+                    "  ",
+                )
+            })
+            .collect::<Vec<_>>();
+        editor.buffer().update(cx, |multibuffer, cx| {
+            multibuffer.edit(edits, None, cx);
+        });
+        cx.notify();
+        true
+    })
+}
+
+/// Copies the row/column currently selected via its handle, tab-separated so
+/// spreadsheets paste it as cells. Returns false when there is no selection
+/// so the caller can propagate.
+fn copy_selected_table_unit(weak_editor: &WeakEntity<Editor>, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    let Some(text) = editor.read_with(cx, |editor, cx| {
+        let selection = editor
+            .addon::<LivePreviewAddon>()?
+            .selected_table_unit
+            .as_ref()?;
+        let (_, structure) = fresh_table_at(editor, &selection.table_range, cx)?;
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        Some(table_unit_text(&structure, selection.unit, &snapshot))
+    }) else {
+        return false;
+    };
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+    true
+}
+
+/// A cell's text as a reader sees it: trimmed, with GFM pipe escapes undone.
+fn table_cell_text(range: &Range<Anchor>, snapshot: &MultiBufferSnapshot) -> String {
+    let start = range.start.to_offset(snapshot);
+    let end = range.end.to_offset(snapshot).max(start);
+    snapshot
+        .text_for_range(start..end)
+        .collect::<String>()
+        .trim()
+        .replace("\\|", "|")
+}
+
+/// A row's cells joined by tabs, or a column's cells (header first) joined by
+/// newlines.
+fn table_unit_text(
+    structure: &TableStructure,
+    unit: TableUnit,
+    snapshot: &MultiBufferSnapshot,
+) -> String {
+    let cell_text = |range: &Range<Anchor>| table_cell_text(range, snapshot);
+    match unit {
+        TableUnit::Row(row) => structure
+            .rows
+            .get(row)
+            .map(|cells| cells.iter().map(cell_text).collect::<Vec<_>>().join("\t"))
+            .unwrap_or_default(),
+        TableUnit::Column(column) => std::iter::once(&structure.header)
+            .chain(&structure.rows)
+            .filter_map(|cells| cells.get(column))
+            .map(cell_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
 }
 
 /// Deletes the row/column currently selected via its handle, if any.
@@ -4108,7 +4389,9 @@ fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
         // mid-line in the editor; only single-`$` math needs tight delimiters.
         let source = match event {
             pulldown_cmark::Event::InlineMath(source) => {
-                if source.starts_with(char::is_whitespace) || source.ends_with(char::is_whitespace)
+                if source.starts_with(char::is_whitespace)
+                    || source.ends_with(char::is_whitespace)
+                    || closes_before_digit(text, range.end)
                 {
                     continue;
                 }
@@ -4156,6 +4439,15 @@ fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
         push_cell_text(&mut segments, rest);
     }
     segments
+}
+
+/// Pandoc's rule for single-`$` math: a closing `$` followed by a digit is a
+/// price, not a delimiter, so "$0.20 / $0.80 ≈ **$1.00**" stays prose even
+/// though `$0.80 ≈ **$` has no space inside either delimiter.
+fn closes_before_digit(text: &str, close_end: usize) -> bool {
+    text.get(close_end..)
+        .and_then(|rest| rest.chars().next())
+        .is_some_and(|character| character.is_ascii_digit())
 }
 
 fn push_cell_text<'a>(segments: &mut Vec<CellSegment<'a>>, text: &'a str) {
@@ -4340,6 +4632,20 @@ fn render_table_block(
                 .read(block_cx.app)
                 .snapshot(block_cx.app)
         });
+        let selected_cells =
+            editor
+                .upgrade()
+                .zip(resolved.as_ref())
+                .and_then(|(entity, snapshot)| {
+                    let selection = entity
+                        .read(block_cx.app)
+                        .addon::<LivePreviewAddon>()?
+                        .selected_cells
+                        .as_ref()?;
+                    (selection.table_range.start.to_offset(snapshot)
+                        == table_range.start.to_offset(snapshot))
+                    .then(|| (selection.grid_rows(), selection.columns()))
+                });
         let (selected_unit, drag_source_unit, drop_boundary) = editor
             .upgrade()
             .zip(resolved.as_ref())
@@ -4412,6 +4718,20 @@ fn render_table_block(
                 None => false,
             };
             let in_selected_unit = unit_covers_cell(selected_unit);
+            let grid_row = data_row.map_or(0, |row| row + 1);
+            let position = (grid_row, column);
+            // Which outer edges of the selected rectangle this cell sits on.
+            let selection_edges = selected_cells
+                .as_ref()
+                .filter(|(rows, columns)| rows.contains(&grid_row) && columns.contains(&column))
+                .map(|(rows, columns)| {
+                    (
+                        grid_row == *rows.start(),
+                        column == *columns.end(),
+                        grid_row == *rows.end(),
+                        column == *columns.start(),
+                    )
+                });
             // The dragged unit gets the tint only: recoloring its borders
             // reads as a second insertion line.
             let is_drag_source_cell = unit_covers_cell(drag_source_unit);
@@ -4483,6 +4803,47 @@ fn render_table_block(
                         .border_color(colors.border_focused)
                 })
                 .when(is_drag_source_cell, |this| this.bg(colors.element_selected))
+                .when_some(selection_edges, |this, (top, right, bottom, left)| {
+                    // Overlay, not the cell's own borders, which draw only
+                    // the right and bottom grid lines.
+                    let outline = div()
+                        .absolute()
+                        .top(gpui::px(-1.))
+                        .bottom(gpui::px(-1.))
+                        .left(gpui::px(-1.))
+                        .right(gpui::px(-1.))
+                        .border_color(colors.border_focused)
+                        .when(top, |outline| outline.border_t_2())
+                        .when(right, |outline| outline.border_r_2())
+                        .when(bottom, |outline| outline.border_b_2())
+                        .when(left, |outline| outline.border_l_2());
+                    this.relative().bg(colors.element_selected).child(outline)
+                })
+                .capture_any_mouse_down({
+                    let weak = editor.clone();
+                    let cell_table_range = table_range.clone();
+                    move |event, _, cx| {
+                        if event.button != MouseButton::Left {
+                            return;
+                        }
+                        weak.update(cx, |editor, _| {
+                            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                                addon.cell_press = Some((cell_table_range.clone(), position));
+                            }
+                        })
+                        .log_err();
+                    }
+                })
+                .on_mouse_move({
+                    let weak = editor.clone();
+                    let cell_table_range = table_range.clone();
+                    move |event, window, cx| {
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            return;
+                        }
+                        extend_cell_selection(&weak, &cell_table_range, position, window, cx);
+                    }
+                })
                 .when_some(column_insertion, |this, after| {
                     // Overlay, not a border: borders recolor the cell's own
                     // grid lines and shift layout; an absolute bar draws one
@@ -4585,7 +4946,7 @@ fn render_table_block(
         let select_unit = |unit: TableUnit| {
             let weak = editor.clone();
             let unit_table_range = table_range.clone();
-            move |event: &gpui::MouseUpEvent, _: &mut Window, cx: &mut App| {
+            move |event: &gpui::MouseUpEvent, window: &mut Window, cx: &mut App| {
                 weak.update(cx, |editor, cx| {
                     let Some(press) = editor
                         .addon_mut::<LivePreviewAddon>()
@@ -4599,7 +4960,11 @@ fn render_table_block(
                         return;
                     }
                     commit_active_cell(editor, cx);
+                    // The table swallows mouse downs, so nothing else gives
+                    // the main editor focus for Copy/Cut/Delete to reach it.
+                    refocus_main_editor(editor, window, cx);
                     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.selected_cells = None;
                         let already = addon
                             .selected_table_unit
                             .as_ref()
@@ -4998,6 +5363,14 @@ fn render_table_block(
             .group("mdlp-table")
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
+            })
+            .capture_any_mouse_up({
+                let weak = editor.clone();
+                move |_, _, cx| clear_cell_press(&weak, cx)
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let weak = editor.clone();
+                move |_, _, cx| clear_cell_press(&weak, cx)
             })
             .on_drop::<TableRowDrag>(container_row_drop)
             .on_drop::<TableColumnDrag>(container_column_drop)
@@ -7558,7 +7931,8 @@ impl Extraction<'_> {
     /// The grammar treats a run of one or more `$` as the delimiter, so the
     /// opening run's length is what separates inline from display math.
     /// Following Obsidian, `$...$` requires a non-space immediately inside
-    /// each delimiter — so prose like "cost $5 and $10" stays prose — while
+    /// each delimiter — so prose like "cost $5 and $10" stays prose — and,
+    /// following Pandoc, no digit right after the closing `$`, while
     /// `$$...$$` tolerates padding. Display math that sits alone on its lines
     /// becomes a centered block; mid-line `$$...$$` renders inline (in
     /// compact text style) because a block replacement would swallow its
@@ -7592,7 +7966,8 @@ impl Extraction<'_> {
         let display = open.byte_range().len() >= 2;
         if !display
             && (source.starts_with(|c: char| c.is_whitespace())
-                || source.ends_with(|c: char| c.is_whitespace()))
+                || source.ends_with(|c: char| c.is_whitespace())
+                || closes_before_digit(self.text, close.end_byte()))
         {
             return;
         }
