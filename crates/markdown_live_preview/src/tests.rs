@@ -4987,7 +4987,7 @@ async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppCon
     });
     let weak = cx.editor.downgrade();
     let handled =
-        cx.update(|window, cx| reveal_at_source_index(&weak, &range, "> Su".len(), window, cx));
+        cx.update(|window, cx| reveal_at_source_index(&weak, &range, "> Su".len(), 0, window, cx));
     assert!(handled);
     cx.executor().run_until_parked();
 
@@ -5005,7 +5005,8 @@ async fn test_click_on_widget_text_reveals_at_that_character(cx: &mut TestAppCon
 
     // An index past the block (the widget's mini-document carries appended
     // reference definitions) clamps to the block's end.
-    let handled = cx.update(|window, cx| reveal_at_source_index(&weak, &range, 10_000, window, cx));
+    let handled =
+        cx.update(|window, cx| reveal_at_source_index(&weak, &range, 10_000, 0, window, cx));
     assert!(handled);
     cx.executor().run_until_parked();
     let head = cx.update_editor(|editor, _, cx| {
@@ -5569,6 +5570,112 @@ async fn test_soft_wrapped_line_of_links_before_a_heading_does_not_panic(cx: &mu
     cx.update_editor(|editor, window, cx| {
         editor.snapshot(window, cx);
     });
+}
+
+#[gpui::test]
+async fn test_fenced_code_block_nested_in_list_keeps_its_language(cx: &mut TestAppContext) {
+    use markdown::parser::{CodeBlockKind, MarkdownEvent, MarkdownTag};
+
+    let mut cx = markdown_test_context(cx).await;
+    // Issue #147: the widget used to receive the fence with the list item's
+    // four columns of indentation, which made it an indented code block of
+    // its own, rendered as plain text with the fences showing.
+    for (indent, fence) in [
+        ("    ", "~~~"),
+        ("    ", "```"),
+        ("\t", "```"),
+        ("  ", "~~~"),
+    ] {
+        cx.set_state(&format!(
+            "ˇ- item\n\n{indent}{fence}bash\n{indent}echo hi\n{indent}{fence}\n\nAfter"
+        ));
+        cx.executor().run_until_parked();
+        cx.update_editor(|editor, _, cx| {
+            let addon = editor.addon::<LivePreviewAddon>().unwrap();
+            let languages: Vec<_> = addon
+                .markdown_blocks
+                .values()
+                .flat_map(|(_, markdown, _)| {
+                    markdown
+                        .read(cx)
+                        .parsed_markdown()
+                        .events
+                        .iter()
+                        .filter_map(|(_, event)| match event {
+                            MarkdownEvent::Start(MarkdownTag::CodeBlock { kind, .. }) => {
+                                Some(kind.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            assert_eq!(
+                languages,
+                vec![CodeBlockKind::FencedLang("bash".into())],
+                "{indent:?} {fence:?}"
+            );
+        });
+    }
+
+    // Every generic widget gets the same treatment: a quote nested in a list
+    // item was likewise swallowed as an indented code block.
+    cx.set_state("ˇ- item\n\n    > quoted\n\nAfter");
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let addon = editor.addon::<LivePreviewAddon>().unwrap();
+        let quotes = addon
+            .markdown_blocks
+            .values()
+            .flat_map(|(_, markdown, _)| markdown.read(cx).parsed_markdown().events.iter())
+            .filter(|(_, event)| matches!(event, MarkdownEvent::Start(MarkdownTag::BlockQuote(_))))
+            .count();
+        assert_eq!(quotes, 1);
+    });
+
+    // A click on the widget's text still lands on the clicked character,
+    // past the indentation the widget no longer sees.
+    cx.set_state("ˇ- item\n\n    ```bash\n    echo hi\n    ```\n\nAfter");
+    cx.executor().run_until_parked();
+    let (range, indent_columns) = cx.update_editor(|editor, _, cx| {
+        extract_markers(editor, cx)
+            .unwrap()
+            .blocks
+            .iter()
+            .find_map(|block| match &block.kind {
+                BlockRenderKind::Markdown => Some((block.range.clone(), block.indent_columns)),
+                _ => None,
+            })
+            .expect("code block")
+    });
+    assert_eq!(indent_columns, 4);
+    let weak = cx.editor.downgrade();
+    let clicked = "```bash\nec".len();
+    assert!(cx.update(|window, cx| {
+        reveal_at_source_index(&weak, &range, clicked, indent_columns, window, cx)
+    }));
+    cx.executor().run_until_parked();
+    let head = cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        editor.selections.newest_anchor().head().to_point(&snapshot)
+    });
+    assert_eq!(head, Point::new(3, "    ec".len() as u32));
+}
+
+#[test]
+fn test_dedent_block_source_round_trips_indices() {
+    let original = "    ```bash\n  x\n\n\tdone\n    ```";
+    let dedented = dedent_block_source(original, 4);
+    assert_eq!(dedented, "```bash\nx\n\ndone\n```");
+    for (index, character) in dedented.char_indices() {
+        let mapped = index_before_dedent(original, 4, index);
+        assert_eq!(
+            original[mapped..].chars().next(),
+            Some(character),
+            "{index}"
+        );
+    }
+    assert_eq!(dedent_block_source(original, 0), original);
 }
 
 #[gpui::test]
