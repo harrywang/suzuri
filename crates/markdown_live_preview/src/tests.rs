@@ -2454,6 +2454,52 @@ async fn test_drag_row_reorders_via_mouse(cx: &mut TestAppContext) {
     );
 }
 
+// Also pins that GPUI hit-testing intersects a hitbox with the content mask
+// active when it was inserted, which is what keeps gutter clicks off blocks.
+#[gpui::test]
+async fn test_horizontally_scrolled_block_stays_behind_gutter(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let long_line = "y".repeat(400);
+    let wide_cell = "x".repeat(80);
+    cx.set_state(&format!(
+        "ˇ{long_line}\n\n| {wide_cell} | B |\n| --- | --- |\n| {wide_cell} | 1 |\n"
+    ));
+    cx.update_editor(|editor, _, cx| {
+        editor.set_soft_wrap_mode(language::language_settings::SoftWrap::None, cx);
+    });
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, window, cx| {
+        editor.set_scroll_position(gpui::point(40., 0.), window, cx);
+    });
+    cx.executor().run_until_parked();
+
+    let editor_bounds = cx
+        .update_editor(|editor, _, _| editor.last_bounds().copied())
+        .expect("editor laid out");
+    let cell = cx
+        .cx
+        .debug_bounds("mdlp-cell-0-0")
+        .expect("table cell rendered");
+    let in_gutter = gpui::point(editor_bounds.left() + gpui::px(1.), cell.center().y);
+    assert!(
+        cell.contains(&in_gutter),
+        "scrolling should slide the cell under the gutter: cell {cell:?}, editor {editor_bounds:?}"
+    );
+
+    cx.cx
+        .simulate_mouse_down(in_gutter, gpui::MouseButton::Left, Modifiers::none());
+    cx.executor().run_until_parked();
+    let editing_cell = cx.update_editor(|editor, _, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .is_some_and(|addon| addon.active_cell.is_some())
+    });
+    assert!(
+        !editing_cell,
+        "a click on the gutter must not reach the block scrolled behind it"
+    );
+}
+
 #[gpui::test]
 async fn test_drag_row_drop_anywhere_on_table(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
