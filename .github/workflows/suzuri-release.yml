@@ -78,6 +78,16 @@ jobs:
         with:
           node-version: 20
 
+      # bundle-mac requires the macOS 26 SDK (upstream #65994), and the
+      # image's default Xcode 16.4 only has macOS 15.5. Select the newest
+      # Xcode 26 here, before the next step deletes every other Xcode.
+      - name: Select Xcode 26
+        run: |
+          xcode="$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)"
+          [ -n "$xcode" ] || { echo "no Xcode 26 on this runner image"; exit 1; }
+          sudo xcode-select -s "$xcode"
+          echo "using $xcode, macOS SDK $(xcrun --sdk macosx --show-sdk-version)"
+
       # Hosted macOS images leave roughly 40G free, and the 0.4.6 build ran
       # out at the final link. The unused Xcode versions and simulator
       # runtimes are the cheapest space to reclaim.
