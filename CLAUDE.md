@@ -389,6 +389,8 @@ To release:
 
 1. Bump `SUZURI_VERSION` in `crates/suzuri_update/src/suzuri_update.rs`.
 2. Tag `suzuri-v<that same version>` and push the tag.
+3. Once the release publishes, run `/update-log` in `../suzuri.ai`, and check that every
+   user-facing feature since the previous tag has a page in `../suzuri-docs`.
 
 The two must agree: `SUZURI_VERSION` is what a running build compares against the
 newest GitHub release, so a tag ahead of the constant ships a build that never
