@@ -1,5 +1,5 @@
 use acp_thread::{AcpThread, MessageKind};
-use agent_client_protocol::schema::v2 as acp_v2;
+use agent_client_protocol::v2::schema as acp_v2;
 use anyhow::Result;
 use collections::HashMap;
 use gpui::Context;
@@ -93,10 +93,18 @@ impl PendingSessionUpdates {
         let mut notifications = Vec::new();
         // Session IDs correlate concurrent creations. The wire carries no request ID
         // on these notifications, so provisional ID reuse by the agent remains ambiguous.
+        // The new session's subagents, and theirs, are announced before their own traffic,
+        // so walking in order also collects that traffic, in the order it arrived.
+        let mut sessions = vec![session_id.clone()];
         for update in std::mem::take(&mut self.updates) {
-            if &update.notification.session_id == session_id
-                && update.generation >= creation.generation
+            if update.generation >= creation.generation
+                && sessions.contains(&update.notification.session_id)
             {
+                if let InboundSessionUpdate::Subagent(subagent) = &update.notification.update
+                    && !sessions.contains(&subagent.session_id)
+                {
+                    sessions.push(subagent.session_id.clone());
+                }
                 notifications.push(update.notification);
             } else {
                 self.updates.push_back(update);
@@ -225,8 +233,18 @@ impl TryFrom<acp_v2::UpdateSessionNotification> for InboundSessionNotification {
                 InboundSessionUpdate::ToolCallContentChunk(chunk)
             }
             acp_v2::SessionUpdate::PlanUpdate(mut update) => {
+                // Zed only renders item plans, but any plan type replaces the plan with that ID.
                 let plan = match update.plan {
                     acp_v2::PlanUpdateContent::Items(plan) => plan,
+                    acp_v2::PlanUpdateContent::File(plan) => {
+                        acp_v2::PlanItems::new(plan.plan_id, Vec::new())
+                    }
+                    acp_v2::PlanUpdateContent::Markdown(plan) => {
+                        acp_v2::PlanItems::new(plan.plan_id, Vec::new())
+                    }
+                    acp_v2::PlanUpdateContent::Other(plan) => {
+                        acp_v2::PlanItems::new(plan.plan_id, Vec::new())
+                    }
                     content => {
                         update.plan = content;
                         notification.update = acp_v2::SessionUpdate::PlanUpdate(update);

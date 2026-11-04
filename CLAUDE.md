@@ -84,7 +84,7 @@ The suzuri.ai site ([suzuri.ai](https://github.com/harrywang/suzuri.ai), cloned 
 `../suzuri.ai`) shows screenshots of the app. Take them from the vaults in
 `../suzuri-testbed/screenshots/` with its `open.sh` and `capture.sh`, never from a
 personal folder, so a retake after a UI change matches the rest; its README lists the traps.
-Visual regression tests: `cargo run -p zed --bin zed_visual_test_runner --features visual-tests`
+Visual regression tests: `cargo run -p zed --bin zed-visual-test-runner --features visual-tests`
 (prefix with `UPDATE_BASELINE=1` to re-record).
 
 Gotcha: running Zed from `cargo run` and then opening *this* repo inside it leaks Cargo's
