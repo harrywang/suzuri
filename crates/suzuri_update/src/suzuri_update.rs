@@ -14,10 +14,8 @@
 //! remote server from; see [`remote_server_download_url`].
 
 use anyhow::{Context as _, Result};
-use http_client::{
-    HttpClient,
-    github::{GithubRelease, GithubReleaseAsset, latest_github_release},
-};
+use github_releases::{GithubRelease, GithubReleaseAsset, latest_github_release};
+use http_client::HttpClient;
 use semver::Version;
 use std::sync::Arc;
 

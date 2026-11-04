@@ -10875,6 +10875,7 @@ dependencies = [
  "anyhow",
  "citations",
  "editor",
+ "github_releases",
  "gpui",
  "http_client",
  "log",
@@ -18019,6 +18020,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures 0.3.34",
+ "github_releases",
  "http_client",
  "semver",
 ]
@@ -19794,6 +19796,7 @@ dependencies = [
  "anyhow",
  "editor",
  "futures 0.3.34",
+ "github_releases",
  "gpui",
  "http_client",
  "language",

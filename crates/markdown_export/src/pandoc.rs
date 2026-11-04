@@ -15,8 +15,8 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
-use http_client::HttpClient;
-use http_client::github::AssetKind;
+use github_releases::AssetKind;
+use typeset_preview::Downloader;
 
 /// The pinned Pandoc release, bumped deliberately rather than tracking latest.
 const PANDOC_TAG: &str = "3.11";
@@ -132,7 +132,7 @@ fn pandoc_on_path() -> Option<PathBuf> {
 pub async fn ensure_tools(
     format: Format,
     pdf_engine: &str,
-    http: std::sync::Arc<dyn HttpClient>,
+    http: Downloader,
 ) -> Result<Tools> {
     let pandoc = match pandoc_on_path() {
         Some(found) => found,
@@ -195,7 +195,7 @@ fn find_binary(directory: &Path, name: &str, depth: usize) -> Option<PathBuf> {
         .find_map(|child| find_binary(&child, name, depth - 1))
 }
 
-async fn ensure_pandoc(http: std::sync::Arc<dyn HttpClient>) -> Result<PathBuf> {
+async fn ensure_pandoc(http: Downloader) -> Result<PathBuf> {
     if let Some(existing) = provisioned_pandoc() {
         return Ok(existing);
     }
@@ -204,7 +204,7 @@ async fn ensure_pandoc(http: std::sync::Arc<dyn HttpClient>) -> Result<PathBuf> 
     std::fs::create_dir_all(&destination).with_context(|| format!("creating {destination:?}"))?;
 
     let release =
-        http_client::github::get_release_by_tag_name(PANDOC_REPOSITORY, PANDOC_TAG, http.clone())
+        github_releases::get_release_by_tag_name(PANDOC_REPOSITORY, PANDOC_TAG, http.http_client())
             .await?;
     let asset = release
         .assets
@@ -212,8 +212,9 @@ async fn ensure_pandoc(http: std::sync::Arc<dyn HttpClient>) -> Result<PathBuf> 
         .find(|asset| asset.name == asset_name)
         .with_context(|| format!("no Pandoc release asset named {asset_name:?}"))?;
 
-    http_client::github_download::download_server_binary(
-        http.as_ref(),
+    github_releases::download_server_binary(
+        http.executor(),
+        http.http_client(),
         &asset.browser_download_url,
         None,
         &destination.join("unpacked"),

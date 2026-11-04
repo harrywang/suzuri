@@ -318,7 +318,7 @@ fn run(
         None => show_toast(workspace, &format!("Exporting to {}…", format.label()), cx),
     }
 
-    let http = cx.http_client();
+    let http = typeset_preview::Downloader::new(cx);
     let conversion = pandoc::Conversion {
         format,
         source: request.source,

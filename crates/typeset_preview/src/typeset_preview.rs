@@ -29,6 +29,31 @@ use editor::{Editor, EditorEvent};
 use gpui::{App, AppContext as _, Context, Entity, Global, TaskExt as _, Window, actions};
 use settings::{LatexEngine, RegisterSetting, Settings as _};
 use util::ResultExt as _;
+
+/// What fetching a compiler needs: the HTTP client, and the executor the
+/// shared GitHub downloader runs its work on.
+#[derive(Clone)]
+pub struct Downloader {
+    http: std::sync::Arc<dyn http_client::HttpClient>,
+    executor: gpui::BackgroundExecutor,
+}
+
+impl Downloader {
+    pub fn new(cx: &App) -> Self {
+        Self {
+            http: cx.http_client(),
+            executor: cx.background_executor().clone(),
+        }
+    }
+
+    pub fn http_client(&self) -> std::sync::Arc<dyn http_client::HttpClient> {
+        self.http.clone()
+    }
+
+    pub fn executor(&self) -> &gpui::BackgroundExecutor {
+        &self.executor
+    }
+}
 use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
 
@@ -238,7 +263,7 @@ fn begin_preview(
         ),
         None => show_toast(workspace, "Compiling…", cx),
     }
-    let http = cx.http_client();
+    let http = Downloader::new(cx);
     let task = cx.background_spawn(async move { compile_document(&path, http, engine).await });
     cx.spawn_in(window, async move |workspace, cx| {
         let result = task.await;
@@ -315,7 +340,7 @@ fn compile(path: PathBuf, workspace: Option<Entity<Workspace>>, cx: &mut Context
         registry.in_flight.insert(path.clone());
     }
 
-    let http = cx.http_client();
+    let http = Downloader::new(cx);
     let engine = TypesetPreviewSettings::get_global(cx).latex_engine.clone();
     cx.spawn(async move |_, cx| {
         let result = cx
@@ -475,7 +500,7 @@ fn latex_invocation(engine: &LatexEngine) -> (&str, Vec<String>) {
 
 async fn compile_command(
     path: &Path,
-    http: std::sync::Arc<dyn http_client::HttpClient>,
+    http: Downloader,
     engine: LatexEngine,
 ) -> Result<CompileCommand> {
     let working_directory = path
@@ -553,7 +578,7 @@ async fn compile_command(
 /// download rather than each fetching a copy: markdown export uses Typst as
 /// its PDF engine for exactly this reason.
 pub async fn ensure_typst_binary(
-    http: std::sync::Arc<dyn http_client::HttpClient>,
+    http: Downloader,
 ) -> Result<PathBuf> {
     ensure_typst(http).await
 }
@@ -564,7 +589,7 @@ pub fn provisioned_typst_path() -> Option<PathBuf> {
     provisioned_typst().ok()
 }
 
-async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Result<PathBuf> {
+async fn ensure_typst(http: Downloader) -> Result<PathBuf> {
     let binary = provisioned_typst()?;
     if binary.exists() {
         return Ok(binary);
@@ -583,7 +608,7 @@ async fn ensure_typst(http: std::sync::Arc<dyn http_client::HttpClient>) -> Resu
             TYPST_TAG,
             &asset_name,
             &destination,
-            http_client::github::AssetKind::Zip,
+            github_releases::AssetKind::Zip,
         )
         .await?;
     } else {
@@ -655,7 +680,7 @@ fn tinytex_asset_name() -> Result<String> {
 }
 
 /// Downloads and prepares a managed TeX Live, returning its binary directory.
-async fn ensure_tinytex(http: std::sync::Arc<dyn http_client::HttpClient>) -> Result<PathBuf> {
+async fn ensure_tinytex(http: Downloader) -> Result<PathBuf> {
     if let Some(bin) = tinytex_installed() {
         return Ok(bin);
     }
@@ -736,13 +761,13 @@ fn prepended_path(bin: &Path) -> std::ffi::OsString {
 
 /// Resolves a release asset to its download URL and normalized sha256.
 async fn release_asset(
-    http: &std::sync::Arc<dyn http_client::HttpClient>,
+    http: &Downloader,
     repository: &str,
     tag: &str,
     asset_name: &str,
 ) -> Result<(String, Option<String>)> {
     let release =
-        http_client::github::get_release_by_tag_name(repository, tag, http.clone()).await?;
+        github_releases::get_release_by_tag_name(repository, tag, http.http_client()).await?;
     let asset = release
         .assets
         .iter()
@@ -758,12 +783,12 @@ async fn release_asset(
 }
 
 async fn download_release_archive(
-    http: &std::sync::Arc<dyn http_client::HttpClient>,
+    http: &Downloader,
     repository: &str,
     tag: &str,
     asset_name: &str,
     destination: &Path,
-    kind: http_client::github::AssetKind,
+    kind: github_releases::AssetKind,
 ) -> Result<()> {
     let (url, digest) = release_asset(http, repository, tag, asset_name).await?;
     // The downloader stages its temp files in the destination's parent and
@@ -771,8 +796,9 @@ async fn download_release_archive(
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
     }
-    http_client::github_download::download_server_binary(
-        http.as_ref(),
+    github_releases::download_server_binary(
+        http.executor(),
+        http.http_client(),
         &url,
         digest.as_deref(),
         destination,
@@ -790,7 +816,7 @@ async fn download_release_archive(
 /// stages the file, so a failed download cannot leave a partial archive
 /// behind for the extractor to choke on.
 async fn fetch_to_file(
-    http: &std::sync::Arc<dyn http_client::HttpClient>,
+    http: &Downloader,
     url: &str,
     digest: Option<&str>,
     directory: &Path,
@@ -799,8 +825,9 @@ async fn fetch_to_file(
     if let Some(parent) = directory.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {parent:?}"))?;
     }
-    http_client::github_download::download_server_raw_binary(
-        http.as_ref(),
+    github_releases::download_server_raw_binary(
+        http.executor(),
+        http.http_client(),
         url,
         digest,
         directory,
@@ -864,7 +891,7 @@ const MAX_RESOLVE_ROUNDS: usize = 12;
 
 async fn compile_document(
     path: &Path,
-    http: std::sync::Arc<dyn http_client::HttpClient>,
+    http: Downloader,
     engine: LatexEngine,
 ) -> Result<()> {
     let command = compile_command(path, http, engine).await?;
