@@ -1,9 +1,9 @@
 use gpui::{
-    AnyElement, ClipboardItem, Context, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Styled, Window, div, px,
+    AnyElement, ClipboardItem, Context, CursorStyle, IntoElement, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Styled, Window, div, px,
 };
 
-use super::pdf_renderer;
+use super::pdf_renderer::{self, LinkTarget};
 use super::{CopyDocumentText, PdfViewer, TextPosition};
 
 impl PdfViewer {
@@ -267,6 +267,74 @@ impl PdfViewer {
         })
     }
 
+    /// The link under a window position, as (page, index into its links).
+    pub(crate) fn link_at(&self, window_position: Point<Pixels>) -> Option<(usize, usize)> {
+        let (page_index, pdf_x, pdf_y) = self.point_to_page_point(window_position)?;
+        let link_index = self
+            .text_layouts
+            .get(&page_index)?
+            .link_at_point(pdf_x, pdf_y)?;
+        Some((page_index, link_index))
+    }
+
+    fn follow_link(&mut self, page_index: usize, link_index: usize, cx: &mut Context<Self>) {
+        let Some(link) = self
+            .text_layouts
+            .get(&page_index)
+            .and_then(|layout| layout.links.get(link_index))
+        else {
+            return;
+        };
+        match link.target.clone() {
+            LinkTarget::Uri(uri) => {
+                // A document can link anything the system knows how to open,
+                // including local files and applications, so only web and
+                // mail links are followed.
+                let scheme = uri.split_once(':').map(|(scheme, _)| scheme);
+                if scheme.is_some_and(|scheme| {
+                    ["http", "https", "mailto"]
+                        .iter()
+                        .any(|allowed| scheme.eq_ignore_ascii_case(allowed))
+                }) {
+                    cx.open_url(&uri);
+                } else {
+                    log::info!(
+                        "pdf_viewer: not opening link {uri:?}, only web and mail links open"
+                    );
+                }
+            }
+            LinkTarget::Page { index, top } => {
+                if index < self.page_count() {
+                    self.scroll_to_page_point(index, top.unwrap_or(0.0).max(0.0), cx);
+                }
+            }
+        }
+    }
+
+    /// Invisible boxes over a page's links, so the pointer shows a hand where
+    /// a click would follow one. Clicks themselves are hit-tested in
+    /// `handle_mouse_up`, which keeps a drag across a link a text selection.
+    pub(crate) fn link_areas_for_page(&self, page_index: usize, scale: f32) -> Vec<AnyElement> {
+        let Some(layout) = self.text_layouts.get(&page_index) else {
+            return Vec::new();
+        };
+        layout
+            .links
+            .iter()
+            .map(|link| {
+                let bounds = link.bounds;
+                div()
+                    .absolute()
+                    .left(px(bounds.x0 as f32 * scale))
+                    .top(px(bounds.y0 as f32 * scale))
+                    .w(px(bounds.width() as f32 * scale))
+                    .h(px(bounds.height() as f32 * scale))
+                    .cursor(CursorStyle::PointingHand)
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     pub(crate) fn handle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -278,6 +346,7 @@ impl PdfViewer {
         }
         // Clicking the document leaves the page box, as it does in a browser.
         window.focus(&self.focus_handle, cx);
+        self.pressed_link = self.link_at(event.position);
 
         log::debug!(
             "pdf_viewer: mouse_down at ({:.0},{:.0})",
@@ -332,16 +401,22 @@ impl PdfViewer {
 
     pub(crate) fn handle_mouse_up(
         &mut self,
-        _event: &MouseUpEvent,
+        event: &MouseUpEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.is_selecting = false;
+        let pressed_link = self.pressed_link.take();
 
         if self.selection_start == self.selection_end {
             log::debug!("pdf_viewer: mouse_up — click without drag, clearing selection");
             self.selection_start = None;
             self.selection_end = None;
+            if let Some((page_index, link_index)) = pressed_link
+                && self.link_at(event.position) == pressed_link
+            {
+                self.follow_link(page_index, link_index, cx);
+            }
         } else {
             log::debug!(
                 "pdf_viewer: mouse_up — selection: {:?} to {:?}",
