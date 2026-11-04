@@ -115,6 +115,7 @@ members = [
     "crates/icons",
     "crates/image_viewer",
     "crates/pdf_viewer",
+    "crates/json_canvas",
     "crates/typeset_preview",
     "crates/input_latency_ui",
     "crates/inspector_ui",
@@ -398,6 +399,7 @@ http_proxy = { path = "crates/http_proxy" }
 icons = { path = "crates/icons" }
 image_viewer = { path = "crates/image_viewer" }
 pdf_viewer = { path = "crates/pdf_viewer" }
+json_canvas = { path = "crates/json_canvas" }
 typeset_preview = { path = "crates/typeset_preview" }
 input_latency_ui = { path = "crates/input_latency_ui" }
 inspector_ui = { path = "crates/inspector_ui" }

@@ -26,6 +26,7 @@ The fork's own changes are small and additive:
 | LaTeX math rendering for live preview | `crates/math_render/` |
 | PDF viewer (adopted from zed#51040) | `crates/pdf_viewer/` |
 | Live Typst/LaTeX preview | `crates/typeset_preview/` |
+| Read-only JSON Canvas viewer (`.canvas`; agents write the file, the view follows it) | `crates/json_canvas/`, `crates/zed/src/main.rs` (`init` after `editor::init`, so it wins over the text editor) |
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs`, `crates/editor/src/selections_collection.rs` |
 | Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/element/header.rs` (sticky scroll keeps base typography), `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
 | Native heading search reveal and Vim integration regressions | `crates/editor/src/editor.rs` (`selection_is_from_search`), `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
@@ -177,7 +178,7 @@ merge chasing them:
 | Tests | Why |
 | --- | --- |
 | 11 save-prompt tests in `workspace` and `zed`, plus `project_panel tests::undo::undo_create_dirty_file` | The fork's `autosave` default in `assets/settings/default.json`. Tests load the shipped defaults, so buffers save themselves and upstream's tests never see the prompt they wait for. Setting `"autosave": "off"` in that file makes all twelve pass. |
-| `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer` and `typeset_preview`. |
+| `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer`, `typeset_preview`, and `json_canvas`. |
 | `collab db_tests::*_postgres` (14) | Need a local Postgres; CI provisions one. |
 
 Anything *else* that fails is worth investigating. Before blaming the merge, check whether
