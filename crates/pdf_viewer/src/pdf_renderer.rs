@@ -2,8 +2,15 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use gpui::RenderImage;
-use hayro::hayro_interpret::InterpreterSettings;
+use hayro::hayro_interpret::{InterpreterSettings, PageExt};
 use hayro::hayro_syntax::Pdf;
+use hayro::hayro_syntax::object::dict::keys::{
+    A, ANNOTS, D, DEST, DESTS, KIDS, LIMITS, NAMES, RECT, S, SUBTYPE, URI,
+};
+use hayro::hayro_syntax::object::{
+    Array, Dict, MaybeRef, Name, Object, ObjectIdentifier, Rect, String as PdfString,
+};
+use hayro::hayro_syntax::page::{Page, Rotation};
 use hayro::text::extract_text;
 use hayro::vello_cpu::color::AlphaColor;
 use hayro::vello_cpu::color::Srgb;
@@ -111,6 +118,35 @@ pub struct TextGlyph {
 pub struct PageTextLayout {
     /// Glyphs sorted in reading order (top-to-bottom, left-to-right).
     pub glyphs: Vec<TextGlyph>,
+    pub links: Vec<PageLink>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum LinkTarget {
+    Uri(std::string::String),
+    /// A page of this document. `top` is the point the destination asks to
+    /// bring to the top of the view, in PDF points below the page's top edge.
+    Page {
+        index: usize,
+        top: Option<f32>,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub struct PageLink {
+    /// In PDF points, top-left origin, the same space as glyph positions.
+    pub bounds: kurbo::Rect,
+    pub target: LinkTarget,
+}
+
+impl PageTextLayout {
+    pub fn link_at_point(&self, x: f32, y: f32) -> Option<usize> {
+        let point = kurbo::Point::new(x as f64, y as f64);
+        // Later annotations are drawn on top, so they win an overlap.
+        self.links
+            .iter()
+            .rposition(|link| link.bounds.contains(point))
+    }
 }
 
 impl PageTextLayout {
@@ -267,7 +303,144 @@ pub fn extract_page_text(pdf: &Pdf, page_index: usize) -> Result<PageTextLayout>
             .then_with(|| a.x.partial_cmp(&b.x).unwrap_or(std::cmp::Ordering::Equal))
     });
 
-    Ok(PageTextLayout { glyphs })
+    let links = extract_page_links(pdf, page);
+
+    Ok(PageTextLayout { glyphs, links })
+}
+
+fn extract_page_links(pdf: &Pdf, page: &Page<'_>) -> Vec<PageLink> {
+    let Some(annotations) = page.raw().get::<Array<'_>>(ANNOTS) else {
+        return Vec::new();
+    };
+    let transform = page.initial_transform(true);
+    annotations
+        .iter::<Dict<'_>>()
+        .filter_map(|annotation| {
+            if annotation.get::<Name>(SUBTYPE).as_deref() != Some(b"Link".as_slice()) {
+                return None;
+            }
+            let rect = annotation.get::<Rect>(RECT)?;
+            // Opposite corners stay opposite under the page's rotation and
+            // y-flip, but not necessarily as minimum and maximum.
+            let bounds = kurbo::Rect::from_points(
+                transform * kurbo::Point::new(rect.x0, rect.y0),
+                transform * kurbo::Point::new(rect.x1, rect.y1),
+            );
+            let target = link_target(pdf, &annotation)?;
+            Some(PageLink { bounds, target })
+        })
+        .collect()
+}
+
+fn link_target<'a>(pdf: &'a Pdf, annotation: &Dict<'a>) -> Option<LinkTarget> {
+    if let Some(action) = annotation.get::<Dict<'a>>(A) {
+        return match action.get::<Name>(S)?.as_ref() {
+            b"URI" => {
+                let uri = action.get::<PdfString>(URI)?;
+                let uri = std::string::String::from_utf8_lossy(uri.as_bytes());
+                Some(LinkTarget::Uri(uri.trim().to_string()))
+            }
+            b"GoTo" => resolve_destination(pdf, action.get::<Object<'a>>(D)?),
+            _ => None,
+        };
+    }
+    resolve_destination(pdf, annotation.get::<Object<'a>>(DEST)?)
+}
+
+fn resolve_destination<'a>(pdf: &'a Pdf, destination: Object<'a>) -> Option<LinkTarget> {
+    let array = match destination {
+        Object::Array(array) => array,
+        Object::Dict(dict) => dict.get::<Array<'a>>(D)?,
+        // LaTeX's hyperref names every destination, so citations, footnotes,
+        // and cross-references all resolve through here.
+        Object::Name(name) => named_destination(pdf, name.as_ref())?,
+        Object::String(name) => named_destination(pdf, name.as_bytes())?,
+        _ => return None,
+    };
+    explicit_destination(pdf, &array)
+}
+
+fn named_destination<'a>(pdf: &'a Pdf, name: &[u8]) -> Option<Array<'a>> {
+    let catalog = pdf.xref().get::<Dict<'a>>(pdf.xref().root_id())?;
+    let destination = catalog
+        .get::<Dict<'a>>(NAMES)
+        .and_then(|names| names.get::<Dict<'a>>(DESTS))
+        .and_then(|tree| name_tree_lookup(&tree, name, 0))
+        // PDF 1.1 kept named destinations in a plain dictionary instead.
+        .or_else(|| catalog.get::<Dict<'a>>(DESTS)?.get::<Object<'a>>(name))?;
+    match destination {
+        Object::Array(array) => Some(array),
+        Object::Dict(dict) => dict.get::<Array<'a>>(D),
+        _ => None,
+    }
+}
+
+// A malformed tree can reference its own ancestors.
+const NAME_TREE_MAX_DEPTH: usize = 32;
+
+fn name_tree_lookup<'a>(node: &Dict<'a>, key: &[u8], depth: usize) -> Option<Object<'a>> {
+    if depth > NAME_TREE_MAX_DEPTH {
+        return None;
+    }
+    if let Some(names) = node.get::<Array<'a>>(NAMES) {
+        let mut entries = names.flex_iter();
+        while let Some(entry_key) = entries.next::<PdfString>() {
+            let value = entries.next::<Object<'a>>()?;
+            if entry_key.as_bytes() == key {
+                return Some(value);
+            }
+        }
+    }
+    let kids = node.get::<Array<'a>>(KIDS)?;
+    kids.iter::<Dict<'a>>().find_map(|kid| {
+        if let Some(limits) = kid.get::<Array<'a>>(LIMITS) {
+            let mut limits = limits.iter::<PdfString>();
+            if let (Some(low), Some(high)) = (limits.next(), limits.next())
+                && (key < low.as_bytes() || key > high.as_bytes())
+            {
+                return None;
+            }
+        }
+        name_tree_lookup(&kid, key, depth + 1)
+    })
+}
+
+/// An explicit destination is `[page fit-type parameters...]`, where the
+/// page is a reference to its page object.
+fn explicit_destination(pdf: &Pdf, destination: &Array<'_>) -> Option<LinkTarget> {
+    let mut items = destination.raw_iter();
+    let page_id: ObjectIdentifier = items.next()?.as_obj_ref()?.into();
+    let pages = pdf.pages();
+    let index = pages
+        .iter()
+        .position(|page| page.raw().obj_id() == Some(page_id))?;
+
+    let fit = match items.next() {
+        Some(MaybeRef::NotRef(Object::Name(fit))) => Some(fit),
+        _ => None,
+    };
+    let parameters: Vec<Option<f64>> = items
+        .map(|item| match item {
+            MaybeRef::NotRef(Object::Number(number)) => Some(number.as_f64()),
+            _ => None,
+        })
+        .collect();
+    let top = match fit.as_deref() {
+        Some(b"XYZ") => parameters.get(1),
+        Some(b"FitH" | b"FitBH") => parameters.get(0),
+        Some(b"FitR") => parameters.get(3),
+        _ => None,
+    }
+    .copied()
+    .flatten();
+
+    let page = pages.get(index)?;
+    // On a quarter-turned page the destination's top runs across the view,
+    // and landing on the page itself is the best a vertical scroll can do.
+    let top = top
+        .filter(|_| matches!(page.rotation(), Rotation::None | Rotation::Flipped))
+        .map(|top| (page.initial_transform(true) * kurbo::Point::new(0.0, top)).y as f32);
+    Some(LinkTarget::Page { index, top })
 }
 
 pub fn render_single_page(
@@ -481,6 +654,182 @@ mod tests {
 
         let text = layout.full_text();
         assert_eq!(text, "Heading Body text");
+    }
+
+    /// A PDF made of `objects`, numbered from 1, with object 1 as the
+    /// catalog and real cross-reference offsets.
+    fn pdf_from_objects(objects: &[String]) -> Vec<u8> {
+        let mut pdf = "%PDF-1.7\n".to_string();
+        let mut offsets = Vec::new();
+        for (index, object) in objects.iter().enumerate() {
+            offsets.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", index + 1));
+        }
+        let xref_offset = pdf.len();
+        pdf.push_str(&format!(
+            "xref\n0 {}\n0000000000 65535 f \n",
+            objects.len() + 1
+        ));
+        for offset in offsets {
+            pdf.push_str(&format!("{offset:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n",
+            objects.len() + 1
+        ));
+        pdf.into_bytes()
+    }
+
+    /// Two Letter pages (objects 3 and 4). The first carries "Link" at
+    /// (72, 700) and the given annotations; `catalog_extra` goes into the
+    /// catalog, and `extra_objects` are numbered from 7.
+    fn linked_pdf(
+        rotate: u32,
+        annotations: &str,
+        catalog_extra: &str,
+        extra_objects: &[&str],
+    ) -> Vec<u8> {
+        let stream = "BT /F1 12 Tf 72 700 Td (Link) Tj ET";
+        let mut objects = vec![
+            format!("<< /Type /Catalog /Pages 2 0 R {catalog_extra} >>"),
+            "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate {rotate} \
+                 /Contents 5 0 R /Resources << /Font << /F1 6 0 R >> >> \
+                 /Annots [{annotations}] >>"
+            ),
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string(),
+            format!(
+                "<< /Length {} >>\nstream\n{stream}\nendstream",
+                stream.len()
+            ),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+        ];
+        objects.extend(extra_objects.iter().map(|object| object.to_string()));
+        pdf_from_objects(&objects)
+    }
+
+    fn first_page_links(pdf_bytes: &[u8]) -> PageTextLayout {
+        let pdf = open_pdf(pdf_bytes).expect("Failed to open PDF");
+        extract_page_text(&pdf, 0).expect("Failed to extract text")
+    }
+
+    #[test]
+    fn link_bounds_use_the_top_left_space_of_glyphs() {
+        let layout = first_page_links(&linked_pdf(
+            0,
+            "<< /Type /Annot /Subtype /Link /Rect [70 695 110 712] \
+             /A << /S /URI /URI (https://example.com/) >> >>",
+            "",
+            &[],
+        ));
+        let [link] = layout.links.as_slice() else {
+            panic!("expected one link, got {:?}", layout.links);
+        };
+        assert_eq!(link.bounds, kurbo::Rect::new(70.0, 80.0, 110.0, 97.0));
+        assert_eq!(link.target, LinkTarget::Uri("https://example.com/".into()));
+        let glyph = &layout.glyphs[0];
+        assert_eq!(layout.link_at_point(glyph.x + 1.0, glyph.y - 1.0), Some(0));
+        assert_eq!(layout.link_at_point(glyph.x + 1.0, glyph.y + 20.0), None);
+    }
+
+    /// The link rectangle and the glyphs go through the same page transform,
+    /// so on a rotated page the link still covers its text.
+    #[test]
+    fn links_cover_their_text_on_rotated_pages() {
+        for rotate in [90, 180, 270] {
+            let layout = first_page_links(&linked_pdf(
+                rotate,
+                "<< /Subtype /Link /Rect [70 695 110 712] /A << /S /URI /URI (mailto:a@b.c) >> >>",
+                "",
+                &[],
+            ));
+            let glyph = &layout.glyphs[0];
+            let link = &layout.links[0];
+            assert!(
+                link.bounds.width() > 0.0 && link.bounds.height() > 0.0,
+                "rotate {rotate}: degenerate {:?}",
+                link.bounds
+            );
+            assert!(
+                link.bounds
+                    .contains(kurbo::Point::new(glyph.x as f64, glyph.y as f64)),
+                "rotate {rotate}: {:?} misses the glyph at ({}, {})",
+                link.bounds,
+                glyph.x,
+                glyph.y
+            );
+        }
+    }
+
+    #[test]
+    fn only_link_annotations_with_a_target_count() {
+        let layout = first_page_links(&linked_pdf(
+            0,
+            "<< /Subtype /Text /Rect [0 0 10 10] /Contents (note) >> \
+             << /Subtype /Link /Rect [0 0 10 10] /A << /S /Launch /F (calc.app) >> >> \
+             << /Subtype /Link /Rect [0 0 10 10] /A << /S /URI /URI (https://kept.org) >> >>",
+            "",
+            &[],
+        ));
+        let targets: Vec<_> = layout.links.iter().map(|link| &link.target).collect();
+        assert_eq!(targets, [&LinkTarget::Uri("https://kept.org".into())]);
+    }
+
+    #[test]
+    fn internal_links_resolve_to_a_page_and_a_point_on_it() {
+        let annotation = |destination: &str| {
+            format!("<< /Subtype /Link /Rect [70 695 110 712] {destination} >>")
+        };
+        let annotations = [
+            annotation("/Dest [4 0 R /XYZ 0 700 0]"),
+            annotation("/A << /S /GoTo /D [4 0 R /Fit] >>"),
+            annotation("/A << /S /GoTo /D [4 0 R /FitH 600] >>"),
+            // hyperref's style: a string naming a destination in a name tree
+            // whose leaves sit under an intermediate node.
+            annotation("/A << /S /GoTo /D (cite.smith) >>"),
+            annotation("/Dest (cite.unknown)"),
+            // PDF 1.1's catalog dictionary of named destinations.
+            annotation("/Dest /section.2"),
+        ]
+        .join(" ");
+        let layout = first_page_links(&linked_pdf(
+            0,
+            &annotations,
+            "/Names << /Dests 7 0 R >> /Dests << /section.2 << /D [3 0 R /XYZ 0 792 0] >> >>",
+            &[
+                "<< /Kids [8 0 R 9 0 R] >>",
+                "<< /Limits [(a) (b)] /Names [(a) [3 0 R /Fit]] >>",
+                "<< /Limits [(cite.a) (cite.z)] \
+                 /Names [(cite.jones) [3 0 R /Fit] (cite.smith) << /D [4 0 R /XYZ 0 392 0] >>] >>",
+            ],
+        ));
+        let targets: Vec<_> = layout.links.into_iter().map(|link| link.target).collect();
+        assert_eq!(
+            targets,
+            [
+                LinkTarget::Page {
+                    index: 1,
+                    top: Some(92.0)
+                },
+                LinkTarget::Page {
+                    index: 1,
+                    top: None
+                },
+                LinkTarget::Page {
+                    index: 1,
+                    top: Some(192.0)
+                },
+                LinkTarget::Page {
+                    index: 1,
+                    top: Some(400.0)
+                },
+                LinkTarget::Page {
+                    index: 0,
+                    top: Some(0.0)
+                },
+            ]
+        );
     }
 
     #[test]

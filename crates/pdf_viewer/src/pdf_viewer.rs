@@ -125,6 +125,9 @@ pub struct PdfViewer {
     selection_start: Option<TextPosition>,
     selection_end: Option<TextPosition>,
     is_selecting: bool,
+    /// The link (page, index into that page's links) the left button went
+    /// down on. A link opens only when the button comes back up on it too.
+    pressed_link: Option<(usize, usize)>,
     /// The page number in the status bar, editable to jump to a page.
     page_input: Entity<Editor>,
     /// The page last written into `page_input`. `None` makes the next frame
@@ -265,6 +268,7 @@ impl PdfViewer {
             selection_start: None,
             selection_end: None,
             is_selecting: false,
+            pressed_link: None,
             page_input,
             shown_page: None,
             _page_input_subscription: page_input_subscription,
@@ -501,10 +505,23 @@ impl PdfViewer {
     /// Scrolls so page `index` sits one canvas gutter below the top of the
     /// viewport, as the first page does at the start of the document.
     fn scroll_to_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.scroll_to_page_point(index, 0.0, cx);
+    }
+
+    /// Like `scroll_to_page`, but lines up the point `top` PDF points below
+    /// the page's top edge instead of the edge itself.
+    fn scroll_to_page_point(&mut self, index: usize, top: f32, cx: &mut Context<Self>) {
         let viewport_width: f32 = self.scroll_handle.bounds().size.width.into();
-        let top = self.page_top(index, Self::page_fit_width(viewport_width));
+        let fit_width = Self::page_fit_width(viewport_width);
+        let mut offset_y = self.page_top(index, fit_width);
+        if let Some(dimensions) = self.page_dimensions().get(index)
+            && dimensions.width > 0.0
+        {
+            offset_y += top * fit_width / dimensions.width * self.zoom_level;
+        }
         let offset = self.scroll_handle.offset();
-        self.scroll_handle.set_offset(point(offset.x, px(-top)));
+        self.scroll_handle
+            .set_offset(point(offset.x, px(-offset_y)));
         cx.notify();
     }
 
@@ -781,6 +798,7 @@ impl PdfViewer {
         };
 
         let highlights = self.selection_highlights_for_page(index, fit_scale);
+        let link_areas = self.link_areas_for_page(index, scale);
 
         div()
             .debug_selector(|| format!("pdf-page-{index}"))
@@ -809,6 +827,7 @@ impl PdfViewer {
                 .size_full(),
             )
             .children(highlights)
+            .children(link_areas)
             // The outline is an overlay rather than a border on this div so
             // the page box keeps the exact size the rendered bitmap and the
             // selection highlights are positioned against.
@@ -1255,6 +1274,7 @@ impl Item for PdfViewer {
                 selection_start: None,
                 selection_end: None,
                 is_selecting: false,
+                pressed_link: None,
                 page_input,
                 shown_page: None,
                 _page_input_subscription: page_input_subscription,
@@ -1389,6 +1409,12 @@ mod navigation_tests {
     /// A document of `page_count` blank Letter pages, with a cross-reference
     /// table whose offsets are real.
     fn blank_pdf(page_count: usize) -> String {
+        blank_pdf_with_links(page_count, "")
+    }
+
+    /// Like `blank_pdf`, with `annotations` as the first page's `/Annots`.
+    /// Page `n` (from 0) is object `n + 3`.
+    fn blank_pdf_with_links(page_count: usize, annotations: &str) -> String {
         let kids = (0..page_count)
             .map(|index| format!("{} 0 R", index + 3))
             .collect::<Vec<_>>()
@@ -1397,10 +1423,12 @@ mod navigation_tests {
             "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
             format!("<< /Type /Pages /Kids [{kids}] /Count {page_count} >>"),
         ];
-        objects.extend(
-            (0..page_count)
-                .map(|_| "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>".to_string()),
-        );
+        objects.extend((0..page_count).map(|index| {
+            let annotations = if index == 0 { annotations } else { "" };
+            format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Annots [{annotations}] >>"
+            )
+        }));
 
         let mut pdf = "%PDF-1.7\n".to_string();
         let mut offsets = Vec::new();
@@ -1426,6 +1454,13 @@ mod navigation_tests {
     async fn open_viewer(
         cx: &mut TestAppContext,
     ) -> (Entity<PdfViewer>, &mut VisualTestContext, tempfile::TempDir) {
+        open_viewer_on(blank_pdf(10), cx).await
+    }
+
+    async fn open_viewer_on(
+        pdf: String,
+        cx: &mut TestAppContext,
+    ) -> (Entity<PdfViewer>, &mut VisualTestContext, tempfile::TempDir) {
         cx.executor().allow_parking();
         cx.update(|cx| {
             let store = settings::SettingsStore::test(cx);
@@ -1443,7 +1478,6 @@ mod navigation_tests {
         // The item reads the bytes with `std::fs`, not the project's `Fs`, so
         // the document has to exist on disk at the path the worktree reports.
         let dir = tempfile::tempdir().expect("temp dir");
-        let pdf = blank_pdf(10);
         std::fs::write(dir.path().join("doc.pdf"), &pdf).expect("write the PDF");
         let fs = FakeFs::new(cx.executor());
         fs.insert_tree(dir.path(), json!({ "doc.pdf": pdf })).await;
@@ -1846,5 +1880,123 @@ mod navigation_tests {
 
         assert!(!page_input_is_focused(&viewer, cx));
         assert_eq!(shown_page_text(&viewer, cx), "1");
+    }
+
+    /// Opens a ten-page document whose first page carries `annotations`,
+    /// and waits for the background extraction that finds its links.
+    async fn open_linked_viewer<'a>(
+        annotations: &str,
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<PdfViewer>,
+        &'a mut VisualTestContext,
+        tempfile::TempDir,
+    ) {
+        let (viewer, cx, dir) = open_viewer_on(blank_pdf_with_links(10, annotations), cx).await;
+        for _ in 0..500 {
+            if viewer.read_with(cx, |viewer, _| viewer.text_layouts.len() == 10) {
+                redraw(&viewer, cx);
+                return (viewer, cx, dir);
+            }
+            // The extractor runs on an OS thread the test scheduler cannot
+            // drive, so give it real time.
+            std::thread::sleep(Duration::from_millis(10));
+            cx.run_until_parked();
+        }
+        panic!("text extraction never finished");
+    }
+
+    /// A window position inside the first page, given in PDF points from its
+    /// top-left corner.
+    fn on_first_page(x: f32, y: f32, cx: &mut VisualTestContext) -> Point<Pixels> {
+        let page = cx
+            .debug_bounds("pdf-page-0")
+            .expect("the first page is laid out");
+        let scale = f32::from(page.size.width) / 612.0;
+        page.origin + point(px(x * scale), px(y * scale))
+    }
+
+    fn click(position: Point<Pixels>, cx: &mut VisualTestContext) {
+        cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+    }
+
+    // Each link is 20pt tall, stacked down the first page from y = 772
+    // (20pt below its top edge in the top-left space).
+    const WEB_LINK: &str = "<< /Subtype /Link /Rect [72 752 272 772] /A << /S /URI /URI (https://openreview.net/) >> >>";
+    const MAIL_LINK: &str =
+        "<< /Subtype /Link /Rect [72 722 272 742] /A << /S /URI /URI (mailto:a@b.edu) >> >>";
+    const FILE_LINK: &str = "<< /Subtype /Link /Rect [72 692 272 712] /A << /S /URI /URI (file:///Applications/Calculator.app) >> >>";
+    const PAGE_LINK: &str = "<< /Subtype /Link /Rect [72 662 272 682] /Dest [7 0 R /Fit] >>";
+    const POINT_LINK: &str =
+        "<< /Subtype /Link /Rect [72 632 272 652] /A << /S /GoTo /D [7 0 R /XYZ 0 396 0] >> >>";
+
+    #[gpui::test]
+    async fn clicking_a_web_or_mail_link_opens_it(cx: &mut TestAppContext) {
+        let (_viewer, cx, _dir) = open_linked_viewer(&format!("{WEB_LINK} {MAIL_LINK}"), cx).await;
+
+        click(on_first_page(100.0, 30.0, cx), cx);
+        assert_eq!(cx.opened_url().as_deref(), Some("https://openreview.net/"));
+
+        click(on_first_page(100.0, 60.0, cx), cx);
+        assert_eq!(cx.opened_url().as_deref(), Some("mailto:a@b.edu"));
+    }
+
+    #[gpui::test]
+    async fn links_to_anything_but_the_web_or_mail_stay_shut(cx: &mut TestAppContext) {
+        let (_viewer, cx, _dir) = open_linked_viewer(FILE_LINK, cx).await;
+        click(on_first_page(100.0, 90.0, cx), cx);
+        assert_eq!(cx.opened_url(), None);
+    }
+
+    /// A link opens on a click, not on a drag that starts or ends on it, so
+    /// text can be selected across links as in Preview and browsers.
+    #[gpui::test]
+    async fn dragging_off_a_link_does_not_open_it(cx: &mut TestAppContext) {
+        let (_viewer, cx, _dir) = open_linked_viewer(WEB_LINK, cx).await;
+        let on_link = on_first_page(100.0, 30.0, cx);
+        let off_link = on_first_page(100.0, 300.0, cx);
+        cx.simulate_mouse_down(on_link, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(off_link, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(off_link, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(cx.opened_url(), None);
+
+        cx.simulate_mouse_down(off_link, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_move(on_link, MouseButton::Left, Modifiers::none());
+        cx.simulate_mouse_up(on_link, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert_eq!(
+            cx.opened_url(),
+            None,
+            "a drag ending on a link is not a click"
+        );
+    }
+
+    #[gpui::test]
+    async fn clicking_an_internal_link_scrolls_to_its_destination(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_linked_viewer(&format!("{PAGE_LINK} {POINT_LINK}"), cx).await;
+
+        click(on_first_page(100.0, 120.0, cx), cx);
+        redraw(&viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 4, cx));
+
+        viewer.update(cx, |viewer, _| {
+            viewer.scroll_handle.set_offset(point(px(0.), px(0.)))
+        });
+        redraw(&viewer, cx);
+        click(on_first_page(100.0, 150.0, cx), cx);
+        redraw(&viewer, cx);
+        let page = cx
+            .debug_bounds("pdf-page-4")
+            .expect("the destination page is laid out");
+        let half_page = page.size.height / 2.0;
+        assert!(
+            (scroll_offset(&viewer, cx) - (page_top_offset(&viewer, 4, cx) - half_page)).abs()
+                < px(1.0),
+            "the point halfway down page 5 should sit where a page top would"
+        );
+        assert_eq!(cx.opened_url(), None);
     }
 }
