@@ -124,11 +124,11 @@ which proves nothing. Record them from the pre-merge commit, **before step 2's
 ```sh
 # Before merging: record what main looks like.
 UPDATE_BASELINE=1 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cargo run -p zed --bin zed_visual_test_runner --features visual-tests
+  cargo run -p zed --bin zed-visual-test-runner --features visual-tests
 
 # After step 4: compare the merge against it.
 DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  cargo run -p zed --bin zed_visual_test_runner --features visual-tests \
+  cargo run -p zed --bin zed-visual-test-runner --features visual-tests \
   && echo OK || echo FAILED
 ```
 

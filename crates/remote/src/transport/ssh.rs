@@ -8,7 +8,7 @@ use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
 use collections::HashMap;
 use futures::{
-    AsyncReadExt as _, FutureExt as _,
+    AsyncReadExt as _, AsyncWriteExt as _, FutureExt as _,
     channel::mpsc::{Sender, UnboundedReceiver, UnboundedSender},
     select_biased,
 };
@@ -21,6 +21,7 @@ use semver::Version;
 pub use settings_content::SshPortForwardOption;
 use smol::fs;
 use std::{
+    borrow::Cow,
     fmt::Write as _,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -31,7 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tempfile::TempDir;
-use util::command::{Child, Stdio};
+use util::command::{Child, Command, Stdio};
 use util::{
     paths::{PathStyle, RemotePathBuf},
     rel_path::RelPath,
@@ -74,9 +75,13 @@ impl SshConnectionHost {
     }
 
     pub fn to_string(&self) -> String {
+        self.to_cow().into_owned()
+    }
+
+    pub fn to_cow(&self) -> Cow<'_, str> {
         match self {
-            Self::IpAddr(ip) => ip.to_string(),
-            Self::Hostname(hostname) => hostname.clone(),
+            Self::IpAddr(ip) => Cow::Owned(ip.to_string()),
+            Self::Hostname(hostname) => Cow::Borrowed(hostname),
         }
     }
 }
@@ -1572,15 +1577,8 @@ impl SshSocket {
         args: &[impl AsRef<str>],
         allow_pseudo_tty: bool,
     ) -> Result<String> {
-        let mut command = self.ssh_command(shell_kind, program, args, allow_pseudo_tty);
-        let output = command.output().await?;
-        log::debug!("{:?}: {:?}", command, output);
-        anyhow::ensure!(
-            output.status.success(),
-            "failed to run command {command:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        let command = self.ssh_command(shell_kind, program, args, allow_pseudo_tty);
+        command_output(command, None).await
     }
 
     fn ssh_options<'a>(
@@ -1637,13 +1635,15 @@ impl SshSocket {
         arguments
     }
 
+    fn environment_posix_command(&self) -> Command {
+        self.ssh_command(ShellKind::Posix, "sh", &["-s"], false)
+    }
+
     async fn environment_posix(&self) -> Result<RemoteEnvironment> {
         let script = RemoteEnvironment::posix_script();
-
-        let output = self
-            .run_command(ShellKind::Posix, "sh", &["-c", &script], false)
+        let output = command_output(self.environment_posix_command(), Some(script.as_bytes()))
             .await
-            .context("Failed to determine remote environment")?;
+            .context("determining remote environment")?;
         RemoteEnvironment::parse_posix(&output)
     }
 
@@ -1755,6 +1755,33 @@ impl SshSocket {
     }
 }
 
+async fn command_output(mut command: Command, input: Option<&[u8]>) -> Result<String> {
+    let (output, write_result) = if let Some(input) = input {
+        let mut child = command.kill_on_drop(true).spawn()?;
+        let mut stdin = child.stdin.take().context("Command did not expose stdin")?;
+        futures::join!(child.output(), async move {
+            let result = async {
+                stdin.write_all(input).await?;
+                stdin.flush().await
+            }
+            .await;
+            drop(stdin);
+            result
+        })
+    } else {
+        (command.output().await, Ok(()))
+    };
+    let output = output?;
+    log::debug!("{command:?}: {output:?}");
+    anyhow::ensure!(
+        output.status.success(),
+        "failed to run command {command:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    write_result.with_context(|| format!("writing stdin for command {command:?}"))?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn parse_port_number(port_str: &str) -> Result<u16> {
     port_str
         .parse()
@@ -1831,7 +1858,6 @@ fn parse_port_forward_spec(spec: &str) -> Result<SshPortForwardOption> {
 
 impl SshConnectionOptions {
     pub fn parse_command_line(input: &str) -> Result<Self> {
-        let input = input.trim_start_matches("ssh ");
         let mut hostname: Option<String> = None;
         let mut username: Option<String> = None;
         let mut port: Option<u16> = None;
@@ -1847,10 +1873,14 @@ impl SshConnectionOptions {
             "-w",
         ];
 
-        let mut tokens = ShellKind::Posix
-            .split(input)
-            .context("invalid input")?
-            .into_iter();
+        let mut tokens = ShellKind::Posix.split(input).context("invalid input")?;
+        // The input may be a full command such as `ssh -p 2222 host`, possibly with
+        // shell-quoted tokens. Strip the executable after tokenizing so that `'ssh'`
+        // is recognized too, while a lone `ssh` is still treated as a hostname.
+        if tokens.len() > 1 && tokens[0] == "ssh" {
+            tokens.remove(0);
+        }
+        let mut tokens = tokens.into_iter();
 
         'outer: while let Some(arg) = tokens.next() {
             if ALLOWED_OPTS.contains(&(&arg as &str)) {
@@ -2482,22 +2512,73 @@ mod tests {
 
         #[cfg(unix)]
         {
-            let output = smol::block_on(
-                util::command::new_command("/bin/sh")
-                    .args(["-c", &RemoteEnvironment::posix_script()])
-                    .env("SHELL", "/bin/sh")
-                    .output(),
-            )?;
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-
-            let environment = RemoteEnvironment::parse_posix(std::str::from_utf8(&output.stdout)?)?;
-            assert_eq!(environment.shell, "/bin/sh");
-            assert!(environment.os_version.is_some());
+            let socket = smol::block_on(SshSocket::new(
+                SshConnectionOptions::default(),
+                PathBuf::from("/tmp/zed-test.sock"),
+            ))?;
+            let command = socket.environment_posix_command();
+            let remote_command = command
+                .get_args()
+                .last()
+                .context("Missing remote command")?;
+            let mut shells = vec![(PathBuf::from("/bin/sh"), &["-c"][..])];
+            if let Ok(powershell) = which::which("pwsh") {
+                shells.push((powershell, &["-NoProfile", "-NonInteractive", "-Command"]));
+            }
+            for (shell, args) in shells {
+                let mut command = util::command::new_command(&shell);
+                command
+                    .args(args)
+                    .arg(remote_command)
+                    .env("SHELL", "/usr/bin/pwsh")
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                let output = smol::block_on(command_output(
+                    command,
+                    Some(RemoteEnvironment::posix_script().as_bytes()),
+                ))?;
+                let environment = RemoteEnvironment::parse_posix(&output)?;
+                assert_eq!(environment.shell, "/usr/bin/pwsh");
+                assert_eq!(environment.platform.arch.as_str(), std::env::consts::ARCH);
+                assert!(environment.os_version.is_some());
+            }
+            assert_eq!(remote_command, "cd; sh -s");
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_drains_output_while_writing_input() -> Result<()> {
+        let input = vec![b'x'; 1024 * 1024];
+        let mut command = util::command::new_command("/bin/sh");
+        command
+            .args(["-c", "head -c 1048576 /dev/zero; cat"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let output = smol::block_on(command_output(command, Some(&input)))?;
+        let mut expected = vec![0; 1024 * 1024];
+        expected.extend_from_slice(&input);
+        assert_eq!(output.as_bytes(), expected);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_output_preserves_stderr_when_input_fails() -> Result<()> {
+        let input = vec![b'x'; 1024 * 1024];
+        let mut command = util::command::new_command("/bin/sh");
+        command
+            .args(["-c", "exec 0<&-; printf 'probe failed' >&2; exit 7"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let expected = format!("failed to run command {command:?}: probe failed");
+        let error = smol::block_on(command_output(command, Some(&input))).unwrap_err();
+        assert_eq!(error.to_string(), expected);
         Ok(())
     }
 
@@ -2967,6 +3048,45 @@ mod tests {
         assert_eq!(opts.host, "192.168.1.1".into());
         assert_eq!(opts.username, Some("user".to_string()));
         assert_eq!(opts.port, Some(2222));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_command_line_with_ssh_executable() -> Result<()> {
+        let opts = SshConnectionOptions::parse_command_line("ssh -p 2222 user@example.com")?;
+        assert_eq!(opts.host, "example.com".into());
+        assert_eq!(opts.username, Some("user".to_string()));
+        assert_eq!(opts.port, Some(2222));
+
+        let opts = SshConnectionOptions::parse_command_line(
+            "'ssh' '-i' '/Users/test/Library/Application Support/key' '-p' '64042' '-o' 'ControlMaster=auto' 'user@127.0.0.1'",
+        )?;
+        assert_eq!(opts.host, "127.0.0.1".into());
+        assert_eq!(opts.username, Some("user".to_string()));
+        assert_eq!(opts.port, Some(64042));
+        assert_eq!(
+            opts.args,
+            Some(vec![
+                "-i".to_string(),
+                "/Users/test/Library/Application Support/key".to_string(),
+                "-o".to_string(),
+                "ControlMaster=auto".to_string(),
+            ])
+        );
+
+        let opts = SshConnectionOptions::parse_command_line("\"ssh\" user@example.com")?;
+        assert_eq!(opts.host, "example.com".into());
+        assert_eq!(opts.username, Some("user".to_string()));
+
+        // A bare `ssh` is a hostname, not the executable.
+        let opts = SshConnectionOptions::parse_command_line("ssh")?;
+        assert_eq!(opts.host, "ssh".into());
+        assert_eq!(opts.username, None);
+
+        let opts = SshConnectionOptions::parse_command_line("ssh user@ssh")?;
+        assert_eq!(opts.host, "ssh".into());
+        assert_eq!(opts.username, Some("user".to_string()));
 
         Ok(())
     }

@@ -84,7 +84,7 @@ The suzuri.ai site ([suzuri.ai](https://github.com/harrywang/suzuri.ai), cloned 
 `../suzuri.ai`) shows screenshots of the app. Take them from the vaults in
 `../suzuri-testbed/screenshots/` with its `open.sh` and `capture.sh`, never from a
 personal folder, so a retake after a UI change matches the rest; its README lists the traps.
-Visual regression tests: `cargo run -p zed --bin zed_visual_test_runner --features visual-tests`
+Visual regression tests: `cargo run -p zed --bin zed-visual-test-runner --features visual-tests`
 (prefix with `UPDATE_BASELINE=1` to re-record).
 
 Gotcha: running Zed from `cargo run` and then opening *this* repo inside it leaks Cargo's
@@ -178,6 +178,7 @@ merge chasing them:
 | Tests | Why |
 | --- | --- |
 | 11 save-prompt tests in `workspace` and `zed`, plus `project_panel tests::undo::undo_create_dirty_file` | The fork's `autosave` default in `assets/settings/default.json`. Tests load the shipped defaults, so buffers save themselves and upstream's tests never see the prompt they wait for. Setting `"autosave": "off"` in that file makes all twelve pass. |
+| `project_panel project_panel_tests::test_focus_follows_mouse_into_blank_area` | The fork docks the project panel left (`project_panel.dock` in `assets/settings/default.json`, #146), and the test hovers where the right dock would be. Setting that default back to `"right"` makes it pass. |
 | `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer`, `typeset_preview`, and `json_canvas`. |
 | `collab db_tests::*_postgres` (14) | Need a local Postgres; CI provisions one. |
 
