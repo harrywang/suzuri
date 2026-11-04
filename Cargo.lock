@@ -9506,6 +9506,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "json_canvas"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "file_icons",
+ "fs",
+ "gpui",
+ "language",
+ "log",
+ "markdown",
+ "project",
+ "serde",
+ "serde_json",
+ "theme",
+ "ui",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "json_schema_store"
 version = "0.1.0"
 dependencies = [
@@ -23321,6 +23342,7 @@ dependencies = [
  "install_cli",
  "itertools 0.14.0",
  "journal",
+ "json_canvas",
  "json_schema_store",
  "keymap_editor",
  "language",

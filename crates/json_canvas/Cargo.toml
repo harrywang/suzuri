@@ -1,0 +1,36 @@
+[package]
+name = "json_canvas"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/json_canvas.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+editor.workspace = true
+file_icons.workspace = true
+gpui.workspace = true
+language.workspace = true
+log.workspace = true
+markdown.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+theme.workspace = true
+ui.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+[dev-dependencies]
+editor = { workspace = true, features = ["test-support"] }
+fs = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }
