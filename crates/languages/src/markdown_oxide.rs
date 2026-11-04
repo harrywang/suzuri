@@ -1,11 +1,11 @@
 use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use futures::StreamExt;
-use gpui::AsyncApp;
 use github_releases::{
     AssetKind, GitHubLspBinaryVersion, GithubBinaryMetadata, download_server_binary,
     get_release_by_tag_name,
 };
+use gpui::AsyncApp;
 use language::{LspAdapter, LspAdapterDelegate, LspInstaller, Toolchain};
 use lsp::{LanguageServerBinary, LanguageServerName};
 use smol::fs;

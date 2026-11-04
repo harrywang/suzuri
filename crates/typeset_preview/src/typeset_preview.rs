@@ -577,9 +577,7 @@ async fn compile_command(
 /// Exposed so other features that need a typesetting engine share the one
 /// download rather than each fetching a copy: markdown export uses Typst as
 /// its PDF engine for exactly this reason.
-pub async fn ensure_typst_binary(
-    http: Downloader,
-) -> Result<PathBuf> {
+pub async fn ensure_typst_binary(http: Downloader) -> Result<PathBuf> {
     ensure_typst(http).await
 }
 
@@ -889,11 +887,7 @@ async fn run_once(command: &CompileCommand) -> Result<CompileRun> {
 /// resolves every file the previous run named, so this is generous.
 const MAX_RESOLVE_ROUNDS: usize = 12;
 
-async fn compile_document(
-    path: &Path,
-    http: Downloader,
-    engine: LatexEngine,
-) -> Result<()> {
+async fn compile_document(path: &Path, http: Downloader, engine: LatexEngine) -> Result<()> {
     let command = compile_command(path, http, engine).await?;
     if let Some(artifact) = command.artifact.clone() {
         return run_until_artifact(command, artifact);

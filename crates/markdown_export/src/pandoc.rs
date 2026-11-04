@@ -129,11 +129,7 @@ fn pandoc_on_path() -> Option<PathBuf> {
 }
 
 /// Resolves the tools an export needs, downloading what is missing.
-pub async fn ensure_tools(
-    format: Format,
-    pdf_engine: &str,
-    http: Downloader,
-) -> Result<Tools> {
+pub async fn ensure_tools(format: Format, pdf_engine: &str, http: Downloader) -> Result<Tools> {
     let pandoc = match pandoc_on_path() {
         Some(found) => found,
         None => ensure_pandoc(http.clone()).await?,
