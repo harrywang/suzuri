@@ -207,9 +207,12 @@ impl CanvasView {
     ) -> Self {
         let buffer = item.read(cx).buffer.clone();
         let buffer_subscription =
-            cx.subscribe(&buffer, |this, _, event: &BufferEvent, cx| match event {
-                BufferEvent::Edited { .. } | BufferEvent::Reloaded => this.reload(cx),
-                _ => {}
+            // A reload from disk applies the change as edits, so `Edited`
+            // covers agents writing the file as well as typing in the JSON.
+            cx.subscribe(&buffer, |this, _, event: &BufferEvent, cx| {
+                if let BufferEvent::Edited { .. } = event {
+                    this.reload(cx);
+                }
             });
         let mut this = Self {
             item,
@@ -234,6 +237,12 @@ impl CanvasView {
         let source = self.item.read(cx).buffer.read(cx).text();
         match canvas_model::parse_canvas(&source) {
             Ok(canvas) => {
+                log::debug!(
+                    "json_canvas: loaded {} with {} nodes and {} edges",
+                    self.item.read(cx).abs_path.display(),
+                    canvas.nodes.len(),
+                    canvas.edges.len()
+                );
                 // A canvas that was empty has nothing to keep in view, so
                 // fit to whatever was just written into it.
                 if self.canvas.nodes.is_empty() {
@@ -245,7 +254,13 @@ impl CanvasView {
             }
             // Most likely a write caught halfway. Keep showing the last
             // canvas that parsed, and say why it is not updating.
-            Err(error) => self.parse_error = Some(error.to_string().into()),
+            Err(error) => {
+                log::debug!(
+                    "json_canvas: keeping the last canvas for {}: {error}",
+                    self.item.read(cx).abs_path.display()
+                );
+                self.parse_error = Some(error.to_string().into());
+            }
         }
         cx.notify();
     }
@@ -342,10 +357,7 @@ impl CanvasView {
                             let subscription = cx.subscribe(&buffer, {
                                 let markdown = markdown.clone();
                                 move |_, buffer, event: &BufferEvent, cx| {
-                                    if matches!(
-                                        event,
-                                        BufferEvent::Edited { .. } | BufferEvent::Reloaded
-                                    ) {
+                                    if let BufferEvent::Edited { .. } = event {
                                         show_note(&markdown, &buffer, subpath.as_deref(), cx);
                                     }
                                 }
@@ -861,6 +873,9 @@ impl Render for CanvasView {
         // follow the zoom along with the text.
         markdown_style.base_text_style.line_height = relative(1.5);
         markdown_style.prevent_mouse_interaction = true;
+        // Obsidian shows a single newline in a card as a line break, and
+        // canvases written for it rely on that.
+        markdown_style.soft_break_as_hard_break = true;
         markdown_style.code_block.text.font_size = Some(rems(0.85).into());
         markdown_style.inline_code.font_size = Some(rems(0.85).into());
 
