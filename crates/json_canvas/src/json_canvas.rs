@@ -16,11 +16,12 @@ use anyhow::Result;
 use editor::Editor;
 use file_icons::FileIcons;
 use gpui::{
-    AnyElement, App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ObjectFit, ParentElement, PathBuilder, PinchEvent, Pixels, Point, Render,
-    ScrollEvent, SharedString, Styled, StyledImage as _, Subscription, Task, Window, actions,
-    canvas, div, img, point, px, relative, rems, rgb, size,
+    AbsoluteLength, AnyElement, App, AppContext as _, Bounds, Context, DefiniteLength, Entity,
+    EventEmitter, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement, Length,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement,
+    PathBuilder, PinchEvent, Pixels, Point, Render, ScrollEvent, SharedString, Styled,
+    StyledImage as _, Subscription, Task, Window, actions, canvas, div, img, point, px, relative,
+    rems, rgb, size,
 };
 use language::{Buffer, BufferEvent};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
@@ -31,6 +32,7 @@ use ui::{
     Color, Icon, IconButton, IconName, IconSize, Label, LabelCommon as _, Tooltip, h_flex,
     prelude::*,
 };
+use unicode_normalization::UnicodeNormalization as _;
 use util::ResultExt as _;
 use workspace::item::{Item, ItemEvent, TabContentParams};
 use workspace::{Pane, SplitDirection, Workspace, WorkspaceId};
@@ -309,14 +311,7 @@ impl CanvasView {
     ) -> CardContent {
         let abs_path = self.item.read(cx).vault_root.join(path);
         let project = self.project.read(cx);
-        let Some(project_path) = project
-            .find_project_path(&abs_path, cx)
-            .filter(|project_path| {
-                project
-                    .entry_for_path(project_path, cx)
-                    .is_some_and(|entry| entry.is_file())
-            })
-        else {
+        let Some(project_path) = find_file(project, &abs_path, cx) else {
             return CardContent::Missing {
                 path: path.to_string().into(),
             };
@@ -382,6 +377,47 @@ impl CanvasView {
             _ => CardContent::OtherFile { project_path, name },
         }
     }
+}
+
+/// The project file at `abs_path`, matched regardless of Unicode
+/// normalization. A name like "Ärger.md" can be spelled as one precomposed
+/// character or as a letter plus a combining mark; macOS keeps whichever form
+/// created the file, Obsidian writes the precomposed one into the canvas, and
+/// the project compares paths byte for byte, so the two spellings miss each
+/// other.
+fn find_file(project: &Project, abs_path: &Path, cx: &App) -> Option<ProjectPath> {
+    let is_file = |project_path: &ProjectPath| {
+        project
+            .entry_for_path(project_path, cx)
+            .is_some_and(|entry| entry.is_file())
+    };
+    if let Some(project_path) = project
+        .find_project_path(abs_path, cx)
+        .filter(|project_path| is_file(project_path))
+    {
+        return Some(project_path);
+    }
+
+    let wanted = nfc(&abs_path.to_string_lossy());
+    project.worktrees(cx).find_map(|worktree| {
+        let worktree = worktree.read(cx);
+        let root = nfc(&worktree.abs_path().to_string_lossy());
+        if !wanted.starts_with(&root) {
+            return None;
+        }
+        worktree
+            .entries(false, 0)
+            .filter(|entry| entry.is_file())
+            .find(|entry| nfc(&worktree.absolutize(&entry.path).to_string_lossy()) == wanted)
+            .map(|entry| ProjectPath {
+                worktree_id: worktree.id(),
+                path: entry.path.clone(),
+            })
+    })
+}
+
+fn nfc(text: &str) -> String {
+    text.nfc().collect()
 }
 
 fn show_note(
@@ -771,6 +807,52 @@ impl CanvasView {
     }
 }
 
+/// Scales the spacing the preview style gives in pixels, which would
+/// otherwise stay the same size while the text shrinks and grows with the
+/// zoom: zoomed out, a paragraph gap meant for full-size text spread the
+/// lines of a note far apart.
+fn scale_fixed_spacing(style: &mut MarkdownStyle, zoom: f32) {
+    fn scale_definite(length: &mut Option<DefiniteLength>, zoom: f32) {
+        if let Some(DefiniteLength::Absolute(AbsoluteLength::Pixels(pixels))) = length {
+            *pixels = *pixels * zoom;
+        }
+    }
+    fn scale_length(length: &mut Option<Length>, zoom: f32) {
+        if let Some(Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(pixels)))) =
+            length
+        {
+            *pixels = *pixels * zoom;
+        }
+    }
+
+    style.paragraph_spacing = style.paragraph_spacing * zoom;
+    style.list_spacing = style.list_spacing * zoom;
+    style.table_cell_padding = point(
+        style.table_cell_padding.x * zoom,
+        style.table_cell_padding.y * zoom,
+    );
+    for refinement in [&mut style.code_block, &mut style.heading] {
+        let padding = &mut refinement.padding;
+        for edge in [
+            &mut padding.top,
+            &mut padding.right,
+            &mut padding.bottom,
+            &mut padding.left,
+        ] {
+            scale_definite(edge, zoom);
+        }
+        let margin = &mut refinement.margin;
+        for edge in [
+            &mut margin.top,
+            &mut margin.right,
+            &mut margin.bottom,
+            &mut margin.left,
+        ] {
+            scale_length(edge, zoom);
+        }
+    }
+}
+
 fn centered_card_body(icon: Icon, text: SharedString, color: Hsla) -> AnyElement {
     v_flex()
         .size_full()
@@ -878,6 +960,7 @@ impl Render for CanvasView {
         markdown_style.soft_break_as_hard_break = true;
         markdown_style.code_block.text.font_size = Some(rems(0.85).into());
         markdown_style.inline_code.font_size = Some(rems(0.85).into());
+        scale_fixed_spacing(&mut markdown_style, self.zoom);
 
         let mut groups = Vec::new();
         let mut cards = Vec::new();
@@ -1184,22 +1267,27 @@ mod tests {
     }
 
     async fn open_canvas(cx: &mut TestAppContext) -> Fixture<'_> {
-        cx.update(|cx| {
-            let _state = AppState::test(cx);
-            editor::init(cx);
-            init(cx);
-        });
-        let fs = FakeFs::new(cx.executor());
-        fs.insert_tree(
-            path!("/vault"),
+        open_canvas_in(
             json!({
                 "map.canvas": CANVAS,
                 "notes": {
                     "Chen2021.md": "---\ntags: [paper]\n---\n# Chen (2021)\nRemote work raised output.",
                 },
             }),
+            cx,
         )
-        .await;
+        .await
+    }
+
+    /// Opens `map.canvas` from a vault laid out as `tree`.
+    async fn open_canvas_in(tree: serde_json::Value, cx: &mut TestAppContext) -> Fixture<'_> {
+        cx.update(|cx| {
+            let _state = AppState::test(cx);
+            editor::init(cx);
+            init(cx);
+        });
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/vault"), tree).await;
         let project = Project::test(fs.clone(), [path!("/vault").as_ref()], cx).await;
         let (multi_workspace, cx) =
             cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
@@ -1412,5 +1500,84 @@ mod tests {
                 .expect("the JSON opens in an editor");
             assert!(editor.read(cx).text(cx).contains("\"nodes\""));
         });
+    }
+
+    /// "Ärger" as one precomposed character, and as an A plus a combining
+    /// diaeresis. They look identical and name the same file on macOS, but
+    /// compare unequal byte for byte.
+    const PRECOMPOSED: &str = "\u{00c4}rger.md";
+    const DECOMPOSED: &str = "A\u{0308}rger.md";
+
+    async fn assert_note_found_across_normalization(
+        name_on_disk: &str,
+        name_in_canvas: &str,
+        cx: &mut TestAppContext,
+    ) {
+        assert_ne!(name_on_disk, name_in_canvas);
+        let canvas = json!({
+            "nodes": [{
+                "id": "note", "type": "file", "x": 0, "y": 0, "width": 300, "height": 200,
+                "file": format!("notes/{name_in_canvas}"),
+            }],
+        })
+        .to_string();
+        let Fixture {
+            workspace,
+            view,
+            cx,
+            ..
+        } = open_canvas_in(
+            json!({
+                "map.canvas": canvas,
+                "notes": { name_on_disk: "# \u{00c4}rger\nFound." },
+            }),
+            cx,
+        )
+        .await;
+
+        let shown = view.read_with(cx, |view, cx| match &view.cards["note"].content {
+            CardContent::Note { markdown, .. } => markdown.read(cx).source().to_string(),
+            CardContent::Missing { .. } => panic!("the note was reported missing"),
+            _ => panic!("a markdown file is shown as a note"),
+        });
+        assert_eq!(shown, "# \u{00c4}rger\nFound.");
+
+        click(card_center("note", cx), cx);
+        assert_eq!(
+            active_path(&workspace, cx),
+            Some(format!("notes/{name_on_disk}")),
+            "clicking opens the file as it is named on disk"
+        );
+    }
+
+    #[gpui::test]
+    async fn a_precomposed_path_finds_a_decomposed_file(cx: &mut TestAppContext) {
+        assert_note_found_across_normalization(DECOMPOSED, PRECOMPOSED, cx).await;
+    }
+
+    #[gpui::test]
+    async fn a_decomposed_path_finds_a_precomposed_file(cx: &mut TestAppContext) {
+        assert_note_found_across_normalization(PRECOMPOSED, DECOMPOSED, cx).await;
+    }
+
+    #[test]
+    fn card_spacing_scales_with_the_zoom() {
+        let mut style = MarkdownStyle::default();
+        style.paragraph_spacing = px(16.);
+        style.list_spacing = px(12.);
+        style.table_cell_padding = point(px(10.), px(4.));
+        style.code_block.padding.top = Some(px(12.).into());
+        style.heading.margin.bottom = Some(Length::Definite(px(12.).into()));
+
+        scale_fixed_spacing(&mut style, 0.5);
+
+        assert_eq!(style.paragraph_spacing, px(8.));
+        assert_eq!(style.list_spacing, px(6.));
+        assert_eq!(style.table_cell_padding, point(px(5.), px(2.)));
+        assert_eq!(style.code_block.padding.top, Some(px(6.).into()));
+        assert_eq!(
+            style.heading.margin.bottom,
+            Some(Length::Definite(px(6.).into()))
+        );
     }
 }
