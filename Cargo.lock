@@ -9482,6 +9482,7 @@ dependencies = [
  "serde_json",
  "theme",
  "ui",
+ "unicode-normalization",
  "util",
  "workspace",
 ]
