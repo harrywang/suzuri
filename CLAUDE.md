@@ -32,6 +32,7 @@ The fork's own changes are small and additive:
 | Native heading search reveal and Vim integration regressions | `crates/editor/src/editor.rs` (`selection_is_from_search`), `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
 | Optional plain block quote geometry | `crates/markdown/src/markdown.rs` (style overrides preserve shared renderer defaults) |
 | Editable preview navigation | `crates/editor/src/editor.rs` (`RowMotion`, `Addon::blocks_to_reveal_before`; the logic lives in the addon), `crates/vim/src/motion.rs`, `crates/vim/src/vim.rs` (Vim motions bypass editor actions) |
+| Open Thread in Claude Code: hands a Claude Agent thread to `claude --resume <session-id>` in a terminal tab, with install guidance when the CLI is missing | `crates/agent_ui/src/suzuri_open_in_claude_code.rs`, `crates/agent_ui/src/agent_panel.rs` (menu entry), `crates/agent_ui/src/agent_ui.rs` (module) |
 | Markdown attachments: drag-and-drop and clipboard paste | `crates/editor/src/items.rs` |
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
