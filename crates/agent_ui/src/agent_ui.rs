@@ -25,6 +25,8 @@ mod model_search;
 mod model_selector;
 mod model_selector_popover;
 mod profile_selector;
+// SUZURI: "Open Thread in Claude Code" in the agent panel menu.
+mod suzuri_open_in_claude_code;
 mod terminal_codegen;
 mod terminal_inline_assistant;
 pub mod terminal_thread_metadata_store;

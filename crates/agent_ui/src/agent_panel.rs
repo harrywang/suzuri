@@ -5727,6 +5727,13 @@ impl AgentPanel {
 
                                 let root_thread_view =
                                     conversation_view.read(cx).root_thread_view();
+                                // SUZURI: computed here because the entry below moves the view.
+                                let claude_resume_task =
+                                    root_thread_view.as_ref().and_then(|view| {
+                                        crate::suzuri_open_in_claude_code::claude_resume_task(
+                                            view.read(cx).thread.read(cx),
+                                        )
+                                    });
                                 if let Some(thread_view) = root_thread_view {
                                     let workspace = workspace.clone();
                                     menu = menu.entry("Open Thread as Markdown", None, {
@@ -5740,6 +5747,21 @@ impl AgentPanel {
                                                         .detach_and_log_err(cx);
                                                 });
                                             }
+                                        }
+                                    });
+                                }
+
+                                // SUZURI: hand a Claude Agent thread over to the native CLI.
+                                if let Some(task) = claude_resume_task {
+                                    let workspace = workspace.clone();
+                                    menu = menu.entry("Open Thread in Claude Code", None, {
+                                        move |window, cx| {
+                                            crate::suzuri_open_in_claude_code::open_in_claude_code(
+                                                task.clone(),
+                                                &workspace,
+                                                window,
+                                                cx,
+                                            );
                                         }
                                     });
                                 }
