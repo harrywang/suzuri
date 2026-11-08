@@ -2,7 +2,7 @@
 # Smoke-tests a Suzuri build through the real GUI: live preview, the PDF viewer, Typst
 # live preview, and the project panel. Runs an isolated nightly-channel instance with
 # its own data dir, drives it with ad-hoc keymap chords, and checks window titles, files
-# on disk and Zed.log. Exits non-zero when a check fails; screenshots are left in
+# on disk and Suzuri.log. Exits non-zero when a check fails; screenshots are left in
 # <work-dir>/shots for review.
 #
 # usage: smoke.sh [app-binary] [work-dir]
@@ -15,7 +15,8 @@ set -uo pipefail
 
 APP=${1:-/Applications/Suzuri.app/Contents/MacOS/zed}
 T=${2:-$(mktemp -d -t suzuri-smoke)}
-LOG="$HOME/Library/Logs/Zed/Zed.log"
+# Suzuri has logged to its own folder since 0.5.8 (paths::APP_NAME = "Suzuri").
+LOG="$HOME/Library/Logs/Suzuri/Suzuri.log"
 SKILL_DIR=$(cd "$(dirname "$0")" && pwd)
 failures=0
 pass() { echo "PASS $*"; }
@@ -139,7 +140,7 @@ chord 115; sleep 2; chord 121; sleep 3; shot 05-panel-refresh
 if kill -0 "$pid" 2>/dev/null; then pass "alive after panel focus and refresh"; else fail "app exited during the run"; fi
 
 kill -TERM "$pid" 2>/dev/null; sleep 3; kill -0 "$pid" 2>/dev/null && kill -KILL "$pid"
-# Zed.log rotates to Zed.log.old at about 1 MB, which can happen mid-run.
+# Suzuri.log rotates to Suzuri.log.old at about 1 MB, which can happen mid-run.
 if [ "$(wc -c < "$LOG")" -lt "$log_start" ]; then
   { tail -c +"$((log_start + 1))" "$LOG.old"; cat "$LOG"; } > "$T/run.log"
 else
@@ -150,7 +151,7 @@ rendered=$(grep -c 'pdf_viewer: page 1 rendered' "$T/run.log")
 if [ "$rendered" -ge 2 ]; then pass "PDF viewer rendered pages ($rendered renders)"; else fail "PDF viewer rendered $rendered pages, expected at least 2 (sample.pdf and paper.pdf)"; fi
 if grep -qi 'panic' "$T/run.log" "$T/stderr.log"; then fail "panic logged"; grep -i -m5 panic "$T/run.log" "$T/stderr.log"; else pass "no panic"; fi
 
-# Zed.log is shared with any other running instance, so these are listed for review,
+# Suzuri.log is shared with any other running instance, so these are listed for review,
 # not failed on.
 echo "--- ERROR/WARN lines during the run (any instance):"
 grep -E ' (ERROR|WARN) ' "$T/run.log" | cut -c1-220 | head -20
