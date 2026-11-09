@@ -144,7 +144,7 @@ another checkout; they are as old as whoever last recorded them.
 project panel. [`smoke.sh`](smoke.sh) launches the real app as an isolated
 nightly-channel instance (its own data dir, auto-update off, so it runs safely beside
 the user's open Suzuri), drives it with keymap chords, and checks window titles, the
-compiled PDF on disk and `Zed.log`. It prints PASS/FAIL per check and exits non-zero on
+compiled PDF on disk and `Suzuri.log`. It prints PASS/FAIL per check and exits non-zero on
 any failure, leaving screenshots for review:
 
 ```sh
