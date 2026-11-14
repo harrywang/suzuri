@@ -117,8 +117,18 @@ fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
 fn convert_body(body: &str, source_directory: Option<&Path>, state: &mut State) -> String {
     let mut output = String::with_capacity(body.len());
     let mut fence: Option<String> = None;
+    let mut after_heading = false;
 
     for line in body.lines() {
+        // Pandoc tries a setext heading before an ATX one, so `# Title`
+        // directly above `---` becomes a heading that reads "# Title". The
+        // preview reads it as a heading and a rule; a blank line makes
+        // Pandoc agree.
+        if after_heading && is_setext_underline(line) {
+            output.push('\n');
+        }
+        after_heading = fence.is_none() && heading_title(line).is_some();
+
         if let Some(open_fence) = &fence {
             output.push_str(line);
             output.push('\n');
@@ -294,6 +304,13 @@ fn section_of(text: &str, section: &str) -> Option<String> {
 }
 
 /// An ATX heading's level and title.
+fn is_setext_underline(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && (trimmed.chars().all(|character| character == '-')
+            || trimmed.chars().all(|character| character == '='))
+}
+
 fn heading_title(line: &str) -> Option<(usize, &str)> {
     let trimmed = line.trim_start();
     let level = trimmed
@@ -767,6 +784,16 @@ mod tests {
         assert_eq!(run("# A Heading\n"), "# A Heading\n");
         assert_eq!(run("### Deeper\n"), "### Deeper\n");
         assert_eq!(run("Closes #42 today.\n"), "Closes #42 today.\n");
+    }
+
+    #[test]
+    fn a_rule_under_a_heading_does_not_make_it_a_setext_heading() {
+        assert_eq!(run("# Title\n---\n## Next\n"), "# Title\n\n---\n## Next\n");
+        assert_eq!(run("Title\n---\n"), "Title\n---\n");
+        assert_eq!(
+            run("```\n# comment\n---\n```\n"),
+            "```\n# comment\n---\n```\n"
+        );
     }
 
     #[test]
