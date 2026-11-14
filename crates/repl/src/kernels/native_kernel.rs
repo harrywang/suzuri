@@ -10,8 +10,8 @@ use jupyter_protocol::{
     ExecutionState, JupyterKernelspec, JupyterMessage, KernelInfoReply,
     connection_info::{ConnectionInfo, Transport},
 };
+use jupyter_zmq_client::dirs;
 use project::Fs;
-use runtimelib::dirs;
 use smol::net::TcpListener;
 use std::{
     collections::VecDeque,
@@ -201,20 +201,20 @@ impl NativeRunningKernel {
 
             let connect = async {
                 let iopub_socket =
-                    runtimelib::create_client_iopub_connection(&connection_info, "", &session_id)
+                    jupyter_zmq_client::create_client_iopub_connection(&connection_info, "", &session_id)
                         .await?;
                 let control_socket =
-                    runtimelib::create_client_control_connection(&connection_info, &session_id)
+                    jupyter_zmq_client::create_client_control_connection(&connection_info, &session_id)
                         .await?;
 
-                let peer_identity = runtimelib::peer_identity_for_session(&session_id)?;
-                let shell_socket = runtimelib::create_client_shell_connection_with_identity(
+                let peer_identity = jupyter_zmq_client::peer_identity_for_session(&session_id)?;
+                let shell_socket = jupyter_zmq_client::create_client_shell_connection_with_identity(
                     &connection_info,
                     &session_id,
                     peer_identity.clone(),
                 )
                 .await?;
-                let stdin_socket = runtimelib::create_client_stdin_connection_with_identity(
+                let stdin_socket = jupyter_zmq_client::create_client_stdin_connection_with_identity(
                     &connection_info,
                     &session_id,
                     peer_identity,

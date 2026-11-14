@@ -2318,14 +2318,6 @@ impl ClipLeft {
     }
 }
 
-impl IntoElement for ClipLeft {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 impl gpui::Element for ClipLeft {
     type RequestLayoutState = ();
     type PrepaintState = ();
@@ -2958,14 +2950,6 @@ impl gpui::Element for AtEditorFontSize {
         if let Some(child) = child {
             child.paint(window, cx);
         }
-    }
-}
-
-impl IntoElement for AtEditorFontSize {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
     }
 }
 
