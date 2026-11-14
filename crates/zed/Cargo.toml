@@ -146,6 +146,7 @@ http_client.workspace = true
 image_viewer.workspace = true
 pdf_viewer.workspace = true
 json_canvas.workspace = true
+note_graph.workspace = true
 typeset_preview.workspace = true
 input_latency_ui.workspace = true
 inspector_ui.workspace = true

@@ -27,6 +27,7 @@ The fork's own changes are small and additive:
 | PDF viewer (adopted from zed#51040) | `crates/pdf_viewer/` |
 | Live Typst/LaTeX preview | `crates/typeset_preview/` |
 | Read-only JSON Canvas viewer (`.canvas`; agents write the file, the view follows it) | `crates/json_canvas/`, `crates/zed/src/main.rs` (`init` after `editor::init`, so it wins over the text editor) |
+| Local graph: the notes linked to and from the active note, in a split that follows it (Document → Show Local Graph). Links are read from disk and resolved with live preview's `WikilinkTarget`, so a wikilink is drawn to the note that clicking it opens (markdown-link paths are matched as written, without the filesystem's case folding) | `crates/note_graph/`, `crates/markdown_live_preview/src/markdown_live_preview.rs` (`WikilinkTarget`), `crates/zed/src/main.rs` (`init`) |
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs`, `crates/editor/src/selections_collection.rs` |
 | Native per-line typography and visual row geometry | `crates/editor/src/display_map.rs`, `crates/editor/src/display_map/wrap_map.rs`, `crates/editor/src/editor.rs`, `crates/editor/src/element.rs`, `crates/editor/src/element/header.rs` (sticky scroll keeps base typography), `crates/editor/src/scroll.rs`, `crates/editor/src/scroll/autoscroll.rs`, `crates/terminal_view/src/terminal_element.rs` |
 | Native heading search reveal and Vim integration regressions | `crates/editor/src/editor.rs` (`selection_is_from_search`), `crates/vim/src/test.rs`, `crates/vim/src/test/native_markdown.rs`, `crates/vim/Cargo.toml` (test-only live-preview dependency) |
@@ -179,8 +180,8 @@ merge chasing them:
 | Tests | Why |
 | --- | --- |
 | 11 save-prompt tests in `workspace` and `zed`, plus `project_panel tests::undo::undo_create_dirty_file` | The fork's `autosave` default in `assets/settings/default.json`. Tests load the shipped defaults, so buffers save themselves and upstream's tests never see the prompt they wait for. Setting `"autosave": "off"` in that file makes all twelve pass. |
-| `project_panel project_panel_tests::test_focus_follows_mouse_into_blank_area` | The fork docks the project panel left (`project_panel.dock` in `assets/settings/default.json`, #146), and the test hovers where the right dock would be. Setting that default back to `"right"` makes it pass. |
-| `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer`, `typeset_preview`, and `json_canvas`. |
+| `project_panel project_panel_tests::test_focus_follows_mouse_into_blank_area`, `zed tests::test_open_paths_action` | The fork docks the project panel left (`project_panel.dock` in `assets/settings/default.json`, #146). The first test hovers where the right dock would be, and the second asserts the right dock is open. Setting that default back to `"right"` makes both pass (the second also needs `"autosave": "off"`). |
+| `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer`, `typeset_preview`, `json_canvas`, and `note_graph`. |
 | `collab db_tests::*_postgres` (14) | Need a local Postgres; CI provisions one. |
 
 Anything *else* that fails is worth investigating. Before blaming the merge, check whether

@@ -2633,12 +2633,7 @@ fn resolve_embed_target(
     target: &str,
     cx: &App,
 ) -> Option<(ProjectPath, PathBuf)> {
-    let target = target.trim().trim_end_matches(".md");
-    if target.is_empty() {
-        return None;
-    }
-    let wanted_path = target.to_lowercase();
-    let wanted_stem = Path::new(target).file_stem()?.to_str()?.to_lowercase();
+    let target = WikilinkTarget::new(target)?;
 
     let mut best: Option<(u32, usize, ProjectPath, PathBuf)> = None;
     for worktree in project.read(cx).worktrees(cx) {
@@ -2648,16 +2643,11 @@ fn resolve_embed_target(
             if !entry.is_file() || entry.path.extension() != Some("md") {
                 continue;
             }
-            let relative = entry.path.as_unix_str().to_lowercase();
-            let stem = entry.path.file_stem().map(str::to_lowercase);
-            let rank = if relative.trim_end_matches(".md") == wanted_path {
-                0
-            } else if stem.as_deref() == Some(wanted_stem.as_str()) {
-                let beside = source_directory.is_some_and(|directory| {
+            let Some(rank) = target.rank(entry.path.as_unix_str(), entry.path.file_stem(), || {
+                source_directory.is_some_and(|directory| {
                     worktree.absolutize(&entry.path).parent() == Some(directory)
-                });
-                if beside { 1 } else { 2 }
-            } else {
+                })
+            }) else {
                 continue;
             };
             let depth = entry.path.components().count();
@@ -2675,6 +2665,57 @@ fn resolve_embed_target(
         }
     }
     best.map(|(_, _, path, absolute)| (path, absolute))
+}
+
+/// A wikilink's note name, prepared for matching against the project's
+/// notes. The note graph resolves links through this too, so the note a
+/// link opens and the note the graph draws it to are always the same one.
+pub struct WikilinkTarget {
+    path: String,
+    stem: String,
+}
+
+impl WikilinkTarget {
+    /// `target` is what precedes any `#heading` or `|alias`.
+    pub fn new(target: &str) -> Option<Self> {
+        let target = target.trim().trim_end_matches(".md");
+        if target.is_empty() {
+            return None;
+        }
+        Some(Self {
+            path: target.to_lowercase(),
+            stem: Path::new(target).file_stem()?.to_str()?.to_lowercase(),
+        })
+    }
+
+    /// The lowercase path a note must have, without `.md`, to match in full.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The lowercase file stem a note must have to match by name.
+    pub fn stem(&self) -> &str {
+        &self.stem
+    }
+
+    /// How well the note at `relative_path` (a `.md` file's path in its
+    /// worktree, with `/` separators) answers to this target; lower is
+    /// better and `None` is no match. Among equal ranks the note fewest
+    /// folders deep wins, then the first one found.
+    pub fn rank(
+        &self,
+        relative_path: &str,
+        stem: Option<&str>,
+        beside: impl FnOnce() -> bool,
+    ) -> Option<u32> {
+        if relative_path.to_lowercase().trim_end_matches(".md") == self.path {
+            Some(0)
+        } else if stem.map(str::to_lowercase).as_deref() == Some(self.stem.as_str()) {
+            Some(if beside() { 1 } else { 2 })
+        } else {
+            None
+        }
+    }
 }
 
 /// A lowercase heading title as a GitHub-style anchor slug: punctuation
