@@ -178,6 +178,11 @@ pub struct GraphView {
     viewport: Rc<Cell<Bounds<Pixels>>>,
     drag: Option<Drag>,
     index_task: Task<()>,
+    /// An index pass is under way, and whether the project changed during
+    /// it. A pass is never restarted: saves and agents' writes arrive faster
+    /// than a large project can be read, so restarting would never finish.
+    indexing: bool,
+    index_stale: bool,
     typing_task: Task<()>,
     center_subscription: Subscription,
     _subscriptions: Vec<Subscription>,
@@ -241,6 +246,8 @@ impl GraphView {
             viewport: Rc::default(),
             drag: None,
             index_task: Task::ready(()),
+            indexing: false,
+            index_stale: false,
             typing_task: Task::ready(()),
             center_subscription,
             _subscriptions: subscriptions,
@@ -286,6 +293,11 @@ impl GraphView {
     /// Lists the project's notes and reads the links of those that changed
     /// since they were last read.
     fn refresh_index(&mut self, delay: Duration, cx: &mut Context<Self>) {
+        if self.indexing {
+            self.index_stale = true;
+            return;
+        }
+        self.indexing = true;
         self.index_task = cx.spawn(async move |this, cx| {
             if !delay.is_zero() {
                 cx.background_executor().timer(delay).await;
@@ -327,6 +339,8 @@ impl GraphView {
                     if !project.is_local() {
                         to_read.clear();
                     }
+                    // Changes from here on are not in this listing.
+                    this.index_stale = false;
                     (notes, to_read, project.fs().clone())
                 })
                 .log_err()
@@ -358,7 +372,11 @@ impl GraphView {
             this.update(cx, |this, cx| {
                 this.notes = notes;
                 this.indexed = true;
+                this.indexing = false;
                 this.rebuild_graph(cx);
+                if this.index_stale {
+                    this.refresh_index(INDEX_DEBOUNCE, cx);
+                }
             })
             .log_err();
         });

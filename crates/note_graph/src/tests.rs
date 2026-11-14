@@ -357,3 +357,63 @@ async fn the_command_is_available_only_on_a_note(cx: &mut TestAppContext) {
     open_file("Hub.md", &workspace, cx).await;
     assert!(available(cx));
 }
+
+#[gpui::test]
+async fn pointing_at_a_note_marks_it_and_leaving_clears_it(cx: &mut TestAppContext) {
+    let Fixture { workspace, cx, .. } = open_vault(cx).await;
+    let view = open_graph("Hub.md", &workspace, cx).await;
+    let hovered_name = |cx: &mut VisualTestContext| {
+        view.read_with(cx, |view, _| {
+            view.hovered
+                .map(|shown| view.note_name(view.shown.notes[shown].note).to_string())
+        })
+    };
+    assert_eq!(hovered_name(cx), None);
+
+    let alpha = node_center("Alpha", cx);
+    cx.simulate_mouse_move(alpha, None, Modifiers::none());
+    redraw(cx);
+    assert_eq!(hovered_name(cx).as_deref(), Some("Alpha"));
+    // Still drawn, now with its full name on top.
+    node_center("Alpha", cx);
+    assert_eq!(
+        active_path(&workspace, cx).as_deref(),
+        Some("Hub.md"),
+        "pointing opens nothing"
+    );
+
+    cx.simulate_mouse_move(point(alpha.x, alpha.y - px(60.0)), None, Modifiers::none());
+    redraw(cx);
+    assert_eq!(hovered_name(cx), None);
+}
+
+/// Saves and agents' writes can arrive faster than a project is read. Each
+/// one used to restart the read, which then never finished.
+#[gpui::test]
+async fn changes_during_an_index_pass_do_not_restart_it(cx: &mut TestAppContext) {
+    let Fixture { fs, workspace, cx } = open_vault(cx).await;
+    let view = open_graph("Hub.md", &workspace, cx).await;
+
+    view.update(cx, |view, cx| {
+        view.refresh_index(INDEX_DEBOUNCE, cx);
+        assert!(view.indexing);
+        // A second request while one is under way is remembered, not run.
+        view.refresh_index(INDEX_DEBOUNCE, cx);
+        assert!(view.index_stale);
+    });
+    fs.insert_file(
+        Path::new(path!("/vault/Late.md")),
+        b"Points at [[Hub]].\n".to_vec(),
+    )
+    .await;
+    cx.run_until_parked();
+    cx.executor().advance_clock(INDEX_DEBOUNCE * 2);
+    cx.run_until_parked();
+    cx.executor().advance_clock(INDEX_DEBOUNCE * 2);
+    redraw(cx);
+
+    view.read_with(cx, |view, _| {
+        assert!(!view.indexing && !view.index_stale, "the passes ran out");
+    });
+    assert!(shown(&view, cx).contains(&("Late".to_string(), 1)));
+}
