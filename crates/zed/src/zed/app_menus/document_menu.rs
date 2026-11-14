@@ -22,6 +22,8 @@ pub fn document_menu() -> Menu {
         MenuItem::action("Insert Citation…", citations::InsertCitation),
         MenuItem::action("Open Citation Source", citations::OpenSource),
         MenuItem::separator(),
+        MenuItem::action("Show Local Graph", note_graph::OpenLocalGraph),
+        MenuItem::separator(),
         export_submenu(),
     ])
 }

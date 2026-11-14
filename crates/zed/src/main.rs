@@ -739,6 +739,7 @@ fn main() {
         pdf_viewer::init(cx);
         // SUZURI: after editor::init, since the last opener registered wins and .canvas files are also plain text.
         json_canvas::init(cx);
+        note_graph::init(cx);
         typeset_preview::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
