@@ -208,15 +208,21 @@ triggers the full signed-and-notarized build, which takes hours on hosted runner
 ## 7. Sweep stale build artifacts
 
 A merge bumps dependency versions, and Cargo never deletes the artifacts of the old
-ones — `target/debug` once reached 272G this way. Sweep every target dir that still
-exists, keeping anything touched in the last 30 days so the hot cache survives:
+ones — `target/debug` once reached 272G this way, and grew 65G → 175G in the
+2026-11-14 sync alone. Sweep every target dir that still exists, keeping anything
+touched in the last 30 days so the hot cache survives:
 
 ```sh
-for d in . .claude/worktrees/* ../suzuri-headings ../suzuri-upstream; do
+setopt nullglob 2>/dev/null  # zsh errors on an unmatched glob and aborts the loop
+for d in . .claude/worktrees/* ../suzuri-upstream; do
   [ -d "$d/target" ] && cargo sweep --time 30 "$d"
 done
 df -h / | tail -1
 ```
+
+Right after a sync this usually cleans nothing: step 5's baseline build touched every
+pre-merge artifact, so none is 30 days old yet. If free space is low, run
+`/freeup-local-space`, which deletes `target/debug` outright when sweeping falls short.
 
 `cargo-sweep` is installed via `cargo install cargo-sweep`. Dependencies rebuild from
 the shared `sccache` cache (`rustc-wrapper` in `~/.cargo/config.toml`), so a sweep
