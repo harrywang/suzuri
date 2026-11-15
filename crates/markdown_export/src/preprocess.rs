@@ -16,6 +16,7 @@
 //! replaced by that note's text, recursively, so a paper assembled from section
 //! notes exports as one document. Everything else is a local rewrite.
 
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 /// How deep `![[Note]]` embeds may nest before the pass stops descending.
@@ -118,6 +119,8 @@ fn convert_body(body: &str, source_directory: Option<&Path>, state: &mut State) 
     let mut output = String::with_capacity(body.len());
     let mut fence: Option<String> = None;
     let mut after_heading = false;
+    let mut after_blank = true;
+    let mut after_paragraph_text = false;
 
     for line in body.lines() {
         // Pandoc tries a setext heading before an ATX one, so `# Title`
@@ -126,8 +129,22 @@ fn convert_body(body: &str, source_directory: Option<&Path>, state: &mut State) 
         // Pandoc agree.
         if after_heading && is_setext_underline(line) {
             output.push('\n');
+            after_blank = true;
         }
+        // The preview lets a list, heading, quote, or rule start on the line
+        // right after a paragraph, where Pandoc reads it as more of the
+        // paragraph: "Strengths: - one - two".
+        if after_paragraph_text && fence.is_none() && interrupts_paragraph(line) {
+            output.push('\n');
+            after_blank = true;
+        }
+        after_paragraph_text = fence.is_none() && is_paragraph_text(line);
+        // Pandoc also reads `---` after a blank line as the start of a YAML
+        // metadata block, and fails the export on the prose that follows,
+        // unless a blank line comes next. The preview reads a rule.
+        let opens_metadata = fence.is_none() && after_blank && line.trim_end() == "---";
         after_heading = fence.is_none() && heading_title(line).is_some();
+        after_blank = line.trim().is_empty();
 
         if let Some(open_fence) = &fence {
             output.push_str(line);
@@ -159,6 +176,9 @@ fn convert_body(body: &str, source_directory: Option<&Path>, state: &mut State) 
                 output.push_str(&convert_line(line, state));
                 output.push('\n');
             }
+        }
+        if opens_metadata {
+            output.push('\n');
         }
     }
     output
@@ -311,6 +331,77 @@ fn is_setext_underline(line: &str) -> bool {
             || trimmed.chars().all(|character| character == '='))
 }
 
+/// Whether `line` starts a block that CommonMark, and so the preview, lets cut
+/// a paragraph short without a blank line in between.
+fn interrupts_paragraph(line: &str) -> bool {
+    let indent = line.len() - line.trim_start().len();
+    if indent > 3 {
+        return false;
+    }
+    let trimmed = line.trim();
+    // `---` under a paragraph underlines it as a heading, in the preview and
+    // Pandoc alike.
+    if heading_title(line).is_some()
+        || trimmed.starts_with('>')
+        || (is_thematic_break(trimmed) && !is_setext_underline(line))
+    {
+        return true;
+    }
+    // A nested item already sits inside a list, where Pandoc needs no blank
+    // line. CommonMark lets only an ordered list that starts at 1 interrupt a
+    // paragraph, so a wrapped line beginning "1984." stays prose.
+    indent == 0
+        && list_item_content(trimmed)
+            .is_some_and(|(ordinal, content)| ordinal.is_none_or(|n| n == 1) && !content.is_empty())
+}
+
+/// A line that continues a paragraph, as opposed to one that starts or
+/// belongs to some other block.
+fn is_paragraph_text(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty()
+        && heading_title(line).is_none()
+        && list_item_content(trimmed).is_none()
+        && !is_thematic_break(trimmed)
+        && !is_setext_underline(line)
+        && !trimmed.starts_with(['>', '|', '<'])
+        && opens_fence(line).is_none()
+}
+
+/// A list item's ordinal (`None` for a bullet) and content.
+fn list_item_content(trimmed: &str) -> Option<(Option<u64>, &str)> {
+    if let Some(rest) = trimmed.strip_prefix(['-', '*', '+']) {
+        return (rest.is_empty() || rest.starts_with([' ', '\t'])).then(|| (None, rest.trim()));
+    }
+    let digits = trimmed
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    if digits == 0 || digits > 9 {
+        return None;
+    }
+    let rest = trimmed[digits..].strip_prefix(['.', ')'])?;
+    if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some((trimmed[..digits].parse().ok(), rest.trim()))
+}
+
+fn is_thematic_break(trimmed: &str) -> bool {
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    matches!(first, '*' | '_' | '-')
+        && trimmed
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .all(|character| character == first)
+        && trimmed
+            .chars()
+            .filter(|&character| character == first)
+            .count()
+            >= 3
+}
+
 fn heading_title(line: &str) -> Option<(usize, &str)> {
     let trimmed = line.trim_start();
     let level = trimmed
@@ -447,7 +538,92 @@ fn convert_inline_segment(segment: &str, state: &mut State) -> String {
     let with_embeds = convert_media_embeds(segment, state);
     let with_links = convert_wikilinks(&with_embeds);
     let with_images = convert_image_widths(&with_links);
-    escape_tags(&with_images)
+    let with_strikes = double_single_tildes(&with_images);
+    escape_tags(&with_strikes)
+}
+
+/// The preview strikes through `~text~` as well as `~~text~~`, but Pandoc
+/// strikes only the double form and reads the single one as a subscript.
+/// Doubling a single tilde only where it pairs up leaves a lone `~5` and a
+/// URL's `/~user` alone, and math is skipped because a tilde there is a
+/// LaTeX space.
+fn double_single_tildes(segment: &str) -> String {
+    if !segment.contains('~') {
+        return segment.to_string();
+    }
+    let characters: Vec<(usize, char)> = segment.char_indices().collect();
+    let character_at = |index: usize| characters.get(index).map(|&(_, character)| character);
+    let protected = protected_spans(segment);
+    let is_single_tilde = |index: usize| {
+        character_at(index) == Some('~')
+            && index
+                .checked_sub(1)
+                .is_none_or(|previous| character_at(previous) != Some('~'))
+            && character_at(index + 1) != Some('~')
+            && !protected
+                .iter()
+                .any(|span| span.contains(&characters[index].0))
+    };
+
+    let mut doubled = Vec::new();
+    let mut opener: Option<usize> = None;
+    for index in 0..characters.len() {
+        if !is_single_tilde(index) {
+            continue;
+        }
+        let before = index
+            .checked_sub(1)
+            .and_then(|previous| character_at(previous));
+        let after = character_at(index + 1);
+        match opener {
+            Some(open) if before.is_some_and(|character| !character.is_whitespace()) => {
+                doubled.push(open);
+                doubled.push(index);
+                opener = None;
+            }
+            _ => {
+                if after.is_some_and(|character| !character.is_whitespace()) && before != Some('/')
+                {
+                    opener = Some(index);
+                }
+            }
+        }
+    }
+
+    let mut output = String::with_capacity(segment.len() + doubled.len());
+    for (index, &(_, character)) in characters.iter().enumerate() {
+        output.push(character);
+        if doubled.contains(&index) {
+            output.push('~');
+        }
+    }
+    output
+}
+
+/// Byte ranges a tilde rewrite must not touch: `$...$` math and bare URLs.
+fn protected_spans(segment: &str) -> Vec<Range<usize>> {
+    let mut spans = Vec::new();
+    let mut search_from = 0;
+    while let Some(open_offset) = segment[search_from..].find('$') {
+        let open = search_from + open_offset;
+        let Some(close_offset) = segment[open + 1..].find('$') else {
+            break;
+        };
+        let close = open + 1 + close_offset;
+        spans.push(open..close + 1);
+        search_from = close + 1;
+    }
+    let mut word_start = 0;
+    for (index, character) in segment.char_indices().chain([(segment.len(), ' ')]) {
+        if character.is_whitespace() {
+            let word = &segment[word_start..index];
+            if word.contains("://") || word.starts_with("www.") {
+                spans.push(word_start..index);
+            }
+            word_start = index + character.len_utf8();
+        }
+    }
+    spans
 }
 
 /// `![[photo.png]]` and `![[photo.png|320]]` become ordinary image syntax.
@@ -788,12 +964,69 @@ mod tests {
 
     #[test]
     fn a_rule_under_a_heading_does_not_make_it_a_setext_heading() {
-        assert_eq!(run("# Title\n---\n## Next\n"), "# Title\n\n---\n## Next\n");
+        assert_eq!(
+            run("# Title\n---\n## Next\n"),
+            "# Title\n\n---\n\n## Next\n"
+        );
         assert_eq!(run("Title\n---\n"), "Title\n---\n");
         assert_eq!(
             run("```\n# comment\n---\n```\n"),
             "```\n# comment\n---\n```\n"
         );
+    }
+
+    #[test]
+    fn a_rule_after_a_blank_line_cannot_open_a_metadata_block() {
+        assert_eq!(run("Para\n\n---\n* item\n"), "Para\n\n---\n\n* item\n");
+        assert_eq!(run("Para\n---\n"), "Para\n---\n");
+        assert_eq!(run("Para\n\n----\nText\n"), "Para\n\n----\nText\n");
+    }
+
+    #[test]
+    fn a_block_right_under_a_paragraph_gets_its_own_blank_line() {
+        assert_eq!(
+            run("Strengths:\n- one\n- two\n"),
+            "Strengths:\n\n- one\n- two\n"
+        );
+        assert_eq!(run("Steps:\n1. first\n"), "Steps:\n\n1. first\n");
+        assert_eq!(run("Text\n## Heading\n"), "Text\n\n## Heading\n");
+        assert_eq!(run("He said:\n> quoted\n"), "He said:\n\n> quoted\n");
+        assert_eq!(run("Text\n***\nMore\n"), "Text\n\n***\nMore\n");
+    }
+
+    #[test]
+    fn lines_the_preview_keeps_in_the_paragraph_are_left_alone() {
+        // Only an ordered list starting at 1 may interrupt a paragraph.
+        assert_eq!(
+            run("The year was\n1984. A good year.\n"),
+            "The year was\n1984. A good year.\n"
+        );
+        // A setext underline, an empty bullet, a nested item, a tag.
+        assert_eq!(run("Title\n---\n"), "Title\n---\n");
+        assert_eq!(run("Text\n-\n"), "Text\n-\n");
+        assert_eq!(
+            run("- parent\n  text\n  - child\n"),
+            "- parent\n  text\n  - child\n"
+        );
+        assert_eq!(run("Text\n#tag here\n"), "Text\n\\#tag here\n");
+        // Consecutive list items and code are not paragraphs.
+        assert_eq!(run("- a\n- b\n"), "- a\n- b\n");
+        assert_eq!(
+            run("```\ntext\n- not a list\n```\n"),
+            "```\ntext\n- not a list\n```\n"
+        );
+    }
+
+    #[test]
+    fn single_tilde_strikethrough_is_doubled_for_pandoc() {
+        assert_eq!(run("~gone~ and ~~gone~~\n"), "~~gone~~ and ~~gone~~\n");
+        assert_eq!(run("Costs ~5 to ~10.\n"), "Costs ~5 to ~10.\n");
+        assert_eq!(
+            run("See https://example.com/~a~b now.\n"),
+            "See https://example.com/~a~b now.\n"
+        );
+        assert_eq!(run("Math $a~b~c$ here.\n"), "Math $a~b~c$ here.\n");
+        assert_eq!(run("Code `~x~` here.\n"), "Code `~x~` here.\n");
     }
 
     #[test]

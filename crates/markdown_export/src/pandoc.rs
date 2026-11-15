@@ -256,6 +256,17 @@ fn pandoc_asset() -> Result<(String, AssetKind)> {
     })
 }
 
+/// Pandoc's markdown, tuned to read a note the way the preview shows it.
+/// `mark` carries `==highlight==` through, and the rest of Suzuri's syntax is
+/// rewritten before Pandoc sees it. The preview is the editor, so every source
+/// line stays its own line, and a bare URL is a link. Pandoc's own syntax that
+/// the preview shows as plain text is turned off, so `x^2^`, `| a line`,
+/// `Term` over `: definition`, `(@)`, and `{#id}` export as written.
+/// `fancy_lists` stays on because `1)` lists need it.
+const READER: &str = "markdown+mark+hard_line_breaks+autolink_bare_uris\
+    -subscript-superscript-line_blocks-definition_lists-example_lists\
+    -header_attributes-bracketed_spans";
+
 /// Runs one conversion. The rewritten markdown and the CSL style are staged in
 /// a temporary directory rather than beside the note, so an export never adds
 /// files to the user's vault, not even briefly.
@@ -277,9 +288,7 @@ pub async fn convert(conversion: Conversion, tools: Tools) -> Result<()> {
     let mut command = util::command::new_command(&tools.pandoc);
     command
         .arg("--from")
-        // `mark` carries `==highlight==` through; the rest of Suzuri's
-        // extensions are rewritten before Pandoc sees them.
-        .arg("markdown+mark")
+        .arg(READER)
         .arg("--output")
         .arg(&conversion.output)
         .arg("--resource-path")
@@ -358,6 +367,9 @@ fn failure_message(stderr: &[u8], stdout: &[u8]) -> String {
     if combined.trim().is_empty() {
         combined = String::from_utf8_lossy(stdout).into_owned();
     }
+    if let Some(message) = frontmatter_message(&combined) {
+        return message;
+    }
     let lines: Vec<&str> = combined
         .lines()
         .map(str::trim_end)
@@ -376,6 +388,41 @@ fn failure_message(stderr: &[u8], stdout: &[u8]) -> String {
     } else {
         tail.chars().take(600).collect()
     }
+}
+
+/// Pandoc reports invalid frontmatter against the staged copy in a temporary
+/// folder, with the line counted from inside the block, which points nowhere
+/// useful. The note's frontmatter is passed through untouched at the top of
+/// that copy, so the block's line plus the line inside it is the note's line.
+fn frontmatter_message(output: &str) -> Option<String> {
+    let (_, after) = output.split_once("Error parsing YAML metadata at")?;
+    let block_line: usize = number_after(after, "(line ")?;
+    let (_, exception) = after.split_once("YAML parse exception at line ")?;
+    let inner_line: usize = number_after(exception, "")?;
+    let (_, after_column) = exception.split_once("column ")?;
+    let reason = after_column
+        .trim_start_matches(|character: char| character.is_ascii_digit())
+        .trim_start_matches([',', ':'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if reason.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "The frontmatter is not valid YAML at line {}: {reason}. \
+         Put quotes around a value that contains a colon or starts with *, @, &, or a quote, \
+         for example title: \"Review: A Study\".",
+        block_line + inner_line
+    ))
+}
+
+fn number_after(text: &str, prefix: &str) -> Option<usize> {
+    let (_, rest) = text.split_once(prefix)?;
+    let digits = rest
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..digits].parse().ok()
 }
 
 #[cfg(test)]
@@ -489,6 +536,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn invalid_frontmatter_is_reported_against_the_note() {
+        let stderr = "Error parsing YAML metadata at \"/var/folders/yt/T/.tmp3rO56d/document.md\" \
+            (line 1, column 1):\nYAML parse exception at line 1, column 13:\n\
+            mapping values are not allowed in this context\n";
+        let message = failure_message(stderr.as_bytes(), b"");
+        assert!(message.starts_with("The frontmatter is not valid YAML at line 2: mapping values are not allowed in this context."), "{message}");
+        assert!(!message.contains("/var/folders"), "{message}");
+
+        let alias = "Error parsing YAML metadata at \"document.md\" (line 1, column 1):\n\
+            YAML parse exception at line 1, column 16,\nwhile scanning an alias:\n\
+            did not find expected alphabetic or numeric character\n";
+        let message = failure_message(alias.as_bytes(), b"");
+        assert!(
+            message.contains("line 2: while scanning an alias: did not find"),
+            "{message}"
+        );
+    }
+
+    /// Every way the comparison against the preview found Pandoc reading a
+    /// note differently, run through the real pipeline. Each assertion names
+    /// what the preview shows.
+    #[test]
+    fn an_export_reads_the_note_the_way_the_preview_shows_it() {
+        let Ok(pandoc) = which::which("pandoc") else {
+            return;
+        };
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let note = concat!(
+            "# Summary\n---\n## Strengths\n",
+            "Strengths:\n- first strength\n- second strength\n\n",
+            "Intro.\n\n---\nKept: this line\n---\n\n",
+            "Steps:\n1. first step\n\n",
+            "He said:\n> a quote\n\n",
+            "Some text\n## A heading\n\n",
+            "Line one\nline two\n\n",
+            "Visit https://example.com/page today, ~struck~ and x^2^.\n\n",
+            "| a line\n\nTerm\n: not a definition\n\n## Titled {#custom}\n",
+        );
+        let vault = crate::ProjectVault::for_directory(directory.path());
+        let processed = crate::preprocess::preprocess(note, Some(directory.path()), &vault);
+        let output = directory.path().join("out.html");
+        let conversion = Conversion {
+            format: Format::Html,
+            source: processed.text,
+            output: output.clone(),
+            resource_directory: directory.path().to_path_buf(),
+            bibliography: None,
+            csl: None,
+            pdf_engine: "typst".to_string(),
+        };
+        smol::block_on(convert(
+            conversion,
+            Tools {
+                pandoc,
+                pdf_engine: None,
+            },
+        ))
+        .expect("Pandoc converts the note");
+        let rendered = std::fs::read_to_string(&output).expect("reading the exported document");
+
+        for (expected, what) in [
+            (
+                "<h1 id=\"summary\">Summary</h1>\n<hr />",
+                "a heading above a rule",
+            ),
+            ("<li>first strength</li>", "a list right under a line"),
+            ("Kept: this line", "text between two rules"),
+            ("<li>first step</li>", "a numbered list right under a line"),
+            ("<blockquote>", "a quote right under a line"),
+            (
+                "<h2 id=\"a-heading\">A heading</h2>",
+                "a heading right under a line",
+            ),
+            ("Line one<br />", "a line break"),
+            ("<a href=\"https://example.com/page\"", "a bare URL"),
+            ("<del>struck</del>", "single-tilde strikethrough"),
+            ("x^2^", "a caret"),
+            ("| a line", "a leading pipe"),
+            (": not a definition", "a colon line"),
+            ("Titled {#custom}", "a heading attribute"),
+        ] {
+            assert!(rendered.contains(expected), "{what}: {rendered}");
+        }
+    }
+
     /// A note using every extension the fork adds, carried all the way to a
     /// finished document. The unit tests pin each rewrite in isolation; this
     /// pins that the rewritten whole is still markdown Pandoc will accept,
@@ -514,7 +647,8 @@ mod tests {
 
         let note = concat!(
             "---\ntitle: A Complete Note\ncsl: ieee\n---\n\n",
-            "# Findings\n\n",
+            "# Findings\n---\n* **Bold:** a list a YAML reader takes for an alias.\n\n",
+            "Rules between sections:\n\n---\n## Next\n\n---\nText.\n\n",
             "Typesetting is ==solved== [@knuth1984], filed under #method/qualitative.\n\n",
             "See [[Other Note|the companion]] for context.\n\n",
             "> [!warning] Mind the gap\n> Results are preliminary.\n\n",
