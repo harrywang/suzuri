@@ -1,8 +1,27 @@
 # Suzuri
 
-**Code and write in one place.**
+**Your notes, your papers and your code in one fast editor — with the AI agent you already use.**
 
-Suzuri adds a writing environment to Zed without giving up the code editor: Obsidian-style live preview for notes, Typst and LaTeX for papers, and a PDF pane for reading — all over plain markdown on your own machine. The agents you already code with draft, import, and cite; you verify and publish.
+Suzuri is a free, open-source writing environment built on [Zed](https://zed.dev). Point it at a folder of plain markdown, including the vault you already keep in Obsidian, and start writing: wikilinks, backlinks, callouts and embeds render in place, and nothing is imported or converted. Write papers in LaTeX or Typst with a live PDF beside them, read PDFs, and cite from Zotero. The agents you already code with draft, import, and cite; you verify and publish.
+
+<!-- DEMO GIF: drag the demo GIF here when editing on GitHub -->
+
+**Made for**
+
+- **Researchers** who write papers next to their code and data
+- **Obsidian users** who want a fast editor and an agent that can see the whole vault
+- **Developers** who keep docs and notes in markdown
+
+**Keep Obsidian if you like it.** Suzuri reads the same plain files, so you can keep Obsidian on your phone and use Suzuri on your desktop for long-form writing.
+
+| From your Obsidian vault | In Suzuri |
+| --- | --- |
+| `[[Wikilinks]]`, backlinks, embeds | Yes, with completion and broken-link checks |
+| Callouts, highlights, tags, footnotes | Yes |
+| Math (`$…$`, `$$…$$`) | Yes |
+| JSON Canvas | Read-only viewer |
+| Graph view | In progress |
+| Obsidian community plugins | No |
 
 *Suzuri* (硯) is Japanese for inkstone — the stone a scholar grinds ink on before writing begins.
 
