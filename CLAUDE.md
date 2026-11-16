@@ -2,14 +2,17 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-The shared agent rules (Rust conventions, GPUI primer, PR hygiene) live in `.rules`,
-which `AGENTS.md` and `GEMINI.md` also symlink to. They apply here too:
+The shared agent rules (Rust conventions, GPUI primer, PR hygiene) live in
+`AGENTS.md`, upstream Zed's file (it replaced `.rules` in zed#66716). They apply here too:
 
-@.rules
+@AGENTS.md
 
-Per `.rules`, do not edit `.rules` inline during feature work — propose additions in
-the PR description instead. This file (`CLAUDE.md`) is the Suzuri-specific layer and
-is safe to edit.
+Per `AGENTS.md`, do not edit it inline during feature work — propose additions in
+the PR description instead. The fork's one delta there is the removal of upstream's
+README review-banner rule (`7b71f9e3c5e`); a merge that brings it back resolves by
+dropping it again. Upstream deleted its `CLAUDE.md`, so every merge that touches it
+is a modify/delete conflict: keep ours. This file (`CLAUDE.md`) is the Suzuri-specific
+layer and is safe to edit.
 
 ## What this repository is
 
