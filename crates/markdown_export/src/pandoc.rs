@@ -573,10 +573,19 @@ mod tests {
             "Some text\n## A heading\n\n",
             "Line one\nline two\n\n",
             "Visit https://example.com/page today, ~struck~ and x^2^.\n\n",
-            "| a line\n\nTerm\n: not a definition\n\n## Titled {#custom}\n",
+            "| a line\n\nTerm\n: not a definition\n\n## Titled {#custom}\n\n",
+            "Data:\n| a | b |\n|---|---|\n| 1 | 2 |\n\n",
+            "> Inside:\n> - quoted item\n\n",
+            "(1) The first claim\n\na. apple\n\n",
+            "Ping @harry about [@knuth1984].\n",
         );
         let vault = crate::ProjectVault::for_directory(directory.path());
-        let processed = crate::preprocess::preprocess(note, Some(directory.path()), &vault);
+        let processed = crate::preprocess::preprocess(
+            note,
+            Some(directory.path()),
+            &vault,
+            &std::collections::HashSet::new(),
+        );
         let output = directory.path().join("out.html");
         let conversion = Conversion {
             format: Format::Html,
@@ -617,6 +626,17 @@ mod tests {
             ("| a line", "a leading pipe"),
             (": not a definition", "a colon line"),
             ("Titled {#custom}", "a heading attribute"),
+            ("<table>", "a table right under a line"),
+            (
+                "<li>quoted item</li>",
+                "a list right under a line in a quote",
+            ),
+            ("(1) The first claim", "a parenthesized number"),
+            ("a. apple", "a letter and period"),
+            (
+                "Ping @harry about [@knuth1984]",
+                "citations with no library",
+            ),
         ] {
             assert!(rendered.contains(expected), "{what}: {rendered}");
         }
@@ -658,7 +678,10 @@ mod tests {
         );
 
         let vault = crate::ProjectVault::for_directory(directory.path());
-        let processed = crate::preprocess::preprocess(note, Some(directory.path()), &vault);
+        let keys = crate::preprocess::bibliography_keys(
+            &std::fs::read_to_string(&bibliography).expect("reading the bibliography"),
+        );
+        let processed = crate::preprocess::preprocess(note, Some(directory.path()), &vault, &keys);
         assert!(
             processed.missing_embeds.is_empty(),
             "Method.md should have resolved: {:?}",
