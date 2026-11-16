@@ -1734,6 +1734,10 @@
     "bindings": {
       "right": "pdf_viewer::NextPage",
       "left": "pdf_viewer::PreviousPage",
+      "alt-down": "pdf_viewer::NextPage",
+      "alt-up": "pdf_viewer::PreviousPage",
+      "cmd-pagedown": "pdf_viewer::NextPage",
+      "cmd-pageup": "pdf_viewer::PreviousPage",
       "home": "pdf_viewer::FirstPage",
       "end": "pdf_viewer::LastPage",
       "cmd-up": "pdf_viewer::FirstPage",
@@ -1746,6 +1750,8 @@
       "pageup": "pdf_viewer::ScrollScreenUp",
       "space": "pdf_viewer::ScrollScreenDown",
       "shift-space": "pdf_viewer::ScrollScreenUp",
+      "enter": "pdf_viewer::ScrollScreenDown",
+      "shift-enter": "pdf_viewer::ScrollScreenUp",
     },
   },
   {

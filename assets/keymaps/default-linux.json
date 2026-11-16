@@ -1693,6 +1693,8 @@
       "pageup": "pdf_viewer::ScrollScreenUp",
       "space": "pdf_viewer::ScrollScreenDown",
       "shift-space": "pdf_viewer::ScrollScreenUp",
+      "enter": "pdf_viewer::ScrollScreenDown",
+      "shift-enter": "pdf_viewer::ScrollScreenUp",
     },
   },
   {

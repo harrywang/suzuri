@@ -2006,6 +2006,17 @@ mod navigation_tests {
         press("left", &viewer, cx);
         assert_eq!(scroll_offset(&viewer, cx), px(0.0));
 
+        // Preview's and Acrobat's own page keys on macOS.
+        if cfg!(target_os = "macos") {
+            press("alt-down", &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 1, cx));
+            press("cmd-pagedown", &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 2, cx));
+            press("alt-up", &viewer, cx);
+            press("cmd-pageup", &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        }
+
         let (to_last, to_first) = if cfg!(target_os = "macos") {
             ("cmd-down", "cmd-up")
         } else {
@@ -2068,6 +2079,10 @@ mod navigation_tests {
         press("shift-space", &viewer, cx);
         press("pageup", &viewer, cx);
         assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        press("enter", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(-screen));
+        press("shift-enter", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
     }
 
     #[gpui::test]
@@ -2087,6 +2102,13 @@ mod navigation_tests {
         );
         let typed = viewer.read_with(cx, |viewer, cx| viewer.page_input.read(cx).text(cx));
         assert_eq!(typed, "1 jk");
+
+        // Enter scrolls by a screen in the pages, but in the box it jumps.
+        cx.dispatch_action(GoToPage);
+        cx.simulate_input("4");
+        press("enter", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 3, cx));
+        assert!(!page_input_is_focused(&viewer, cx));
     }
 
     fn page_input_is_focused(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> bool {
