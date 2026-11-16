@@ -30,8 +30,8 @@ use editor::{Editor, EditorEvent, actions::SelectAll};
 use file_icons::FileIcons;
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable,
-    Font, IntoElement, MouseButton, ParentElement, Pixels, Point, Render, RenderImage, ScrollDelta,
-    ScrollEvent, ScrollHandle, SharedString, Styled, Subscription, Task, TextAlign,
+    Font, IntoElement, KeyContext, MouseButton, ParentElement, Pixels, Point, Render, RenderImage,
+    ScrollDelta, ScrollEvent, ScrollHandle, SharedString, Styled, Subscription, Task, TextAlign,
     TextStyleRefinement, Window, actions, canvas, div, img, point, px,
 };
 use project::Project;
@@ -59,6 +59,11 @@ const MAX_ZOOM: f32 = 20.0;
 const ZOOM_STEP: f32 = 1.1;
 const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
 const SCROLL_ZOOM_SENSITIVITY: f32 = 0.01;
+/// How far an arrow key scrolls, the step browsers use.
+const KEY_SCROLL_STEP_PX: f32 = 40.0;
+/// How far a scroll position may be from a page's top and still count as
+/// sitting on it, so a page jumped to is never "next" or "previous" again.
+const PAGE_ALIGNMENT_TOLERANCE_PX: f32 = 1.0;
 
 const RENDER_DEBOUNCE: Duration = Duration::from_millis(200);
 
@@ -79,6 +84,23 @@ actions!(
         CopyDocumentText,
         /// Type a page number to jump to that page.
         GoToPage,
+        /// Jump to the top of the next page.
+        NextPage,
+        /// Jump to the top of the current page, or of the previous page when
+        /// already there.
+        PreviousPage,
+        /// Jump to the first page.
+        FirstPage,
+        /// Jump to the top of the last page.
+        LastPage,
+        /// Scroll down a little.
+        ScrollDown,
+        /// Scroll up a little.
+        ScrollUp,
+        /// Scroll down by one screen.
+        ScrollScreenDown,
+        /// Scroll up by one screen.
+        ScrollScreenUp,
     ]
 );
 
@@ -523,6 +545,103 @@ impl PdfViewer {
         self.scroll_handle
             .set_offset(point(offset.x, px(-offset_y)));
         cx.notify();
+    }
+
+    /// The scroll position, as a distance below the top of the document.
+    fn scroll_top(&self) -> f32 {
+        -f32::from(self.scroll_handle.offset().y)
+    }
+
+    fn scroll_by(&mut self, delta: f32, cx: &mut Context<Self>) {
+        let max_top = f32::from(self.scroll_handle.max_offset().y).max(0.0);
+        let top = (self.scroll_top() + delta).clamp(0.0, max_top);
+        let offset = self.scroll_handle.offset();
+        self.scroll_handle.set_offset(point(offset.x, px(-top)));
+        cx.notify();
+    }
+
+    /// The scroll position `scroll_to_page` gives each page.
+    fn page_scroll_tops(&self) -> Vec<f32> {
+        let viewport_width: f32 = self.scroll_handle.bounds().size.width.into();
+        let fit_width = Self::page_fit_width(viewport_width);
+        let mut next_top = 0.0;
+        self.page_dimensions()
+            .iter()
+            .map(|dim| {
+                let top = next_top;
+                next_top += Self::display_height(dim, fit_width, self.zoom_level) + PAGE_GAP_PX;
+                top
+            })
+            .collect()
+    }
+
+    // Pages are chosen by comparing their tops with the scroll position
+    // rather than stepping from `current_page`: zoomed out, the end of the
+    // document counts as the last page even though several pages above it are
+    // in view, and stepping back from there would pick a page whose top is
+    // also past the end of the scroll range, leaving the view where it was.
+    fn next_page(&mut self, _: &NextPage, _window: &mut Window, cx: &mut Context<Self>) {
+        let top = self.scroll_top();
+        if let Some(index) = self
+            .page_scroll_tops()
+            .iter()
+            .position(|page_top| *page_top > top + PAGE_ALIGNMENT_TOLERANCE_PX)
+        {
+            self.scroll_to_page(index, cx);
+        }
+    }
+
+    fn previous_page(&mut self, _: &PreviousPage, _window: &mut Window, cx: &mut Context<Self>) {
+        let top = self.scroll_top();
+        let index = self
+            .page_scroll_tops()
+            .iter()
+            .rposition(|page_top| *page_top < top - PAGE_ALIGNMENT_TOLERANCE_PX)
+            .unwrap_or(0);
+        self.scroll_to_page(index, cx);
+    }
+
+    fn first_page(&mut self, _: &FirstPage, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_to_page(0, cx);
+    }
+
+    fn last_page(&mut self, _: &LastPage, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(last) = self.page_count().checked_sub(1) {
+            self.scroll_to_page(last, cx);
+        }
+    }
+
+    fn scroll_down(&mut self, _: &ScrollDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(KEY_SCROLL_STEP_PX, cx);
+    }
+
+    fn scroll_up(&mut self, _: &ScrollUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.scroll_by(-KEY_SCROLL_STEP_PX, cx);
+    }
+
+    /// One screen less one arrow step, so the line at the bottom of the view
+    /// is still in view after the jump to keep the reader's place.
+    fn screen_step(&self) -> f32 {
+        let viewport_height: f32 = self.scroll_handle.bounds().size.height.into();
+        (viewport_height - KEY_SCROLL_STEP_PX).max(KEY_SCROLL_STEP_PX)
+    }
+
+    fn scroll_screen_down(
+        &mut self,
+        _: &ScrollScreenDown,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_by(self.screen_step(), cx);
+    }
+
+    fn scroll_screen_up(
+        &mut self,
+        _: &ScrollScreenUp,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_by(-self.screen_step(), cx);
     }
 
     fn go_to_page(&mut self, _: &GoToPage, window: &mut Window, cx: &mut Context<Self>) {
@@ -1063,9 +1182,17 @@ impl Render for PdfViewer {
         let page_digits = page_count.max(1).to_string().len() as f32;
         let page_box_width = px(page_digits * 9.0 + 30.0);
 
+        // Keys like space and `j` navigate only while the page box is not
+        // being typed in, the same `not_editing` convention the panels use.
+        let mut key_context = KeyContext::default();
+        key_context.add("PdfViewer");
+        if !self.page_input.focus_handle(cx).is_focused(window) {
+            key_context.add("not_editing");
+        }
+
         v_flex()
             .id("PdfViewer")
-            .key_context("PdfViewer")
+            .key_context(key_context)
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::zoom_in))
             .on_action(cx.listener(Self::zoom_out))
@@ -1074,6 +1201,14 @@ impl Render for PdfViewer {
             .on_action(cx.listener(Self::zoom_to_actual_size))
             .on_action(cx.listener(Self::copy_document_text))
             .on_action(cx.listener(Self::go_to_page))
+            .on_action(cx.listener(Self::next_page))
+            .on_action(cx.listener(Self::previous_page))
+            .on_action(cx.listener(Self::first_page))
+            .on_action(cx.listener(Self::last_page))
+            .on_action(cx.listener(Self::scroll_down))
+            .on_action(cx.listener(Self::scroll_up))
+            .on_action(cx.listener(Self::scroll_screen_down))
+            .on_action(cx.listener(Self::scroll_screen_up))
             // Take the space the pane leaves rather than asking for the
             // parent's full height: measured in a running window, a
             // `size_full` root put this view's bounds 45px below the pane's
@@ -1820,6 +1955,165 @@ mod navigation_tests {
             cx.notify();
         });
         cx.run_until_parked();
+    }
+
+    /// Binds the shipped keymap, so these tests press the keys a user does
+    /// rather than dispatching actions the keymap might not reach.
+    fn bind_default_keymap(cx: &mut VisualTestContext) {
+        cx.update(|_, cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                settings::DEFAULT_KEYMAP_PATH,
+                cx,
+            )
+            .expect("the default keymap loads");
+            cx.bind_keys(bindings);
+        });
+    }
+
+    fn press(keystrokes: &str, viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) {
+        cx.simulate_keystrokes(keystrokes);
+        redraw(viewer, cx);
+    }
+
+    #[gpui::test]
+    async fn arrow_keys_step_through_pages(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        bind_default_keymap(cx);
+
+        press("right", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 1, cx));
+        press("right", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 2, cx));
+        press("left", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 1, cx));
+
+        // Partway down a page, the previous page is the top of this one.
+        scroll_to(&viewer, page_top_offset(&viewer, 1, cx) - px(100.0), cx);
+        press("left", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 1, cx));
+
+        press("end", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 9, cx));
+        assert_eq!(shown_page_text(&viewer, cx), "10");
+        press("right", &viewer, cx);
+        assert_eq!(
+            scroll_offset(&viewer, cx),
+            page_top_offset(&viewer, 9, cx),
+            "there is no page after the last"
+        );
+        press("home", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        press("left", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+
+        // Preview's and Acrobat's own page keys on macOS.
+        if cfg!(target_os = "macos") {
+            press("alt-down", &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 1, cx));
+            press("cmd-pagedown", &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 2, cx));
+            press("alt-up", &viewer, cx);
+            press("cmd-pageup", &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        }
+
+        let chords = if cfg!(target_os = "macos") {
+            [("cmd-down", "cmd-up"), ("cmd-shift-down", "cmd-shift-up")]
+        } else {
+            [
+                ("ctrl-end", "ctrl-home"),
+                ("ctrl-shift-down", "ctrl-shift-up"),
+            ]
+        };
+        for (to_last, to_first) in chords {
+            press(to_last, &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 9, cx));
+            press(to_first, &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        }
+    }
+
+    #[gpui::test]
+    async fn previous_page_moves_from_the_end_when_zoomed_out(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        bind_default_keymap(cx);
+        viewer.update(cx, |viewer, cx| {
+            viewer.zoom_level = 0.2;
+            cx.notify();
+        });
+        redraw(&viewer, cx);
+
+        press("end", &viewer, cx);
+        let end = scroll_offset(&viewer, cx);
+        assert!(end < px(0.0), "zoomed out, the document must still scroll");
+        assert_eq!(shown_page_text(&viewer, cx), "10");
+
+        // Pages 8 to 10 cannot reach the top of the view, so stepping back
+        // from the number shown would land beyond the end of the scroll range.
+        press("left", &viewer, cx);
+        let back = scroll_offset(&viewer, cx);
+        assert!(back > end, "the previous page must move the view up");
+        assert!(
+            (0..10).any(|index| back == page_top_offset(&viewer, index, cx)),
+            "the view should rest on a page's top"
+        );
+    }
+
+    #[gpui::test]
+    async fn scroll_keys_move_by_a_step_and_by_a_screen(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        bind_default_keymap(cx);
+        let step = px(KEY_SCROLL_STEP_PX);
+
+        press("down", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), -step);
+        press("j", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), -step * 2.0);
+        press("k", &viewer, cx);
+        press("up", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        press("up", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0), "the top stays put");
+
+        let screen = viewer.read_with(cx, |viewer, _| viewer.screen_step());
+        assert!(screen > KEY_SCROLL_STEP_PX);
+        press("space", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(-screen));
+        press("pagedown", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(-2.0 * screen));
+        press("shift-space", &viewer, cx);
+        press("pageup", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        press("enter", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(-screen));
+        press("shift-enter", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+    }
+
+    #[gpui::test]
+    async fn navigation_keys_type_into_the_page_box(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        bind_default_keymap(cx);
+
+        cx.dispatch_action(GoToPage);
+        cx.simulate_input("1");
+        cx.simulate_keystrokes("space j k left");
+        cx.run_until_parked();
+        assert!(page_input_is_focused(&viewer, cx));
+        assert_eq!(
+            scroll_offset(&viewer, cx),
+            px(0.0),
+            "keys typed into the page box must not scroll the document"
+        );
+        let typed = viewer.read_with(cx, |viewer, cx| viewer.page_input.read(cx).text(cx));
+        assert_eq!(typed, "1 jk");
+
+        // Enter scrolls by a screen in the pages, but in the box it jumps.
+        cx.dispatch_action(GoToPage);
+        cx.simulate_input("4");
+        press("enter", &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 3, cx));
+        assert!(!page_input_is_focused(&viewer, cx));
     }
 
     fn page_input_is_focused(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) -> bool {
