@@ -239,13 +239,6 @@ fn build_request(
         return Err("Export works on markdown notes.".to_string());
     }
 
-    let source_directory = path.parent().map(Path::to_path_buf);
-    let vault = ProjectVault::from_project(&project, cx);
-    let Preprocessed {
-        text: source,
-        missing_embeds,
-    } = preprocess::preprocess(&text, source_directory.as_deref(), &vault);
-
     let settings = MarkdownExportSettings::get_global(cx).clone();
     let bibliography = worktree_root.as_deref().and_then(|root| {
         // Opening a lone file gives it a worktree whose root is the file
@@ -254,6 +247,20 @@ fn build_request(
         let library = root.join(&citations::CitationsSettings::get_global(cx).library);
         library.exists().then_some(library)
     });
+    // Read here rather than in Pandoc's own pass so a key the library lacks
+    // can stay text, as it does in the preview.
+    let citation_keys = bibliography
+        .as_ref()
+        .and_then(|library| std::fs::read_to_string(library).log_err())
+        .map(|library| preprocess::bibliography_keys(&library))
+        .unwrap_or_default();
+
+    let source_directory = path.parent().map(Path::to_path_buf);
+    let vault = ProjectVault::from_project(&project, cx);
+    let Preprocessed {
+        text: source,
+        missing_embeds,
+    } = preprocess::preprocess(&text, source_directory.as_deref(), &vault, &citation_keys);
     // Only worth resolving when there is a bibliography to format against.
     let csl = bibliography
         .as_ref()
