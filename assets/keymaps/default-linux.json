@@ -1677,6 +1677,25 @@
     },
   },
   {
+    "context": "PdfViewer && not_editing",
+    "bindings": {
+      "right": "pdf_viewer::NextPage",
+      "left": "pdf_viewer::PreviousPage",
+      "home": "pdf_viewer::FirstPage",
+      "end": "pdf_viewer::LastPage",
+      "ctrl-home": "pdf_viewer::FirstPage",
+      "ctrl-end": "pdf_viewer::LastPage",
+      "down": "pdf_viewer::ScrollDown",
+      "up": "pdf_viewer::ScrollUp",
+      "j": "pdf_viewer::ScrollDown",
+      "k": "pdf_viewer::ScrollUp",
+      "pagedown": "pdf_viewer::ScrollScreenDown",
+      "pageup": "pdf_viewer::ScrollScreenUp",
+      "space": "pdf_viewer::ScrollScreenDown",
+      "shift-space": "pdf_viewer::ScrollScreenUp",
+    },
+  },
+  {
     "context": "RunModal",
     "bindings": {
       "alt-1": "new_process_modal::ActivateTaskTab",
