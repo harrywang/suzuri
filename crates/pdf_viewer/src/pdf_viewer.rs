@@ -2017,15 +2017,20 @@ mod navigation_tests {
             assert_eq!(scroll_offset(&viewer, cx), px(0.0));
         }
 
-        let (to_last, to_first) = if cfg!(target_os = "macos") {
-            ("cmd-down", "cmd-up")
+        let chords = if cfg!(target_os = "macos") {
+            [("cmd-down", "cmd-up"), ("cmd-shift-down", "cmd-shift-up")]
         } else {
-            ("ctrl-end", "ctrl-home")
+            [
+                ("ctrl-end", "ctrl-home"),
+                ("ctrl-shift-down", "ctrl-shift-up"),
+            ]
         };
-        press(to_last, &viewer, cx);
-        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 9, cx));
-        press(to_first, &viewer, cx);
-        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        for (to_last, to_first) in chords {
+            press(to_last, &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 9, cx));
+            press(to_first, &viewer, cx);
+            assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+        }
     }
 
     #[gpui::test]

@@ -1740,6 +1740,8 @@
       "cmd-pageup": "pdf_viewer::PreviousPage",
       "home": "pdf_viewer::FirstPage",
       "end": "pdf_viewer::LastPage",
+      "cmd-shift-up": "pdf_viewer::FirstPage",
+      "cmd-shift-down": "pdf_viewer::LastPage",
       "cmd-up": "pdf_viewer::FirstPage",
       "cmd-down": "pdf_viewer::LastPage",
       "down": "pdf_viewer::ScrollDown",
