@@ -2005,6 +2005,16 @@ mod navigation_tests {
         assert_eq!(scroll_offset(&viewer, cx), px(0.0));
         press("left", &viewer, cx);
         assert_eq!(scroll_offset(&viewer, cx), px(0.0));
+
+        let (to_last, to_first) = if cfg!(target_os = "macos") {
+            ("cmd-down", "cmd-up")
+        } else {
+            ("ctrl-end", "ctrl-home")
+        };
+        press(to_last, &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), page_top_offset(&viewer, 9, cx));
+        press(to_first, &viewer, cx);
+        assert_eq!(scroll_offset(&viewer, cx), px(0.0));
     }
 
     #[gpui::test]
