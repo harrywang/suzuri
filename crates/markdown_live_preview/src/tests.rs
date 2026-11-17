@@ -5497,7 +5497,9 @@ async fn test_table_columns_fit_their_widest_cell(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
-    let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
+    // Underscores, not hyphens: a line can break after a hyphen, and columns
+    // that can wrap shrink to fit instead of scrolling.
+    let long = "a_fairly_long_piece_of_cell_content_that_goes_on_and_on_for_a_while";
     let header: String = (0..7).map(|i| format!("| Column {i} ")).collect::<String>() + "|";
     let separator = "| --- ".repeat(7) + "|";
     let row: String = (0..7).map(|_| format!("| {long} ")).collect::<String>() + "|";
@@ -5605,13 +5607,14 @@ async fn test_table_wider_than_the_editor_wraps_every_column(cx: &mut TestAppCon
         "the table must stay within the window: {container:?}"
     );
 
-    let header_height = bounds(&mut cx, "mdlp-cell-h-0").size.height;
-    for selector in ["mdlp-cell-0-0", "mdlp-cell-0-1", "mdlp-cell-0-2"] {
+    // The leading columns are the ones that used to keep their full width.
+    for (selector, characters) in [("mdlp-cell-0-0", 50.), ("mdlp-cell-0-1", 51.)] {
         let cell = bounds(&mut cx, selector);
         assert!(
-            cell.size.height > header_height,
-            "{selector} must wrap its content: {:?} vs a one-line header of {header_height:?}",
-            cell.size
+            cell.size.width < advance * characters,
+            "{selector} must be too narrow for its content on one line, so it wraps: {:?} vs {:?}",
+            cell.size.width,
+            advance * characters
         );
     }
     let first = bounds(&mut cx, "mdlp-cell-0-0").size.width;
@@ -5620,6 +5623,42 @@ async fn test_table_wider_than_the_editor_wraps_every_column(cx: &mut TestAppCon
         last > first,
         "the column holding the most text gets the most width: {last:?} vs {first:?}"
     );
+
+    // The fit follows the editor's width while the table is on screen.
+    cx.cx
+        .simulate_resize(gpui::size(gpui::px(1920.), gpui::px(1080.)));
+    cx.executor().run_until_parked();
+    for (selector, characters) in [("mdlp-cell-0-0", 50.), ("mdlp-cell-0-1", 51.)] {
+        let cell = bounds(&mut cx, selector);
+        assert!(
+            cell.size.width >= advance * characters,
+            "{selector} returns to its natural width once the table fits: {:?}",
+            cell.size.width
+        );
+    }
+
+    cx.cx
+        .simulate_resize(gpui::size(gpui::px(760.), gpui::px(1080.)));
+    cx.executor().run_until_parked();
+    let container = bounds(&mut cx, "mdlp-table-scroll");
+    let last_header = bounds(&mut cx, "mdlp-cell-h-2");
+    assert!(
+        last_header.right() <= container.right() && container.right() <= gpui::px(760.),
+        "the columns shrink again when the editor narrows: {last_header:?} in {container:?}"
+    );
+}
+
+#[test]
+fn test_longest_unbreakable_run() {
+    assert_eq!(longest_unbreakable_run("a few short words"), 5);
+    assert_eq!(longest_unbreakable_run(""), 0);
+    assert_eq!(
+        longest_unbreakable_run("snake_case_identifier stays whole"),
+        21
+    );
+    // Text without spaces still wraps, between characters, so it must not
+    // count as one long word.
+    assert!(longest_unbreakable_run("研究写作环境的表格列宽应当自动适应编辑器的宽度") <= 2);
 }
 
 #[test]
@@ -5679,7 +5718,9 @@ fn test_fit_table_column_widths() {
 #[gpui::test]
 async fn test_vertical_wheel_over_wide_table_scrolls_the_document(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
-    let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
+    // Underscores, not hyphens: a line can break after a hyphen, and columns
+    // that can wrap shrink to fit instead of scrolling.
+    let long = "a_fairly_long_piece_of_cell_content_that_goes_on_and_on_for_a_while";
     let header: String = (0..7).map(|i| format!("| Column {i} ")).collect::<String>() + "|";
     let separator = "| --- ".repeat(7) + "|";
     let row: String = (0..7).map(|_| format!("| {long} ")).collect::<String>() + "|";

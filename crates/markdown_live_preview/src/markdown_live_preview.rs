@@ -3640,7 +3640,7 @@ struct TableColumnMetrics {
     /// cell, capped so one long cell cannot claim the whole row.
     natural: f32,
     /// The narrowest the column can get without breaking a word: its longest
-    /// run of non-whitespace characters.
+    /// run of characters with no line-break opportunity.
     minimum: f32,
     /// The uncapped length of its longest cell, which decides how much of the
     /// spare width the column gets when the table has to shrink.
@@ -3676,11 +3676,7 @@ fn table_column_metrics(
             let end = range.end.to_offset(snapshot);
             let text: String = snapshot.text_for_range(start..end).collect();
             let length = text.trim().chars().count() as f32;
-            let longest_word = text
-                .split_whitespace()
-                .map(|word| word.chars().count())
-                .max()
-                .unwrap_or(0) as f32;
+            let longest_word = longest_unbreakable_run(&text) as f32;
             if let Some(column) = metrics.get_mut(index) {
                 column.length = column.length.max(length);
                 column.natural = column
@@ -3697,6 +3693,26 @@ fn table_column_metrics(
         measure(row);
     }
     metrics
+}
+
+/// The length in characters of the longest stretch of `text` that cannot wrap.
+///
+/// Uses the segmenter GPUI's line wrapper breaks lines with, so a column this
+/// wide is the narrowest that wraps without splitting a word. Whitespace alone
+/// would not do: text without spaces, such as Chinese, breaks between
+/// characters, and would otherwise count as one word that pins its column.
+fn longest_unbreakable_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut run_start = 0;
+    for run_end in icu_segmenter::LineSegmenter::new_for_non_complex_scripts(Default::default())
+        .segment_str(text)
+    {
+        if let Some(run) = text.get(run_start..run_end) {
+            longest = longest.max(run.trim().chars().count());
+        }
+        run_start = run_end;
+    }
+    longest
 }
 
 /// Column widths for a table that has `available` width to lay out in.
