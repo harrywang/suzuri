@@ -29,6 +29,7 @@ use gpui::{
 use project::{
     Project,
     git_store::{GitStoreEvent, Repository, RepositoryEvent, RepositoryId},
+    trusted_worktrees::TrustedWorktrees,
 };
 use util::ResultExt as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
@@ -42,6 +43,8 @@ actions!(
         TurnOff,
         /// Syncs this repository now, and resumes syncing after an error stopped it.
         SyncNow,
+        /// Signs in to GitHub again, for when the remote stopped accepting the saved sign-in.
+        SignIn,
     ]
 );
 
@@ -85,6 +88,12 @@ pub fn init(cx: &mut App) {
                 .on_action(cx.listener({
                     let auto_sync = auto_sync.clone();
                     move |workspace, _: &SyncNow, _window, cx| sync_now(&auto_sync, workspace, cx)
+                }))
+                .on_action(cx.listener({
+                    let auto_sync = auto_sync.clone();
+                    move |workspace, _: &SignIn, window, cx| {
+                        sign_in_again(&auto_sync, workspace, window, cx)
+                    }
                 }))
             } else {
                 div.on_action(cx.listener({
@@ -140,6 +149,8 @@ enum Pause {
 enum Outcome {
     Idle,
     Synced,
+    /// Nothing was synced yet; the same trigger runs again shortly.
+    Deferred,
 }
 
 enum Problem {
@@ -335,12 +346,17 @@ impl AutoSync {
             state.failures = 0;
         }
         let cached_token = self.github_token.clone();
+        let nested = {
+            let work_dir = repository.read(cx).work_directory_abs_path.clone();
+            connect::nested_repositories(&work_dir, self.project.read(cx), cx)
+        };
         state.running = Some(cx.spawn(async move |this, cx| {
-            let on_github = repository.read_with(cx, |repository, _| {
-                repository
-                    .remote_origin_url
-                    .as_deref()
-                    .is_some_and(|url| url.starts_with("https://github.com/"))
+            // Asked of git rather than read from the snapshot, which has not
+            // caught up yet when a remote was added a moment ago.
+            let urls = repository.update(cx, |repository, _| repository.remote_urls());
+            let on_github = job_result(urls.await).is_ok_and(|urls| {
+                urls.values()
+                    .any(|url| url.starts_with("https://github.com/"))
             });
             let token = match cached_token {
                 Some(token) => token,
@@ -353,7 +369,7 @@ impl AutoSync {
                 None => None,
             };
             let token = token.filter(|_| on_github);
-            let result = run_cycle(repository, fs, trigger, token, cx).await;
+            let result = run_cycle(repository, fs, trigger, token, nested, cx).await;
             this.update(cx, |this, cx| this.finish(id, trigger, result, cx))
                 .ok();
         }));
@@ -374,6 +390,13 @@ impl AutoSync {
             return;
         }
         match result {
+            Ok(Outcome::Deferred) => {
+                state.pending = Some(
+                    state
+                        .pending
+                        .map_or(trigger, |pending| pending.max(trigger)),
+                );
+            }
             Ok(outcome) => {
                 let was_paused = state.paused.take().is_some();
                 state.failures = 0;
@@ -383,7 +406,9 @@ impl AutoSync {
                 if trigger == Trigger::Manual {
                     let message = match outcome {
                         Outcome::Synced => "Synced with the remote repository.",
-                        Outcome::Idle => "Already in sync with the remote repository.",
+                        Outcome::Idle | Outcome::Deferred => {
+                            "Already in sync with the remote repository."
+                        }
                     };
                     self.notify(id, message.into(), None, true, cx);
                 }
@@ -444,8 +469,13 @@ impl AutoSync {
                         state.paused = Some(Pause::Stopped);
                         self.notify(
                             id,
-                            "Auto sync stopped: the remote did not accept your git credentials. Push once from the Git panel to sign in, then run Sync Now.".into(),
-                            Some(sync_now_button()),
+                            "Auto sync stopped: the remote did not accept your sign-in. For a GitHub repository, sign in again. For any other remote, push once from the Git panel, then run Sync Now.".into(),
+                            Some((
+                                "Sign In to GitHub".into(),
+                                Arc::new(|window: &mut Window, cx: &mut App| {
+                                    window.dispatch_action(Box::new(SignIn), cx)
+                                }),
+                            )),
                             false,
                             cx,
                         );
@@ -565,10 +595,11 @@ async fn run_cycle(
     fs: Arc<dyn Fs>,
     trigger: Trigger,
     github_token: Option<String>,
+    nested: Vec<String>,
     cx: &mut AsyncApp,
 ) -> Result<Outcome, Problem> {
-    let (trusted, branch, changes, conflicted, repository_dir, work_dir) =
-        repository.read_with(cx, |repository, _| {
+    let (trusted, branch, changes, conflicted, repository_dir, work_dir, exclude_path) = repository
+        .read_with(cx, |repository, _| {
             let mut changes = Vec::new();
             let mut conflicted = Vec::new();
             for entry in repository.status() {
@@ -587,10 +618,20 @@ async fn run_cycle(
                 conflicted,
                 repository.repository_dir_abs_path.clone(),
                 repository.work_directory_abs_path.clone(),
+                connect::exclude_path(repository),
             )
         });
     if !trusted {
         return Err(Problem::Blocked(Blocker::NotTrusted));
+    }
+    // Repositories nested in this one would be committed as bare pointers.
+    // Once they are newly excluded, the status read above still lists them,
+    // so this cycle stops and the next one works from a fresh scan.
+    if connect::ensure_excluded(&fs, &exclude_path, &nested)
+        .await
+        .map_err(Problem::Failed)?
+    {
+        return Ok(Outcome::Deferred);
     }
 
     let rebasing = fs.is_dir(&repository_dir.join("rebase-merge")).await
@@ -842,6 +883,7 @@ fn background_askpass(github_token: Option<String>, cx: &mut AsyncApp) -> AskPas
             .and_then(|answer| EncryptedPassword::try_from(answer).ok());
         match answer {
             Some(answer) => {
+                log::info!("auto sync answered a GitHub credential prompt from its own sign-in");
                 response.send(answer).ok();
             }
             None => log::warn!("auto sync declined a git credential prompt: {prompt}"),
@@ -940,6 +982,21 @@ fn turn_on(
 ) {
     let project = workspace.project().clone();
     let auto_sync = auto_sync.clone();
+    // Sync refuses to run git in a folder the user has not trusted, so
+    // setting it up there would end with a repository that never syncs.
+    if TrustedWorktrees::has_restricted_worktrees(&project.read(cx).worktree_store(), cx) {
+        let prompt = window.prompt(
+            PromptLevel::Info,
+            "Trust this folder first",
+            Some(
+                "This folder is open in Restricted Mode. Trust it (the Restricted Mode button in the title bar), then turn on auto sync.",
+            ),
+            &["OK"],
+            cx,
+        );
+        cx.background_spawn(prompt).detach();
+        return;
+    }
     let repository = match sync_target(workspace, cx) {
         Target::Repository(repository) => repository,
         Target::NoFolder => {
@@ -1089,9 +1146,9 @@ async fn enable(
     work_dir: Arc<Path>,
     project: &Entity<Project>,
     auto_sync: &Entity<AutoSync>,
-    cx: &mut gpui::AsyncWindowContext,
+    cx: &mut AsyncApp,
 ) -> Result<()> {
-    let git_config = |args: &[&str], cx: &mut gpui::AsyncWindowContext| {
+    let git_config = |args: &[&str], cx: &mut AsyncApp| {
         let args = args.iter().map(|arg| arg.to_string()).collect();
         project.read_with(cx, |project, cx| {
             project.git_config(work_dir.clone(), args, cx)
@@ -1181,6 +1238,35 @@ fn turn_off(
             )
         })?;
         anyhow::Ok(())
+    })
+    .detach_and_log_err(cx);
+}
+
+fn sign_in_again(
+    auto_sync: &Entity<AutoSync>,
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
+    let Some(repository) = target_repository(workspace, cx) else {
+        return;
+    };
+    let id = repository.read(cx).id;
+    let auto_sync = auto_sync.clone();
+    cx.spawn_in(window, async move |workspace, cx| {
+        let http = cx.update(|_, cx| cx.http_client())?;
+        let result = async {
+            let Some((token, _)) = connect::sign_in(&http, &workspace, cx).await? else {
+                return anyhow::Ok(());
+            };
+            auto_sync.update(cx, |auto_sync, cx| {
+                auto_sync.github_token = Some(Some(token));
+                auto_sync.request(id, Trigger::Manual, Duration::ZERO, cx)
+            });
+            Ok(())
+        }
+        .await;
+        report_connect_failure(result, cx).await
     })
     .detach_and_log_err(cx);
 }
@@ -1522,6 +1608,157 @@ mod tests {
         wait(cx, "resolving the conflict resumes syncing", &|cx| {
             paused(cx).is_none() && remote_file("note.md") == resolved
         });
+    }
+
+    /// The local half of connecting a folder for the first time, against
+    /// real git: a plain folder with a repository nested in it becomes a
+    /// repository, gets a remote, and its notes arrive there without the
+    /// nested repository.
+    #[gpui::test]
+    async fn connects_a_plain_folder_and_leaves_nested_repositories_out(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{AppContext as _, UpdateGlobal as _, WeakEntity};
+        use settings::SettingsStore;
+        use std::{cell::RefCell, path::Path, rc::Rc};
+
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::trusted_worktrees::init(Default::default(), cx);
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(r#"{"session":{"trust_all_worktrees":true}}"#, cx)
+                    .expect("valid settings");
+            });
+        });
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        // The test sets the scene with blocking git calls between steps.
+        #[allow(clippy::disallowed_methods)]
+        let git = |dir: &Path, args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+
+        git(&root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        let notes = root.join("My Notes");
+        std::fs::create_dir_all(notes.join("drafts")).expect("create");
+        std::fs::write(notes.join("Ideas.md"), "an idea\n").expect("write");
+        std::fs::write(notes.join("drafts").join("Chapter.md"), "a draft\n").expect("write");
+        let nested = notes.join("paper-code");
+        std::fs::create_dir_all(&nested).expect("create");
+        git(&nested, &["init", "-q", "-b", "main"]);
+        std::fs::write(nested.join("train.py"), "print('hi')\n").expect("write");
+        git(&nested, &["add", "-A"]);
+        git(&nested, &["commit", "-qm", "Code"]);
+
+        let project =
+            project::Project::test(fs::RealFs::new(None, cx.executor()), [notes.as_path()], cx)
+                .await;
+        let auto_sync = cx.new(|cx| AutoSync::new(project.clone(), WeakEntity::new_invalid(), cx));
+
+        let wait = |cx: &mut gpui::TestAppContext,
+                    what: &str,
+                    done: &dyn Fn(&mut gpui::TestAppContext) -> bool| {
+            for _ in 0..240 {
+                cx.executor().advance_clock(Duration::from_secs(1));
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("timed out waiting until {what}");
+        };
+
+        wait(cx, "the nested repository is discovered", &|cx| {
+            project.read_with(cx, |project, cx| {
+                connect::nested_repositories(&notes, project, cx) == ["paper-code"]
+            })
+        });
+
+        let outcome = Rc::new(RefCell::new(None));
+        cx.update(|cx| {
+            let outcome = outcome.clone();
+            let project = project.clone();
+            let auto_sync = auto_sync.clone();
+            let work_dir: Arc<Path> = notes.clone().into();
+            let remote_url = root.join("remote.git").to_string_lossy().into_owned();
+            cx.spawn(async move |cx| {
+                let result = async {
+                    let identity = connect::Identity {
+                        name: "Ada".into(),
+                        email: "7+ada@users.noreply.github.com".into(),
+                    };
+                    let repository =
+                        connect::prepare_local(work_dir.clone(), None, &identity, &project, cx)
+                            .await?;
+                    connect::attach_remote(&repository, &remote_url, cx).await?;
+                    let id = repository.read_with(cx, |repository, _| repository.id);
+                    enable(id, work_dir, &project, &auto_sync, cx).await
+                }
+                .await;
+                *outcome.borrow_mut() = Some(result);
+            })
+            .detach();
+        });
+        wait(cx, "the folder is connected", &|_| {
+            outcome.borrow().is_some()
+        });
+        if let Some(Err(error)) = outcome.borrow().as_ref() {
+            panic!("connecting failed: {error:#}");
+        }
+
+        // Fails while the remote has no branch yet, which the wait rides out.
+        #[allow(clippy::disallowed_methods)]
+        let remote_files = || {
+            std::process::Command::new("git")
+                .current_dir(&root)
+                .args([
+                    "--git-dir",
+                    "remote.git",
+                    "ls-tree",
+                    "-r",
+                    "--name-only",
+                    "main",
+                ])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+                .unwrap_or_default()
+        };
+        wait(cx, "the notes reach the remote", &|_| {
+            let files = remote_files();
+            files.contains("Ideas.md") && files.contains("drafts/Chapter.md")
+        });
+        let files = remote_files();
+        assert!(
+            !files.contains("paper-code"),
+            "the nested repository must stay out of the backup, got:\n{files}"
+        );
+        let exclude = std::fs::read_to_string(notes.join(".git/info/exclude")).expect("exclude");
+        assert!(exclude.contains("/paper-code/"), "{exclude}");
+        assert_eq!(
+            git(&notes, &["config", "--local", ENABLED_KEY]).trim(),
+            "true"
+        );
     }
 
     #[test]
