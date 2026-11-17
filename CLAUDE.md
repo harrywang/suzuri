@@ -48,7 +48,7 @@ The fork's own changes are small and additive:
 | Own config and data folders, separate from Zed's (`APP_NAME = "Suzuri"`, binary still `zed`): one-time copy of an existing user's state, Import from Zed, keychain credentials in shipped builds (see "Own folders") | `crates/suzuri_migration/`, `crates/paths/src/paths.rs` (`APP_NAME`), `crates/zed/src/main.rs` (assert removed, two calls), `crates/onboarding/src/basics_page.rs` and `Cargo.toml` (Zed import button) |
 | Remote server provisioning on the dev channel (SSH/Docker/WSL remotes; see "Cutting a release") | `crates/auto_update/src/auto_update.rs` (`get_release_asset`), `crates/remote/src/transport/ssh.rs`, `docker.rs`, `wsl.rs` (`ensure_server_binary`) |
 | Issue chooser (Bug, Crash, Feature request; labels, since a user-owned repo has no issue types). Zed's `10_`/`11_` templates are deleted: a merge that brings them back as a modify/delete conflict resolves by keeping them deleted | `.github/ISSUE_TEMPLATE/config.yml`, `.github/ISSUE_TEMPLATE/suzuri_*.yml` |
-| Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
+| Settings plumbing, including Zed's telemetry turned off by default (Suzuri collects none of its own) | `crates/settings_content/`, `assets/settings/default.json` |
 | Branding, CLI name, release infrastructure | `crates/zed/Cargo.toml` (bundle metadata), `crates/zed/resources/app-icon-suzuri*`, `crates/zed/resources/windows/app-icon-suzuri.ico`, `assets/images/suzuri_logo.svg`, `crates/install_cli/src/install_cli_binary.rs`, `script/bundle-mac`, `script/bundle-windows.ps1`, `script/bundle-linux`, `.github/workflows/suzuri-release.yml` |
 
 `git log --author="Harry Wang" --name-only` is the authoritative list of touched files.
@@ -184,6 +184,7 @@ merge chasing them:
 | --- | --- |
 | 11 save-prompt tests in `workspace` and `zed`, plus `project_panel tests::undo::undo_create_dirty_file` | The fork's `autosave` default in `assets/settings/default.json`. Tests load the shipped defaults, so buffers save themselves and upstream's tests never see the prompt they wait for. Setting `"autosave": "off"` in that file makes all twelve pass. |
 | `project_panel project_panel_tests::test_focus_follows_mouse_into_blank_area`, `zed tests::test_open_paths_action` | The fork docks the project panel left (`project_panel.dock` in `assets/settings/default.json`, #146). The first test hovers where the right dock would be, and the second asserts the right dock is open. Setting that default back to `"right"` makes both pass (the second also needs `"autosave": "off"`). |
+| `client telemetry::tests::test_telemetry_flush_on_flush_interval`, `test_telemetry_flush_on_max_queue_size`, `test_report_remote_event_tags_origin` | The fork turns Zed's telemetry off (`telemetry.metrics` and `telemetry.diagnostics` in `assets/settings/default.json`), and these tests load the shipped defaults, so no event is ever queued. Setting `"metrics": true` there makes all three pass. |
 | `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer`, `typeset_preview`, `json_canvas`, and `note_graph`. |
 | `collab db_tests::*_postgres` (14) | Need a local Postgres; CI provisions one. |
 
