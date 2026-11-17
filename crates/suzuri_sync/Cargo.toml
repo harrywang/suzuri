@@ -1,0 +1,26 @@
+[package]
+name = "suzuri_sync"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/suzuri_sync.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+askpass.workspace = true
+collections.workspace = true
+fs.workspace = true
+futures.workspace = true
+gpui.workspace = true
+git.workspace = true
+log.workspace = true
+project.workspace = true
+util.workspace = true
+workspace.workspace = true

@@ -18155,6 +18155,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "suzuri_sync"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "askpass",
+ "collections",
+ "fs",
+ "futures 0.3.34",
+ "git",
+ "gpui",
+ "log",
+ "project",
+ "util",
+ "workspace",
+]
+
+[[package]]
 name = "suzuri_update"
 version = "0.1.0"
 dependencies = [
@@ -23448,6 +23465,7 @@ dependencies = [
  "snippets_ui",
  "suzuri_migration",
  "suzuri_recovery",
+ "suzuri_sync",
  "suzuri_update",
  "svg_preview",
  "sysinfo 0.39.6",

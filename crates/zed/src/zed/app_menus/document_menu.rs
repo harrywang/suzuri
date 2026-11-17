@@ -25,6 +25,12 @@ pub fn document_menu() -> Menu {
         MenuItem::action("Show Local Graph", note_graph::OpenLocalGraph),
         MenuItem::separator(),
         export_submenu(),
+        MenuItem::separator(),
+        MenuItem::submenu(Menu::new("Sync").items([
+            MenuItem::action("Turn On Auto Sync…", suzuri_sync::TurnOn),
+            MenuItem::action("Sync Now", suzuri_sync::SyncNow),
+            MenuItem::action("Turn Off Auto Sync", suzuri_sync::TurnOff),
+        ])),
     ])
 }
 

@@ -802,6 +802,7 @@ fn main() {
         markdown_export::init(cx);
         markdown_writing::init(cx);
         suzuri_recovery::init(cx);
+        suzuri_sync::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);
