@@ -18164,13 +18164,18 @@ dependencies = [
  "fs",
  "futures 0.3.34",
  "git",
+ "git_ui",
  "gpui",
+ "http_client",
  "log",
  "project",
+ "serde",
+ "serde_json",
  "settings",
  "tempfile",
  "util",
  "workspace",
+ "zed_credentials_provider",
 ]
 
 [[package]]

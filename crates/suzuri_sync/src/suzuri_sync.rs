@@ -7,10 +7,17 @@
 //! while another stays manual. Every git operation goes through Zed's
 //! `Repository`, which serializes them with the Git panel's own.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+mod connect;
+mod github;
+
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context as _, Result, anyhow};
-use askpass::AskPassDelegate;
+use askpass::{AskPassDelegate, EncryptedPassword};
 use collections::HashMap;
 use fs::Fs;
 use futures::channel::oneshot;
@@ -64,12 +71,9 @@ pub fn init(cx: &mut App) {
         let workspace_handle = cx.weak_entity();
         let auto_sync = cx.new(|cx| AutoSync::new(project, workspace_handle, cx));
         // Attached per render, so the menu offers Turn On or Turn Off and
-        // Sync Now depending on the active repository.
+        // Sync Now depending on the opened folder's repository.
         workspace.register_action_renderer(move |div, workspace, _window, cx| {
-            let enabled = workspace
-                .project()
-                .read(cx)
-                .active_repository(cx)
+            let enabled = target_repository(workspace, cx)
                 .is_some_and(|repository| auto_sync.read(cx).is_enabled(repository.read(cx).id));
             if enabled {
                 div.on_action(cx.listener({
@@ -99,6 +103,10 @@ struct AutoSync {
     project: Entity<Project>,
     workspace: WeakEntity<Workspace>,
     repositories: HashMap<RepositoryId, RepositorySync>,
+    /// The GitHub sign-in, once it has been looked up: the outer `None` means
+    /// the credential store has not been read yet, which is put off until a
+    /// GitHub remote is actually synced.
+    github_token: Option<Option<String>>,
     _subscription: Subscription,
 }
 
@@ -186,6 +194,7 @@ impl AutoSync {
             project,
             workspace,
             repositories: HashMap::default(),
+            github_token: None,
             _subscription: subscription,
         };
         this.reconcile(cx);
@@ -325,8 +334,26 @@ impl AutoSync {
             state.paused = None;
             state.failures = 0;
         }
+        let cached_token = self.github_token.clone();
         state.running = Some(cx.spawn(async move |this, cx| {
-            let result = run_cycle(repository, fs, trigger, cx).await;
+            let on_github = repository.read_with(cx, |repository, _| {
+                repository
+                    .remote_origin_url
+                    .as_deref()
+                    .is_some_and(|url| url.starts_with("https://github.com/"))
+            });
+            let token = match cached_token {
+                Some(token) => token,
+                None if on_github => {
+                    let token = connect::stored_token(cx).await;
+                    this.update(cx, |this, _| this.github_token = Some(token.clone()))
+                        .ok();
+                    token
+                }
+                None => None,
+            };
+            let token = token.filter(|_| on_github);
+            let result = run_cycle(repository, fs, trigger, token, cx).await;
             this.update(cx, |this, cx| this.finish(id, trigger, result, cx))
                 .ok();
         }));
@@ -363,7 +390,17 @@ impl AutoSync {
             }
             Err(Problem::Blocked(Blocker::NotTrusted)) => {
                 // Restricted mode has its own banner, and trusting the folder
-                // lets the next change sync.
+                // lets the next change sync; only someone who just asked for
+                // a sync needs telling why nothing happened.
+                if trigger == Trigger::Manual {
+                    self.notify(
+                        id,
+                        "Auto sync is waiting: this folder is in Restricted Mode. Trust the folder, then run Sync Now.".into(),
+                        Some(sync_now_button()),
+                        false,
+                        cx,
+                    );
+                }
             }
             Err(Problem::Blocked(Blocker::Conflicts(paths))) => {
                 // Removing the markers from a file git still reports as
@@ -527,6 +564,7 @@ async fn run_cycle(
     repository: Entity<Repository>,
     fs: Arc<dyn Fs>,
     trigger: Trigger,
+    github_token: Option<String>,
     cx: &mut AsyncApp,
 ) -> Result<Outcome, Problem> {
     let (trusted, branch, changes, conflicted, repository_dir, work_dir) =
@@ -615,7 +653,7 @@ async fn run_cycle(
             .await
             .map_err(Problem::Failed)?;
         let message = commit_message(&changes);
-        let askpass = background_askpass(cx);
+        let askpass = background_askpass(github_token.clone(), cx);
         let commit = repository.update(cx, |repository, cx| {
             repository.commit(message.into(), None, CommitOptions::default(), askpass, cx)
         });
@@ -629,7 +667,7 @@ async fn run_cycle(
 
     let mut pulled = false;
     if plan.pull {
-        let askpass = background_askpass(cx);
+        let askpass = background_askpass(github_token.clone(), cx);
         let remote = plan.remote.clone();
         let pull = repository.update(cx, |repository, cx| {
             repository.pull(None, remote, false, askpass, cx)
@@ -639,7 +677,7 @@ async fn run_cycle(
     }
 
     if committed || pulled || plan.set_upstream || plan.ahead > 0 {
-        let askpass = background_askpass(cx);
+        let askpass = background_askpass(github_token.clone(), cx);
         let options = plan.set_upstream.then_some(PushOptions::SetUpstream);
         let push = repository.update(cx, |repository, cx| {
             repository.push(
@@ -790,22 +828,108 @@ fn classify_failure(message: &str) -> Failure {
     }
 }
 
-/// Credentials come from git's own helpers; a sync that runs while nobody is
-/// looking must never open a password prompt. Dropping the response sender
-/// makes askpass end the git process at once, so the repository's job queue
-/// is not held up waiting for an answer.
-fn background_askpass(cx: &mut AsyncApp) -> AskPassDelegate {
-    AskPassDelegate::new(cx, |prompt, _response, _cx| {
-        log::warn!("auto sync declined a git credential prompt: {prompt}");
+/// A sync that runs while nobody is looking must never open a password
+/// prompt. Credentials come from git's own helpers first; when git still asks
+/// and the remote is on GitHub, the token from Suzuri's own sign-in answers.
+/// Any other prompt is declined by dropping the response sender, which makes
+/// askpass end the git process at once, so the repository's job queue is not
+/// held up waiting for an answer.
+fn background_askpass(github_token: Option<String>, cx: &mut AsyncApp) -> AskPassDelegate {
+    AskPassDelegate::new(cx, move |prompt, response, _cx| {
+        let answer = github_token
+            .as_deref()
+            .and_then(|token| github_credential(&prompt, token))
+            .and_then(|answer| EncryptedPassword::try_from(answer).ok());
+        match answer {
+            Some(answer) => {
+                response.send(answer).ok();
+            }
+            None => log::warn!("auto sync declined a git credential prompt: {prompt}"),
+        }
     })
+}
+
+/// What to answer when git asks for GitHub credentials over HTTPS: any
+/// username works with a token as the password.
+fn github_credential<'a>(prompt: &str, token: &'a str) -> Option<&'a str> {
+    // Git quotes the URL it is authenticating to. The host has to match
+    // exactly, or a remote named like `github.com.example.org` would be
+    // handed the token.
+    let url = prompt.split('\'').nth(1)?;
+    let authority = url.strip_prefix("https://")?;
+    let host = authority.rsplit('@').next()?;
+    if host != "github.com" {
+        return None;
+    }
+    if prompt.starts_with("Username for ") {
+        Some("x-access-token")
+    } else if prompt.starts_with("Password for ") {
+        Some(token)
+    } else {
+        None
+    }
 }
 
 fn job_result<T>(result: Result<Result<T>, oneshot::Canceled>) -> Result<T> {
     result.map_err(|_| anyhow!("the git operation was cancelled"))?
 }
 
-fn active_repository(workspace: &Workspace, cx: &App) -> Option<Entity<Repository>> {
-    workspace.project().read(cx).active_repository(cx)
+fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// What Turn On acts on. It is always the folder the user opened, never a
+/// repository further up that happens to contain it, and never a repository
+/// nested inside it that the active file happens to belong to.
+enum Target {
+    Repository(Entity<Repository>),
+    Folder {
+        root: Arc<Path>,
+        /// A repository further up that the folder is part of.
+        enclosing: Option<Arc<Path>>,
+    },
+    NoFolder,
+}
+
+fn sync_target(workspace: &Workspace, cx: &App) -> Target {
+    let project = workspace.project().read(cx);
+    let roots = project
+        .visible_worktrees(cx)
+        .filter(|worktree| !worktree.read(cx).is_single_file())
+        .map(|worktree| worktree.read(cx).abs_path())
+        .collect::<Vec<_>>();
+    let repositories = project.git_store().read(cx).repositories();
+    let is_root = |repository: &Entity<Repository>| {
+        let work_dir = repository.read(cx).work_directory_abs_path.clone();
+        roots.iter().any(|root| root.as_ref() == work_dir.as_ref())
+    };
+    // With several folders open, the active repository picks among them.
+    if let Some(active) = project
+        .active_repository(cx)
+        .filter(|active| is_root(active))
+    {
+        return Target::Repository(active);
+    }
+    if let Some(repository) = repositories.values().find(|repository| is_root(repository)) {
+        return Target::Repository(repository.clone());
+    }
+    let Some(root) = roots.into_iter().next() else {
+        return Target::NoFolder;
+    };
+    let enclosing = repositories
+        .values()
+        .map(|repository| repository.read(cx).work_directory_abs_path.clone())
+        .find(|work_dir| work_dir.as_ref() != root.as_ref() && root.starts_with(work_dir));
+    Target::Folder { root, enclosing }
+}
+
+fn target_repository(workspace: &Workspace, cx: &App) -> Option<Entity<Repository>> {
+    match sync_target(workspace, cx) {
+        Target::Repository(repository) => Some(repository),
+        Target::Folder { .. } | Target::NoFolder => None,
+    }
 }
 
 fn turn_on(
@@ -814,21 +938,60 @@ fn turn_on(
     window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(repository) = active_repository(workspace, cx) else {
-        let prompt = window.prompt(
-            PromptLevel::Info,
-            "This folder is not a git repository yet",
-            Some(
-                "Open the Git panel and choose Initialize Repository, then connect it to an empty repository on GitHub. Turn on auto sync after that.",
-            ),
-            &["OK"],
-            cx,
-        );
-        cx.background_spawn(prompt).detach();
-        return;
-    };
     let project = workspace.project().clone();
     let auto_sync = auto_sync.clone();
+    let repository = match sync_target(workspace, cx) {
+        Target::Repository(repository) => repository,
+        Target::NoFolder => {
+            let prompt = window.prompt(
+                PromptLevel::Info,
+                "Open a folder first",
+                Some(
+                    "Auto sync backs up a whole folder of notes. Open the folder, then turn it on.",
+                ),
+                &["OK"],
+                cx,
+            );
+            cx.background_spawn(prompt).detach();
+            return;
+        }
+        // A notes folder inside a home directory under git, a dotfiles
+        // repository or a monorepo belongs to that larger repository, and
+        // syncing it would upload everything else in there too. Making it a
+        // repository of its own would instead drop it from the larger one's
+        // history.
+        Target::Folder {
+            root,
+            enclosing: Some(enclosing),
+        } => {
+            let detail = format!(
+                "“{}” is part of the git repository at {}. Syncing it would upload that whole repository, not just this folder. Move your notes into a folder of their own, or open the repository's own folder if you mean to sync all of it.",
+                folder_name(&root),
+                enclosing.display()
+            );
+            let prompt = window.prompt(
+                PromptLevel::Warning,
+                "This folder is inside a larger git repository",
+                Some(&detail),
+                &["OK"],
+                cx,
+            );
+            cx.background_spawn(prompt).detach();
+            return;
+        }
+        Target::Folder {
+            root,
+            enclosing: None,
+        } => {
+            cx.spawn_in(window, async move |workspace, cx| {
+                let result =
+                    connect::connect(root, None, project, auto_sync, workspace.clone(), cx).await;
+                report_connect_failure(result, cx).await
+            })
+            .detach_and_log_err(cx);
+            return;
+        }
+    };
     cx.spawn_in(window, async move |workspace, cx| {
         let (id, work_dir, branch) = repository.read_with(cx, |repository, _| {
             (
@@ -837,21 +1000,13 @@ fn turn_on(
                 repository.branch.clone(),
             )
         });
-        let Some(branch) = branch else {
-            return show_info(
-                cx,
-                "No branch is checked out",
-                "Check out a branch, then turn on auto sync.",
-            )
-            .await;
-        };
 
-        let remote = match upstream_remote(&branch) {
+        let remote = match branch.as_ref().and_then(upstream_remote) {
             Some(remote) => Some(SharedString::from(remote.to_string())),
             None => {
-                let branch_name = branch.name().to_string();
+                let branch_name = branch.as_ref().map(|branch| branch.name().to_string());
                 let remotes = repository.update(cx, |repository, _| {
-                    repository.get_remotes(Some(branch_name), true)
+                    repository.get_remotes(branch_name, true)
                 });
                 let remotes = job_result(remotes.await)?;
                 match remotes.as_slice() {
@@ -868,23 +1023,34 @@ fn turn_on(
                 }
             }
         };
+        // No remote yet: the same first-time path as a plain folder, minus
+        // creating the repository.
         let Some(remote) = remote else {
-            return show_info(
+            let result = connect::connect(
+                work_dir,
+                Some(repository),
+                project,
+                auto_sync,
+                workspace.clone(),
                 cx,
-                "This repository is not connected to GitHub yet",
-                "Create an empty private repository on github.com, then add it as a remote: open the branch picker and paste its URL, or run `git remote add origin <url>` in the terminal. Turn on auto sync after that.",
             )
             .await;
+            return report_connect_failure(result, cx).await;
         };
+        if branch.is_none() {
+            return show_info(
+                cx,
+                "No branch is checked out",
+                "Check out a branch, then turn on auto sync.",
+            )
+            .await;
+        }
         let urls = repository.update(cx, |repository, _| repository.remote_urls());
         let url = job_result(urls.await)?
             .remove(remote.as_ref())
             .unwrap_or_else(|| remote.to_string());
 
-        let folder = work_dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| work_dir.display().to_string());
+        let folder = folder_name(&work_dir);
         let message = format!("Sync “{folder}” with {url}?");
         let answer = cx.update(|window, cx| {
             window.prompt(
@@ -901,30 +1067,7 @@ fn turn_on(
             return Ok(());
         }
 
-        let git_config = |args: &[&str], cx: &mut gpui::AsyncWindowContext| {
-            let args = args.iter().map(|arg| arg.to_string()).collect();
-            project.read_with(cx, |project, cx| {
-                project.git_config(work_dir.clone(), args, cx)
-            })
-        };
-        git_config(&["--local", ENABLED_KEY, "true"], cx)
-            .await
-            .context("turning on auto sync")?;
-        // A plain `git pull` refuses to reconcile divergent branches unless
-        // told how, and a rebase that stops on a conflict has no UI to finish
-        // it, so syncing merges. A choice already made for this repository is
-        // left alone.
-        if git_config(&["--local", "--get", "pull.rebase"], cx)
-            .await
-            .is_err()
-        {
-            git_config(&["--local", "pull.rebase", "false"], cx).await?;
-            git_config(&["--local", MANAGED_PULL_KEY, "true"], cx).await?;
-        }
-
-        auto_sync.update(cx, |auto_sync, cx| {
-            auto_sync.set_enabled(id, Some(Trigger::Manual), cx)
-        });
+        enable(id, work_dir, &project, &auto_sync, cx).await?;
         workspace.update(cx, |workspace, cx| {
             workspace.show_toast(
                 Toast::new(
@@ -938,6 +1081,54 @@ fn turn_on(
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
+}
+
+/// Records the opt-in in the repository's git config and starts syncing.
+async fn enable(
+    id: RepositoryId,
+    work_dir: Arc<Path>,
+    project: &Entity<Project>,
+    auto_sync: &Entity<AutoSync>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Result<()> {
+    let git_config = |args: &[&str], cx: &mut gpui::AsyncWindowContext| {
+        let args = args.iter().map(|arg| arg.to_string()).collect();
+        project.read_with(cx, |project, cx| {
+            project.git_config(work_dir.clone(), args, cx)
+        })
+    };
+    git_config(&["--local", ENABLED_KEY, "true"], cx)
+        .await
+        .context("turning on auto sync")?;
+    // A plain `git pull` refuses to reconcile divergent branches unless told
+    // how, and a rebase that stops on a conflict has no UI to finish it, so
+    // syncing merges. A choice already made for this repository is left
+    // alone.
+    if git_config(&["--local", "--get", "pull.rebase"], cx)
+        .await
+        .is_err()
+    {
+        git_config(&["--local", "pull.rebase", "false"], cx).await?;
+        git_config(&["--local", MANAGED_PULL_KEY, "true"], cx).await?;
+    }
+    auto_sync.update(cx, |auto_sync, cx| {
+        auto_sync.set_enabled(id, Some(Trigger::Manual), cx)
+    });
+    Ok(())
+}
+
+/// A first-time setup that fails halfway must say so; a log line alone would
+/// leave the user looking at a menu that did nothing.
+async fn report_connect_failure(
+    result: Result<()>,
+    cx: &mut gpui::AsyncWindowContext,
+) -> Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
+    let detail = format!("{error:#}");
+    log::warn!("connecting to GitHub failed: {detail}");
+    show_info(cx, "Could not finish connecting to GitHub", &detail).await
 }
 
 async fn show_info(cx: &mut gpui::AsyncWindowContext, message: &str, detail: &str) -> Result<()> {
@@ -954,7 +1145,7 @@ fn turn_off(
     _window: &mut Window,
     cx: &mut Context<Workspace>,
 ) {
-    let Some(repository) = active_repository(workspace, cx) else {
+    let Some(repository) = target_repository(workspace, cx) else {
         return;
     };
     let (id, work_dir) = {
@@ -995,7 +1186,7 @@ fn turn_off(
 }
 
 fn sync_now(auto_sync: &Entity<AutoSync>, workspace: &mut Workspace, cx: &mut Context<Workspace>) {
-    let Some(repository) = active_repository(workspace, cx) else {
+    let Some(repository) = target_repository(workspace, cx) else {
         return;
     };
     let id = repository.read(cx).id;
@@ -1331,6 +1522,36 @@ mod tests {
         wait(cx, "resolving the conflict resumes syncing", &|cx| {
             paused(cx).is_none() && remote_file("note.md") == resolved
         });
+    }
+
+    #[test]
+    fn only_github_https_prompts_get_the_token() {
+        assert_eq!(
+            github_credential("Username for 'https://github.com': ", "gho_x"),
+            Some("x-access-token")
+        );
+        assert_eq!(
+            github_credential(
+                "Password for 'https://x-access-token@github.com': ",
+                "gho_x"
+            ),
+            Some("gho_x")
+        );
+        assert_eq!(
+            github_credential("Password for 'https://ada@gitlab.com': ", "gho_x"),
+            None
+        );
+        assert_eq!(
+            github_credential("Username for 'https://github.com.evil.test': ", "gho_x"),
+            None
+        );
+        assert_eq!(
+            github_credential(
+                "Enter passphrase for key '/Users/ada/.ssh/id_ed25519': ",
+                "gho_x"
+            ),
+            None
+        );
     }
 
     #[test]
