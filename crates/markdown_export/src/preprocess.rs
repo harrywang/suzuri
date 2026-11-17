@@ -230,6 +230,7 @@ fn convert_bracket_math(body: &str) -> String {
     }
     let mut output = String::with_capacity(body.len());
     let mut fence: Option<String> = None;
+    let mut indented_code = false;
     let mut paragraph = String::new();
     for line in body.split_inclusive('\n') {
         if let Some(open_fence) = &fence {
@@ -251,6 +252,15 @@ fn convert_bracket_math(body: &str) -> String {
             output.push_str(&convert_paragraph_bracket_math(&std::mem::take(
                 &mut paragraph,
             )));
+            indented_code = false;
+            output.push_str(line);
+            continue;
+        }
+        // An indented code block, like `    sed 's/\(a\)/\1/'`, is code.
+        if paragraph.is_empty() && (line.starts_with("    ") || line.starts_with('\t')) {
+            indented_code = true;
+        }
+        if indented_code {
             output.push_str(line);
             continue;
         }
@@ -263,11 +273,17 @@ fn convert_bracket_math(body: &str) -> String {
 fn convert_paragraph_bracket_math(paragraph: &str) -> String {
     let mut delimiters = Vec::new();
     let mut index = 0;
-    while let Some(offset) = paragraph[index..].find(['`', '\\']) {
+    while let Some(offset) = paragraph[index..].find(['`', '\\', ']']) {
         let at = index + offset;
         let rest = &paragraph[at..];
         if rest.starts_with('`') {
             index = at + code_span_length(rest).unwrap_or(1);
+            continue;
+        }
+        if rest.starts_with(']') {
+            // `Foo_\(bar\)` in a link's destination escapes a URL's
+            // parentheses.
+            index = at + rest.strip_prefix("](").map_or(1, destination_length);
             continue;
         }
         // A backslash escapes the next character, so `\\(` is a backslash
@@ -311,9 +327,15 @@ fn convert_paragraph_bracket_math(paragraph: &str) -> String {
                     }
                 }
             }
-            (Some(_), _) => {}
-            (None, r"\(" | r"\[") => open = Some((at, delimiter)),
-            (None, _) => {}
+            // A mid-line `\[` is an escaped bracket, never an opener.
+            (_, r"\[")
+                if !paragraph[..at]
+                    .rsplit('\n')
+                    .next()
+                    .is_none_or(|line| line.trim().is_empty()) => {}
+            // A second opener means the first was a stray escape.
+            (_, r"\(" | r"\[") => open = Some((at, delimiter)),
+            _ => {}
         }
     }
 
@@ -326,6 +348,27 @@ fn convert_paragraph_bracket_math(paragraph: &str) -> String {
     }
     output.push_str(&paragraph[copied..]);
     output
+}
+
+/// The byte length of `](` plus the link destination after it, through its
+/// closing parenthesis, which may enclose balanced or escaped parentheses.
+/// The whole rest when the destination never closes.
+fn destination_length(destination: &str) -> usize {
+    let mut depth = 0;
+    let mut characters = destination.char_indices();
+    while let Some((index, character)) = characters.next() {
+        match character {
+            '\\' => {
+                characters.next();
+            }
+            '(' => depth += 1,
+            ')' if depth == 0 => return 2 + index + 1,
+            ')' => depth -= 1,
+            '\n' => return 2 + index,
+            _ => {}
+        }
+    }
+    2 + destination.len()
 }
 
 /// The fence a line opens, if it opens one. Returned rather than a bool
@@ -1218,9 +1261,18 @@ mod tests {
             "```\n\\(x\\)\n```\n",
             "open \\( here\n\nclosed \\) there\n",
             "empty \\(  \\) formula\n",
+            "[Foo](https://en.wikipedia.org/wiki/Foo_\\(bar\\)) and ![x](a_\\(b\\).png)\n",
+            "text\n\n    sed 's/\\(a\\)/\\1/'\n",
         ] {
             assert_eq!(run(text), text);
         }
+    }
+
+    #[test]
+    fn stray_bracket_escapes_do_not_swallow_later_math() {
+        assert_eq!(run("a \\[x] then \\(y\\)\n"), "a \\[x] then $y$\n");
+        assert_eq!(run("\\(1) see \\(x\\)\n"), "\\(1) see $x$\n");
+        assert_eq!(run("## Solving \\(ax^2\\)\n"), "## Solving $ax^2$\n");
     }
 
     fn run_in(text: &str, vault: &dyn Vault) -> Preprocessed {

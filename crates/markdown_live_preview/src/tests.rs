@@ -3170,6 +3170,28 @@ async fn test_bracket_inline_math_conceals_and_reveals(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+async fn test_bracket_math_in_headings_and_after_stray_escapes(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+        ## Solving \(ax^2\)
+        a \[x] then \(y\)
+        \(1) see \(z\)
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            Solving ⋯
+            a \[x] then ⋯
+            \(1) see ⋯
+        "}
+    );
+}
+
+#[gpui::test]
 async fn test_bracket_math_hides_no_markdown_inside(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
 
@@ -3268,6 +3290,20 @@ async fn test_escaped_brackets_and_parentheses_stay_text(cx: &mut TestAppContext
             open \( here
 
             closed \) there
+        "}
+    );
+
+    // A link destination escapes its URL's parentheses the same way.
+    cx.set_state(indoc::indoc! {r"
+        plain line
+        see [Foo](https://example.com/Foo_\(bˇar\)) here
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            see [Foo](https://example.com/Foo_\(bar\)) here
         "}
     );
 
@@ -6825,6 +6861,10 @@ fn test_split_cell_math() {
     assert_eq!(describe(r"`\(x\)`"), [r"text(`\(x\)`, false, false)"]);
     assert_eq!(describe(r"\\(x\\)"), [r"text(\\(x\\), false, false)"]);
     assert_eq!(describe(r"\[x\]"), [r"text(\[x\], false, false)"]);
+    assert_eq!(
+        describe(r"\(1) see \(z\)"),
+        [r"text(\(1) see, false, true)", "math(z)"]
+    );
 }
 
 #[gpui::test]

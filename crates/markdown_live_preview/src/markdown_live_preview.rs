@@ -4682,6 +4682,13 @@ fn inline_bracket_math(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
         let Some(close) = close else {
             break;
         };
+        // As in the editor, a later opener means this one was a stray escape.
+        let open = text[open + 2..close]
+            .match_indices(r"\(")
+            .map(|(offset, _)| open + 2 + offset)
+            .filter(|&candidate| is_delimiter(candidate, r"\("))
+            .last()
+            .unwrap_or(open);
         if text[open + 2..close].trim().is_empty() {
             continue;
         }
@@ -8029,6 +8036,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         snapshot: &multibuffer_snapshot,
         prose_regions: Vec::new(),
         code_spans: Vec::new(),
+        heading_regions: Vec::new(),
         last_table_end_row: None,
         references_heading: None,
         inline: Vec::new(),
@@ -8147,6 +8155,8 @@ struct Extraction<'a> {
     /// wikilinks and the like only where they can occur.
     prose_regions: Vec<Range<usize>>,
     code_spans: Vec<Range<usize>>,
+    /// The text of ATX headings, where formulas pair as in a paragraph.
+    heading_regions: Vec<Range<usize>>,
     /// End row of the last table block pushed, for deduplicating table nodes
     /// that fall inside an already-claimed textual table.
     last_table_end_row: Option<u32>,
@@ -8200,7 +8210,9 @@ fn collect_bracket_math_delimiters(
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         match node.kind() {
-            "code_span" | "latex_block" | "html_tag" | "uri_autolink" | "email_autolink" => {}
+            // `Foo_\(bar\)` in a destination escapes a URL's parentheses.
+            "code_span" | "latex_block" | "html_tag" | "uri_autolink" | "email_autolink"
+            | "link_destination" | "link_title" => {}
             "backslash_escape" => {
                 let delimiter = match text.get(node.byte_range()) {
                     Some(r"\(") => BracketMathDelimiter::OpenInline,
@@ -8324,6 +8336,7 @@ impl Extraction<'_> {
         }
         delimiters.sort_by_key(|(range, _)| range.start);
         let mut regions = self.prose_regions.clone();
+        regions.extend(self.heading_regions.iter().cloned());
         regions.sort_by_key(|region| region.start);
         let region_of = |offset: usize| {
             let index = regions.partition_point(|region| region.start <= offset);
@@ -8332,41 +8345,58 @@ impl Extraction<'_> {
                 .filter(|&index| regions[index].end > offset)
         };
 
-        let mut open: Option<(Range<usize>, BracketMathDelimiter, Option<usize>)> = None;
+        let mut open: Option<(Range<usize>, BracketMathDelimiter, usize)> = None;
         for (range, delimiter) in delimiters {
-            let region = region_of(range.start);
-            if let Some((opener, opener_kind, opener_region)) = open.take() {
-                let closes = matches!(
-                    (opener_kind, delimiter),
-                    (
-                        BracketMathDelimiter::OpenInline,
-                        BracketMathDelimiter::CloseInline
-                    ) | (
-                        BracketMathDelimiter::OpenDisplay,
-                        BracketMathDelimiter::CloseDisplay
-                    )
-                );
-                if region == opener_region && region.is_some() {
-                    if closes {
+            let Some(region) = region_of(range.start) else {
+                continue;
+            };
+            if open
+                .as_ref()
+                .is_some_and(|(_, _, opener_region)| *opener_region != region)
+            {
+                open = None;
+            }
+            match delimiter {
+                // A mid-line `\[` is an escaped bracket, never an opener, so
+                // it cannot hold the paragraph's later formulas hostage.
+                BracketMathDelimiter::OpenDisplay if !self.starts_its_line(range.start) => {}
+                // A second opener means the first was a stray escape, as in
+                // `\(1) see \(x\)`; no formula contains its own opener.
+                BracketMathDelimiter::OpenInline | BracketMathDelimiter::OpenDisplay => {
+                    open = Some((range, delimiter, region));
+                }
+                BracketMathDelimiter::CloseInline | BracketMathDelimiter::CloseDisplay => {
+                    let closes = open.as_ref().is_some_and(|(_, opener_kind, _)| {
+                        matches!(
+                            (opener_kind, delimiter),
+                            (
+                                BracketMathDelimiter::OpenInline,
+                                BracketMathDelimiter::CloseInline
+                            ) | (
+                                BracketMathDelimiter::OpenDisplay,
+                                BracketMathDelimiter::CloseDisplay
+                            )
+                        )
+                    });
+                    if closes && let Some((opener, opener_kind, _)) = open.take() {
                         self.claim_bracket_formula(
                             opener,
                             range,
                             opener_kind == BracketMathDelimiter::OpenDisplay,
                         );
-                    } else {
-                        // Inside a formula only its own closer counts.
-                        open = Some((opener, opener_kind, opener_region));
                     }
-                    continue;
                 }
             }
-            if matches!(
-                delimiter,
-                BracketMathDelimiter::OpenInline | BracketMathDelimiter::OpenDisplay
-            ) {
-                open = Some((range, delimiter, region));
-            }
         }
+    }
+
+    fn starts_its_line(&self, offset: usize) -> bool {
+        self.text.get(..offset).is_some_and(|before| {
+            before
+                .rsplit('\n')
+                .next()
+                .is_none_or(|line| line.trim().is_empty())
+        })
     }
 
     fn claim_bracket_formula(&mut self, open: Range<usize>, close: Range<usize>, display: bool) {
@@ -8507,6 +8537,12 @@ impl Extraction<'_> {
         while let Some(node) = stack.pop() {
             match node.kind() {
                 "atx_heading" => {
+                    self.heading_regions.extend(
+                        (0..node.child_count())
+                            .filter_map(|index| node.child(index))
+                            .filter(|child| child.kind() == "inline")
+                            .map(|child| child.byte_range()),
+                    );
                     let (start_row, end_row) = self.node_rows(node);
                     let level = heading_level(node) as u8;
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
