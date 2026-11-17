@@ -1594,11 +1594,18 @@ const MATH_LINE_STYLE_START: usize = 200;
 const MATH_LINE_STYLE_END: usize = 1000;
 const MATH_LINE_MAX_STEPS: usize = MATH_LINE_STYLE_END - MATH_LINE_STYLE_START;
 /// Row heights are rounded up to this fraction of a row, which bounds the
-/// number of keys and keeps a formula from touching the rows around it.
+/// number of keys.
 const MATH_LINE_STEPS_PER_ROW: f32 = 8.0;
+/// Space a formula keeps from the rows around it, split above and below, in
+/// ems of the buffer font.
+/// Without it, a `\frac` just shorter than the line fits by the measure and
+/// still paints edge to edge against its neighbours. Kept below what grows a
+/// row for a plain subscript such as `x_{ij}`, so prose keeps an even pitch.
+const MATH_ROW_CLEARANCE_EM: f32 = 0.1;
 
-/// Grows each row holding a concealed inline formula taller than the line,
-/// such as a matrix, so the formula does not paint over the rows around it.
+/// Grows each row holding a concealed inline formula that, with its
+/// clearance, is taller than the line, such as a fraction or a matrix, so the
+/// formula does not paint over or against the rows around it.
 fn apply_math_line_styles(editor: &mut Editor, cx: &mut Context<Editor>) {
     let Some(addon) = editor.addon::<LivePreviewAddon>() else {
         return;
@@ -1622,7 +1629,7 @@ fn apply_math_line_styles(editor: &mut Editor, cx: &mut Context<Editor>) {
             };
             let layout =
                 InlineMathLayout::new(*baseline_fraction, *width_em, *height_em, font_size, cx);
-            let rows = layout.element_height() / line_height;
+            let rows = (layout.element_height() + font_size * MATH_ROW_CLEARANCE_EM) / line_height;
             if !rows.is_finite() || rows <= 1.0 {
                 continue;
             }

@@ -6731,3 +6731,45 @@ async fn test_table_cell_math_is_rendered(cx: &mut TestAppContext) {
         "the label must follow the formula, got formula={formula:?} label={label:?}"
     );
 }
+
+#[gpui::test]
+async fn test_inline_fraction_row_keeps_clear_of_its_neighbours(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // A text-style fraction measures just under one line, so a row grown only
+    // past the line's height leaves it touching the fraction on the next row.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+        * $\frac{dy}{dx}$: derivative
+        * $\frac{\partial y}{\partial x}$: partial derivative
+        * $\int_a^b f(x) \;dx$: definite integral
+        * $x_{ij}$, $[\mathbf{X}]_{ij}$: an element
+        * $\textrm{Var}(X)$: variance, equal to $\sigma^2_X$
+    "});
+    cx.executor().run_until_parked();
+    let heights = cx.update_editor(|editor, _, cx| {
+        let display = editor.display_snapshot(cx);
+        (0..6)
+            .map(|row| {
+                display
+                    .line_style_for_row(editor::display_map::DisplayRow(row))
+                    .map(|style| style.line_height)
+            })
+            .collect::<Vec<_>>()
+    });
+    assert!(
+        heights[1].is_some_and(|height| height > 1.0) && heights[2] == heights[1],
+        "fraction rows must grow past the line: {heights:?}"
+    );
+    assert!(
+        heights[3]
+            .zip(heights[1])
+            .is_some_and(|(integral, fraction)| integral > fraction),
+        "an integral with limits is taller than a fraction: {heights:?}"
+    );
+    assert_eq!(
+        [heights[0], heights[4], heights[5]],
+        [None, None, None],
+        "subscripts and delimiters keep the base height: {heights:?}"
+    );
+}
