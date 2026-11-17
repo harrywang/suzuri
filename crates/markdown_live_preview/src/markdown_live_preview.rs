@@ -4563,16 +4563,22 @@ enum CellSegment<'a> {
     Math(&'a str),
 }
 
-/// Splits a cell's text around its `$...$` formulas, with the same tight
-/// delimiter rule as the editor's inline math. pulldown-cmark finds them, so
-/// a `$` inside a code span or escaped as `\$` stays text.
+/// Splits a cell's text around its `$...$` and `\(...\)` formulas, with the
+/// same delimiter rules as the editor's inline math. pulldown-cmark finds the
+/// dollar ones, so a `$` inside a code span or escaped as `\$` stays text. A
+/// cell is one line, so `\[...\]` there is never display math.
 fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
     let mut formulas = Vec::new();
+    let mut code = Vec::new();
     let parser = pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::ENABLE_MATH);
     for (event, range) in parser.into_offset_iter() {
         // A cell is one line, so `$$...$$` renders inline there, as it does
         // mid-line in the editor; only single-`$` math needs tight delimiters.
         let source = match event {
+            pulldown_cmark::Event::Code(_) => {
+                code.push(range);
+                continue;
+            }
             pulldown_cmark::Event::InlineMath(source) => {
                 if source.starts_with(char::is_whitespace)
                     || source.ends_with(char::is_whitespace)
@@ -4601,6 +4607,19 @@ fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
             formulas.push((range, source_start..source_end));
         }
     }
+    let taken: Vec<Range<usize>> = code
+        .into_iter()
+        .chain(formulas.iter().map(|(construct, _)| construct.clone()))
+        .collect();
+    for (construct, source) in inline_bracket_math(text) {
+        if !taken
+            .iter()
+            .any(|span| span.start < construct.end && construct.start < span.end)
+        {
+            formulas.push((construct, source));
+        }
+    }
+    formulas.sort_by_key(|(construct, _)| construct.start);
     if formulas.is_empty() {
         return vec![CellSegment::Text {
             text,
@@ -4624,6 +4643,52 @@ fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
         push_cell_text(&mut segments, rest);
     }
     segments
+}
+
+/// The `\(...\)` formulas of one line of text, as (construct, source) byte
+/// ranges. A delimiter's backslash must not itself be escaped, so `\\(` is a
+/// backslash and a parenthesis.
+fn inline_bracket_math(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
+    let is_delimiter = |index: usize, delimiter: &str| {
+        text.get(index..)
+            .is_some_and(|rest| rest.starts_with(delimiter))
+            && text[..index]
+                .bytes()
+                .rev()
+                .take_while(|&byte| byte == b'\\')
+                .count()
+                % 2
+                == 0
+    };
+    let mut formulas = Vec::new();
+    let mut search_from = 0;
+    while let Some(offset) = text.get(search_from..).and_then(|rest| rest.find(r"\(")) {
+        let open = search_from + offset;
+        search_from = open + 2;
+        if !is_delimiter(open, r"\(") {
+            continue;
+        }
+        let mut close_search = open + 2;
+        let close = loop {
+            let Some(offset) = text.get(close_search..).and_then(|rest| rest.find(r"\)")) else {
+                break None;
+            };
+            let candidate = close_search + offset;
+            if is_delimiter(candidate, r"\)") {
+                break Some(candidate);
+            }
+            close_search = candidate + 2;
+        };
+        let Some(close) = close else {
+            break;
+        };
+        if text[open + 2..close].trim().is_empty() {
+            continue;
+        }
+        formulas.push((open..close + 2, open + 2..close));
+        search_from = close + 2;
+    }
+    formulas
 }
 
 /// Pandoc's rule for single-`$` math: a closing `$` followed by a digit is a
@@ -7981,15 +8046,27 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         highlights: Vec::new(),
         tags: Vec::new(),
         code: Vec::new(),
+        bracket_math: Vec::new(),
     };
 
+    let mut inline_roots = Vec::new();
     for layer in buffer_snapshot.syntax_layers() {
-        let root = layer.node();
         match layer.language.name().as_ref() {
-            MARKDOWN => extraction.walk_block_layer(root),
-            MARKDOWN_INLINE => extraction.walk_inline_layer(root),
+            MARKDOWN => extraction.walk_block_layer(layer.node()),
+            MARKDOWN_INLINE => inline_roots.push(layer.node()),
             _ => {}
         }
+    }
+    // `\(...\)` and `\[...\]` are claimed before the inline walk, which then
+    // skips the markdown the grammar finds inside them; it has no math node
+    // for these delimiters, so it parses a formula's `*` and `[` as prose.
+    let mut delimiters = Vec::new();
+    for root in &inline_roots {
+        collect_bracket_math_delimiters(*root, extraction.text, &mut delimiters);
+    }
+    extraction.claim_bracket_math(delimiters);
+    for root in inline_roots {
+        extraction.walk_inline_layer(root);
     }
 
     extraction.scan_wikilinks();
@@ -8065,8 +8142,9 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
 struct Extraction<'a> {
     text: &'a str,
     snapshot: &'a MultiBufferSnapshot,
-    /// Prose regions (the block grammar's `inline` nodes) and code spans,
-    /// used to scan for wikilinks only where they can occur.
+    /// Prose regions (the block grammar's `inline` nodes), and the code spans
+    /// and `\(...\)`/`\[...\]` formulas within them, used to scan for
+    /// wikilinks and the like only where they can occur.
     prose_regions: Vec<Range<usize>>,
     code_spans: Vec<Range<usize>>,
     /// End row of the last table block pushed, for deduplicating table nodes
@@ -8090,6 +8168,52 @@ struct Extraction<'a> {
     /// Inline code content (between the backticks), styled like the
     /// preview's pill: plain text color on a faint background.
     code: Vec<Range<Anchor>>,
+    /// Claimed `\(...\)` and `\[...\]` constructs, delimiters included,
+    /// sorted and disjoint.
+    bracket_math: Vec<Range<usize>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BracketMathDelimiter {
+    OpenInline,
+    CloseInline,
+    OpenDisplay,
+    CloseDisplay,
+}
+
+/// Where a syntax node sits relative to the claimed bracket formulas.
+enum BracketMathOverlap {
+    Clear,
+    Inside,
+    Straddles,
+}
+
+/// Collects the `\(`, `\)`, `\[`, and `\]` escapes of an inline tree, in no
+/// particular order. Working from the tree rather than the text means a
+/// formula's `\\[2pt]` line break is the escape `\\` followed by `[`, not an
+/// opening `\[`, and code spans and `$` math are skipped for free.
+fn collect_bracket_math_delimiters(
+    root: tree_sitter::Node,
+    text: &str,
+    delimiters: &mut Vec<(Range<usize>, BracketMathDelimiter)>,
+) {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "code_span" | "latex_block" | "html_tag" | "uri_autolink" | "email_autolink" => {}
+            "backslash_escape" => {
+                let delimiter = match text.get(node.byte_range()) {
+                    Some(r"\(") => BracketMathDelimiter::OpenInline,
+                    Some(r"\)") => BracketMathDelimiter::CloseInline,
+                    Some(r"\[") => BracketMathDelimiter::OpenDisplay,
+                    Some(r"\]") => BracketMathDelimiter::CloseDisplay,
+                    _ => continue,
+                };
+                delimiters.push((node.byte_range(), delimiter));
+            }
+            _ => push_children(node, &mut stack),
+        }
+    }
 }
 
 impl Extraction<'_> {
@@ -8185,16 +8309,137 @@ impl Extraction<'_> {
         });
     }
 
+    /// Pairs the `\(...\)` and `\[...\]` delimiters within each paragraph and
+    /// claims the formulas, rendering them like `$...$` and `$$...$$`.
+    ///
+    /// In CommonMark these are escaped punctuation, so the claim is narrower
+    /// than for `$`: `\[...\]` is math only when it sits alone on its lines,
+    /// the way LLMs and LaTeX write display math, which leaves the escaped
+    /// brackets of `see \[1\]` (common in Pandoc and Notion output) as text.
+    /// `\(...\)` may sit mid-line, since prose rarely escapes both
+    /// parentheses, and tolerates padding like `$$`.
+    fn claim_bracket_math(&mut self, mut delimiters: Vec<(Range<usize>, BracketMathDelimiter)>) {
+        if delimiters.is_empty() {
+            return;
+        }
+        delimiters.sort_by_key(|(range, _)| range.start);
+        let mut regions = self.prose_regions.clone();
+        regions.sort_by_key(|region| region.start);
+        let region_of = |offset: usize| {
+            let index = regions.partition_point(|region| region.start <= offset);
+            index
+                .checked_sub(1)
+                .filter(|&index| regions[index].end > offset)
+        };
+
+        let mut open: Option<(Range<usize>, BracketMathDelimiter, Option<usize>)> = None;
+        for (range, delimiter) in delimiters {
+            let region = region_of(range.start);
+            if let Some((opener, opener_kind, opener_region)) = open.take() {
+                let closes = matches!(
+                    (opener_kind, delimiter),
+                    (
+                        BracketMathDelimiter::OpenInline,
+                        BracketMathDelimiter::CloseInline
+                    ) | (
+                        BracketMathDelimiter::OpenDisplay,
+                        BracketMathDelimiter::CloseDisplay
+                    )
+                );
+                if region == opener_region && region.is_some() {
+                    if closes {
+                        self.claim_bracket_formula(
+                            opener,
+                            range,
+                            opener_kind == BracketMathDelimiter::OpenDisplay,
+                        );
+                    } else {
+                        // Inside a formula only its own closer counts.
+                        open = Some((opener, opener_kind, opener_region));
+                    }
+                    continue;
+                }
+            }
+            if matches!(
+                delimiter,
+                BracketMathDelimiter::OpenInline | BracketMathDelimiter::OpenDisplay
+            ) {
+                open = Some((range, delimiter, region));
+            }
+        }
+    }
+
+    fn claim_bracket_formula(&mut self, open: Range<usize>, close: Range<usize>, display: bool) {
+        let construct = open.start..close.end;
+        let Some(source) = self.text.get(open.end..close.start) else {
+            return;
+        };
+        if source.trim().is_empty() {
+            return;
+        }
+        if display {
+            if !self.range_is_alone_on_its_lines(construct.clone()) {
+                return;
+            }
+            let start_row = MultiBufferOffset(construct.start)
+                .to_point(self.snapshot)
+                .row;
+            let end_row = MultiBufferOffset(construct.end).to_point(self.snapshot).row;
+            self.push_block_rows(
+                start_row,
+                end_row,
+                (end_row - start_row + 1).max(2),
+                BlockRenderKind::Math {
+                    source: source.to_string(),
+                },
+            );
+        } else {
+            self.inline.push(InlineMarker {
+                range: self.anchor_range(construct.clone()),
+                kind: InlineKind::Math {
+                    source: SharedString::from(source.to_string()),
+                    style: MathStyle::Inline,
+                },
+            });
+        }
+        self.code_spans.push(construct.clone());
+        self.bracket_math.push(construct);
+    }
+
+    fn bracket_math_overlap(&self, range: Range<usize>) -> BracketMathOverlap {
+        let first = self
+            .bracket_math
+            .partition_point(|math| math.end <= range.start);
+        let last = self
+            .bracket_math
+            .partition_point(|math| math.start < range.end);
+        if first >= last {
+            return BracketMathOverlap::Clear;
+        }
+        let (first_math, last_math) = (&self.bracket_math[first], &self.bracket_math[last - 1]);
+        if first + 1 == last && first_math.start <= range.start && range.end <= first_math.end {
+            BracketMathOverlap::Inside
+        } else if first_math.start < range.start || last_math.end > range.end {
+            BracketMathOverlap::Straddles
+        } else {
+            BracketMathOverlap::Clear
+        }
+    }
+
     /// Whether only whitespace shares the node's first and last lines with it.
     fn node_is_alone_on_its_lines(&self, node: tree_sitter::Node) -> bool {
-        let line_start = self.text[..node.start_byte()]
+        self.range_is_alone_on_its_lines(node.byte_range())
+    }
+
+    fn range_is_alone_on_its_lines(&self, range: Range<usize>) -> bool {
+        let line_start = self.text[..range.start]
             .rfind('\n')
             .map_or(0, |index| index + 1);
-        let line_end = self.text[node.end_byte()..]
+        let line_end = self.text[range.end..]
             .find('\n')
-            .map_or(self.text.len(), |index| node.end_byte() + index);
-        let before = self.text.get(line_start..node.start_byte());
-        let after = self.text.get(node.end_byte()..line_end);
+            .map_or(self.text.len(), |index| range.end + index);
+        let before = self.text.get(line_start..range.start);
+        let after = self.text.get(range.end..line_end);
         match (before, after) {
             (Some(before), Some(after)) => {
                 before.chars().all(char::is_whitespace) && after.chars().all(char::is_whitespace)
@@ -8454,6 +8699,16 @@ impl Extraction<'_> {
     fn walk_inline_layer(&mut self, root: tree_sitter::Node) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
+            match self.bracket_math_overlap(node.byte_range()) {
+                BracketMathOverlap::Clear => {}
+                BracketMathOverlap::Inside => continue,
+                // Emphasis the grammar paired across a formula's edge, as in
+                // `\( a*b \) and c*`, is not emphasis the reader wrote.
+                BracketMathOverlap::Straddles => {
+                    push_children(node, &mut stack);
+                    continue;
+                }
+            }
             match node.kind() {
                 "emphasis" | "strong_emphasis" | "strikethrough" => {
                     let range = self.anchor_range(node.byte_range());

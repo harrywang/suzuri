@@ -127,6 +127,7 @@ fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
 }
 
 fn convert_body(body: &str, source_directory: Option<&Path>, state: &mut State) -> String {
+    let body = &convert_bracket_math(body);
     let mut output = String::with_capacity(body.len());
     let mut fence: Option<String> = None;
     let mut after_heading = false;
@@ -210,6 +211,120 @@ fn convert_body(body: &str, source_directory: Option<&Path>, state: &mut State) 
             output.push('\n');
         }
     }
+    output
+}
+
+/// Rewrites the `\(...\)` and `\[...\]` formulas the preview renders as the
+/// `$...$` and `$$...$$` Pandoc reads by default.
+///
+/// Pandoc's `tex_math_single_backslash` would read them directly, but it
+/// takes every `\[` and `\(` for math: the escaped brackets of `see \[1\]`,
+/// which the preview leaves as text, and the escapes this pass writes itself
+/// (`\(1)` for a list lookalike, `\[` in a link label). Rewriting only what
+/// the preview claims leaves every other escape meaning what it says. The
+/// rules are the preview's: delimiters pair within a paragraph, outside code,
+/// and `\[...\]` counts only alone on its lines.
+fn convert_bracket_math(body: &str) -> String {
+    if !body.contains(r"\(") && !body.contains(r"\[") {
+        return body.to_string();
+    }
+    let mut output = String::with_capacity(body.len());
+    let mut fence: Option<String> = None;
+    let mut paragraph = String::new();
+    for line in body.split_inclusive('\n') {
+        if let Some(open_fence) = &fence {
+            if closes_fence(line, open_fence) {
+                fence = None;
+            }
+            output.push_str(line);
+            continue;
+        }
+        if let Some(opened) = opens_fence(line) {
+            output.push_str(&convert_paragraph_bracket_math(&std::mem::take(
+                &mut paragraph,
+            )));
+            fence = Some(opened);
+            output.push_str(line);
+            continue;
+        }
+        if line.trim().is_empty() {
+            output.push_str(&convert_paragraph_bracket_math(&std::mem::take(
+                &mut paragraph,
+            )));
+            output.push_str(line);
+            continue;
+        }
+        paragraph.push_str(line);
+    }
+    output.push_str(&convert_paragraph_bracket_math(&paragraph));
+    output
+}
+
+fn convert_paragraph_bracket_math(paragraph: &str) -> String {
+    let mut delimiters = Vec::new();
+    let mut index = 0;
+    while let Some(offset) = paragraph[index..].find(['`', '\\']) {
+        let at = index + offset;
+        let rest = &paragraph[at..];
+        if rest.starts_with('`') {
+            index = at + code_span_length(rest).unwrap_or(1);
+            continue;
+        }
+        // A backslash escapes the next character, so `\\(` is a backslash
+        // followed by a parenthesis.
+        match rest.get(..2) {
+            Some(delimiter @ (r"\(" | r"\)" | r"\[" | r"\]")) => {
+                delimiters.push((at, delimiter));
+            }
+            _ => {}
+        }
+        index = at + rest.chars().take(2).map(char::len_utf8).sum::<usize>();
+    }
+
+    let mut replacements = Vec::new();
+    let mut open: Option<(usize, &str)> = None;
+    for (at, delimiter) in delimiters {
+        match (open, delimiter) {
+            (Some((start, r"\(")), r"\)") | (Some((start, r"\[")), r"\]") => {
+                open = None;
+                let source = &paragraph[start + 2..at];
+                if source.trim().is_empty() {
+                    continue;
+                }
+                let end = at + 2;
+                if delimiter == r"\)" {
+                    let mut math = format!("${}$", source.trim());
+                    // Pandoc does not close `$` math right before a digit.
+                    if paragraph[end..].starts_with(|character: char| character.is_ascii_digit()) {
+                        math.push_str("<!-- -->");
+                    }
+                    replacements.push((start..end, math));
+                } else {
+                    let line_start = paragraph[..start].rfind('\n').map_or(0, |line| line + 1);
+                    let line_end = paragraph[end..]
+                        .find('\n')
+                        .map_or(paragraph.len(), |line| end + line);
+                    if paragraph[line_start..start].trim().is_empty()
+                        && paragraph[end..line_end].trim().is_empty()
+                    {
+                        replacements.push((start..end, format!("$${source}$$")));
+                    }
+                }
+            }
+            (Some(_), _) => {}
+            (None, r"\(" | r"\[") => open = Some((at, delimiter)),
+            (None, _) => {}
+        }
+    }
+
+    let mut output = String::with_capacity(paragraph.len());
+    let mut copied = 0;
+    for (range, replacement) in replacements {
+        output.push_str(&paragraph[copied..range.start]);
+        output.push_str(&replacement);
+        copied = range.end;
+    }
+    output.push_str(&paragraph[copied..]);
     output
 }
 
@@ -1076,6 +1191,36 @@ mod tests {
 
     fn run(text: &str) -> String {
         preprocess(text, None, &EmptyVault, &HashSet::new()).text
+    }
+
+    #[test]
+    fn bracket_math_becomes_dollar_math() {
+        assert_eq!(
+            run("energy \\(E = mc^2\\) here\n"),
+            "energy $E = mc^2$ here\n"
+        );
+        // Pandoc's `$` must hug its formula.
+        assert_eq!(run("padded \\( a + b \\) too\n"), "padded $a + b$ too\n");
+        // And must not close right before a digit.
+        assert_eq!(run("pay \\(x\\)5\n"), "pay $x$<!-- -->5\n");
+        assert_eq!(run("\\[\na = b\n\\]\n"), "$$\na = b\n$$\n");
+        assert_eq!(run("text\n\n  \\[ a = b \\]\n"), "text\n\n  $$ a = b $$\n");
+        // A `\\[2pt]` line break is an escaped backslash, not a delimiter.
+        assert_eq!(run("\\[\na \\\\[2pt] b\n\\]\n"), "$$\na \\\\[2pt] b\n$$\n");
+    }
+
+    #[test]
+    fn escapes_the_preview_shows_as_text_stay_escapes() {
+        for text in [
+            "see \\[1\\] and \\[citation needed\\]\n",
+            "a \\\\(x\\\\) b\n",
+            "write `\\(x\\)` for math\n",
+            "```\n\\(x\\)\n```\n",
+            "open \\( here\n\nclosed \\) there\n",
+            "empty \\(  \\) formula\n",
+        ] {
+            assert_eq!(run(text), text);
+        }
     }
 
     fn run_in(text: &str, vault: &dyn Vault) -> Preprocessed {

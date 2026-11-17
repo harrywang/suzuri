@@ -673,7 +673,8 @@ mod tests {
             "See [[Other Note|the companion]] for context.\n\n",
             "> [!warning] Mind the gap\n> Results are preliminary.\n\n",
             "![[Method]]\n\n",
-            "Inline math $E = mc^2$ and a fence:\n\n",
+            "Inline math $E = mc^2$, LLM-style \\( a^2 \\), escaped \\[1\\], and\n\n",
+            "\\[\nb^2\n\\]\n\nthen a fence:\n\n",
             "```rust\nlet unchanged = \"[[not a link]]\";\n```\n",
         );
 
@@ -733,6 +734,19 @@ mod tests {
             "the transclusion was not spliced: {rendered}"
         );
         assert!(rendered.contains("Knuth"), "bibliography: {rendered}");
+        assert_eq!(
+            rendered.matches("class=\"math inline\"").count(),
+            2,
+            "`$...$` and `\\(...\\)` math: {rendered}"
+        );
+        assert!(
+            rendered.contains("class=\"math display\""),
+            "`\\[...\\]` display math: {rendered}"
+        );
+        assert!(
+            rendered.contains("escaped [1], and"),
+            "escaped brackets mid-line are text: {rendered}"
+        );
         assert!(
             rendered.contains("[[not a link]]"),
             "the fenced code was rewritten: {rendered}"
