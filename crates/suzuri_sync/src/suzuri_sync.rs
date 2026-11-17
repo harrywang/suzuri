@@ -417,7 +417,7 @@ impl AutoSync {
                         state.failures += 1;
                         if state.failures >= MAX_FAILURES {
                             state.paused = Some(Pause::Stopped);
-                            let detail = message.lines().next().unwrap_or_default();
+                            let detail = error_summary(&message);
                             self.notify(
                                 id,
                                 format!("Auto sync stopped: {detail}"),
@@ -740,6 +740,24 @@ fn commit_message(changes: &[PathBuf]) -> String {
         [path] => format!("Update {}", path.display()),
         _ => format!("Update {} files", changes.len()),
     }
+}
+
+/// The line of git's output that says what went wrong. Git reports progress
+/// on stderr too ("From ../remote", "To github.com:…"), so the first line is
+/// often not it.
+fn error_summary(message: &str) -> &str {
+    let lines = || {
+        message
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+    };
+    lines()
+        .find(|line| {
+            line.starts_with("fatal:") || line.starts_with("error:") || line.starts_with("! [")
+        })
+        .or_else(|| lines().next_back())
+        .unwrap_or("git failed")
 }
 
 fn classify_failure(message: &str) -> Failure {
@@ -1313,6 +1331,24 @@ mod tests {
         wait(cx, "resolving the conflict resumes syncing", &|cx| {
             paused(cx).is_none() && remote_file("note.md") == resolved
         });
+    }
+
+    #[test]
+    fn error_summary_skips_progress_lines() {
+        assert_eq!(
+            error_summary(
+                "From ../remote\n * branch main -> FETCH_HEAD\nerror: Your local changes to the following files would be overwritten by merge:\n\tnote.md\n"
+            ),
+            "error: Your local changes to the following files would be overwritten by merge:"
+        );
+        assert_eq!(
+            error_summary(
+                "To github.com:x/y.git\n ! [rejected]        main -> main (fetch first)\nerror: failed to push some refs\n"
+            ),
+            "! [rejected]        main -> main (fetch first)"
+        );
+        assert_eq!(error_summary("something odd\n\n"), "something odd");
+        assert_eq!(error_summary(""), "git failed");
     }
 
     #[test]
