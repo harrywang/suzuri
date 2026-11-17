@@ -266,16 +266,35 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                     }
                     addon.selected_cells = None;
                 }
+                let mouse_released = editor.selections.pending_anchor().is_none();
+                if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
+                    && addon.focus_awaits_mouse_up
+                    && mouse_released
+                {
+                    addon.focus_awaits_mouse_up = false;
+                    addon.focused = true;
+                }
                 apply_decorations(editor, cx);
             }
             EditorEvent::Focused | EditorEvent::Blurred => {
                 let focused = matches!(event, EditorEvent::Focused);
+                // A click focuses the editor with the button still down.
+                // Revealing then would move the text out from under the
+                // pointer, and the slightest drag would select up to wherever
+                // it had moved, so the reveal waits for the button's release.
+                let mouse_down = editor.selections.pending_anchor().is_some();
                 if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
                     && addon.reveal_requires_focus
-                    && addon.focused != focused
                 {
-                    addon.focused = focused;
-                    apply_decorations(editor, cx);
+                    if focused && mouse_down {
+                        addon.focus_awaits_mouse_up = true;
+                    } else {
+                        addon.focus_awaits_mouse_up = false;
+                        if addon.focused != focused {
+                            addon.focused = focused;
+                            apply_decorations(editor, cx);
+                        }
+                    }
                 }
             }
             _ => {}
@@ -643,6 +662,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         math_line_styles: BTreeMap::new(),
         reveal_requires_focus: false,
         focused: false,
+        focus_awaits_mouse_up: false,
         _subscriptions: subscriptions,
     });
 
@@ -717,6 +737,9 @@ struct LivePreviewAddon {
     /// Tracked from the editor's focus events, and only while
     /// `reveal_requires_focus` is set.
     focused: bool,
+    /// The editor took focus from a mouse press that has not been released,
+    /// so `focused` is still to be set.
+    focus_awaits_mouse_up: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1892,11 +1915,26 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             })
             .collect();
         taken.sort_by_key(|range| range.start);
+        // A paragraph can hold lines a widget stands in for (display math
+        // written without blank lines around it, an image on its own line),
+        // and those keep their rows.
+        let block_rows: Vec<Range<u32>> = markers
+            .blocks
+            .iter()
+            .map(|block| {
+                block.range.start.to_point(&snapshot).row..block.range.end.to_point(&snapshot).row
+            })
+            .collect();
         for soft_break in &markers.soft_breaks {
             let start = soft_break.start.to_offset(&snapshot).0;
             let end = soft_break.end.to_offset(&snapshot).0;
             let index = taken.partition_point(|range| range.end <= start);
             if start >= end || taken.get(index).is_some_and(|range| range.start < end) {
+                continue;
+            }
+            let start_row = soft_break.start.to_point(&snapshot).row;
+            let end_row = soft_break.end.to_point(&snapshot).row;
+            if rows_intersect(&block_rows, start_row, end_row) {
                 continue;
             }
             concealments.push(Concealment {

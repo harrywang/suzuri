@@ -4201,6 +4201,12 @@ fn run_notebook_markdown_cell_visual_tests(
                     "\n",
                     "$$E(S) = \\sum_{i=1}^{c} -p_i \\log_2 p_i$$\n",
                     "\n",
+                    "A formula written inside a paragraph keeps its own row:\n",
+                    "$$\n",
+                    "Gain(T, X) = E(T) - E(T, X)\n",
+                    "$$\n",
+                    "and the text after it starts a new line.\n",
+                    "\n",
                     "| Outlook | Play |\n",
                     "| --- | --- |\n",
                     "| sunny | **no** |\n",
@@ -4305,8 +4311,8 @@ fn run_notebook_markdown_cell_visual_tests(
         cx.run_until_parked();
     };
 
-    let (first_cell_x, first_cell_y, code_cell_x, code_cell_y) = notebook_click_points();
-    click(cx, first_cell_x, first_cell_y);
+    // In window points: the first markdown cell's heading, then the code cell.
+    click(cx, 200.0, 110.0);
     results.push(run_visual_test(
         "notebook_markdown_cells_editing",
         workspace_window.into(),
@@ -4314,7 +4320,7 @@ fn run_notebook_markdown_cell_visual_tests(
         update_baseline,
     )?);
 
-    click(cx, code_cell_x, code_cell_y);
+    click(cx, 200.0, 296.0);
     results.push(run_visual_test(
         "notebook_markdown_cells_rendered_again",
         workspace_window.into(),
@@ -4345,25 +4351,6 @@ fn run_notebook_markdown_cell_visual_tests(
         .into_iter()
         .find(|result| matches!(result, TestResult::BaselineUpdated(_)))
         .unwrap_or(TestResult::Passed))
-}
-
-/// Where the notebook test clicks, in window points: inside the first
-/// markdown cell's heading, then inside the code cell. Overridable so the
-/// points can be re-found after a layout change without recompiling.
-#[cfg(target_os = "macos")]
-fn notebook_click_points() -> (f32, f32, f32, f32) {
-    let parse = |name: &str, default: f32| {
-        std::env::var(name)
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(default)
-    };
-    (
-        parse("NOTEBOOK_MARKDOWN_CLICK_X", 200.0),
-        parse("NOTEBOOK_MARKDOWN_CLICK_Y", 110.0),
-        parse("NOTEBOOK_CODE_CLICK_X", 200.0),
-        parse("NOTEBOOK_CODE_CLICK_Y", 296.0),
-    )
 }
 
 #[cfg(target_os = "macos")]
