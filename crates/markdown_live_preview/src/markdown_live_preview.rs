@@ -2089,12 +2089,12 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
                     .iter()
                     .map(|row| row.iter().map(|range| cell_pieces(range, cx)).collect())
                     .collect();
-                let column_weights = table_column_weights(structure, &snapshot);
+                let column_metrics = table_column_metrics(structure, &snapshot);
                 render_table_block(
                     structure.clone(),
                     header_markdown,
                     rows_markdown,
-                    column_weights,
+                    column_metrics,
                     weak_editor.clone(),
                     marker.range.clone(),
                     marker.indent_columns,
@@ -3640,7 +3640,27 @@ fn wikilink_display_text(text: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-fn table_column_weights(structure: &TableStructure, snapshot: &MultiBufferSnapshot) -> Vec<f32> {
+/// A table column's size in characters of the buffer font.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TableColumnMetrics {
+    /// The width the column takes when the table fits the editor: its longest
+    /// cell, capped so one long cell cannot claim the whole row.
+    natural: f32,
+    /// The narrowest the column can get without breaking a word: its longest
+    /// run of characters with no line-break opportunity.
+    minimum: f32,
+    /// The uncapped length of its longest cell, which decides how much of the
+    /// spare width the column gets when the table has to shrink.
+    length: f32,
+}
+
+const MIN_TABLE_COLUMN_CHARACTERS: f32 = 3.;
+const MAX_TABLE_COLUMN_CHARACTERS: f32 = 60.;
+
+fn table_column_metrics(
+    structure: &TableStructure,
+    snapshot: &MultiBufferSnapshot,
+) -> Vec<TableColumnMetrics> {
     let columns = structure.header.len().max(
         structure
             .rows
@@ -3649,17 +3669,29 @@ fn table_column_weights(structure: &TableStructure, snapshot: &MultiBufferSnapsh
             .max()
             .unwrap_or(0),
     );
-    let mut weights = vec![3.0_f32; columns];
+    let mut metrics = vec![
+        TableColumnMetrics {
+            natural: MIN_TABLE_COLUMN_CHARACTERS,
+            minimum: MIN_TABLE_COLUMN_CHARACTERS,
+            length: MIN_TABLE_COLUMN_CHARACTERS,
+        };
+        columns
+    ];
     let mut measure = |cells: &[Range<Anchor>]| {
         for (index, range) in cells.iter().enumerate() {
             let start = range.start.to_offset(snapshot);
             let end = range.end.to_offset(snapshot);
-            let length: usize = snapshot
-                .text_for_range(start..end)
-                .map(|chunk| chunk.trim().chars().count())
-                .sum();
-            if let Some(weight) = weights.get_mut(index) {
-                *weight = weight.max((length as f32).clamp(3., 60.));
+            let text: String = snapshot.text_for_range(start..end).collect();
+            let length = text.trim().chars().count() as f32;
+            let longest_word = longest_unbreakable_run(&text) as f32;
+            if let Some(column) = metrics.get_mut(index) {
+                column.length = column.length.max(length);
+                column.natural = column
+                    .natural
+                    .max(length.clamp(MIN_TABLE_COLUMN_CHARACTERS, MAX_TABLE_COLUMN_CHARACTERS));
+                column.minimum = column.minimum.max(
+                    longest_word.clamp(MIN_TABLE_COLUMN_CHARACTERS, MAX_TABLE_COLUMN_CHARACTERS),
+                );
             }
         }
     };
@@ -3667,7 +3699,92 @@ fn table_column_weights(structure: &TableStructure, snapshot: &MultiBufferSnapsh
     for row in &structure.rows {
         measure(row);
     }
-    weights
+    metrics
+}
+
+/// The length in characters of the longest stretch of `text` that cannot wrap.
+///
+/// Uses the segmenter GPUI's line wrapper breaks lines with, so a column this
+/// wide is the narrowest that wraps without splitting a word. Whitespace alone
+/// would not do: text without spaces, such as Chinese, breaks between
+/// characters, and would otherwise count as one word that pins its column.
+fn longest_unbreakable_run(text: &str) -> usize {
+    let mut longest = 0;
+    let mut run_start = 0;
+    for run_end in icu_segmenter::LineSegmenter::new_for_non_complex_scripts(Default::default())
+        .segment_str(text)
+    {
+        if let Some(run) = text.get(run_start..run_end) {
+            longest = longest.max(run.trim().chars().count());
+        }
+        run_start = run_end;
+    }
+    longest
+}
+
+/// Column widths for a table that has `available` width to lay out in.
+///
+/// A table that fits keeps every column at its natural width. One that does
+/// not is shrunk the way a browser shrinks it: each column keeps its longest
+/// word, and the width left over goes to the columns in proportion to how
+/// much text they hold, so all of them wrap instead of only the ones over the
+/// natural cap. Only when the longest words alone do not fit does the table
+/// stay wider than `available`, for its container to scroll.
+fn fit_table_column_widths(
+    metrics: &[TableColumnMetrics],
+    available: gpui::Pixels,
+    column_width: impl Fn(f32) -> gpui::Pixels,
+) -> Vec<gpui::Pixels> {
+    let natural: Vec<gpui::Pixels> = metrics
+        .iter()
+        .map(|column| column_width(column.natural))
+        .collect();
+    let natural_total = natural
+        .iter()
+        .fold(gpui::px(0.), |total, width| total + *width);
+    if natural_total <= available {
+        return natural;
+    }
+    let mut widths: Vec<gpui::Pixels> = metrics
+        .iter()
+        .map(|column| column_width(column.minimum))
+        .collect();
+    let minimum_total = widths
+        .iter()
+        .fold(gpui::px(0.), |total, width| total + *width);
+    if minimum_total >= available {
+        return widths;
+    }
+
+    let mut spare = available - minimum_total;
+    let mut growing: Vec<usize> = (0..metrics.len())
+        .filter(|&index| natural[index] > widths[index])
+        .collect();
+    // A column never grows past its natural width, so one whose share would
+    // take it there is settled at that width and the rest is shared again.
+    while !growing.is_empty() {
+        let share = |index: usize| (metrics[index].length - metrics[index].minimum).max(1.);
+        let total_share: f32 = growing.iter().map(|&index| share(index)).sum();
+        let settled: Vec<usize> = growing
+            .iter()
+            .copied()
+            .filter(|&index| widths[index] + spare * (share(index) / total_share) >= natural[index])
+            .collect();
+        if settled.is_empty() {
+            for &index in &growing {
+                // Rounded down so the columns never add up to a fraction more
+                // than `available`, which would leave the table scrollable.
+                widths[index] = (widths[index] + spare * (share(index) / total_share)).floor();
+            }
+            break;
+        }
+        for &index in &settled {
+            spare -= natural[index] - widths[index];
+            widths[index] = natural[index];
+        }
+        growing.retain(|index| !settled.contains(index));
+    }
+    widths
 }
 
 /// Starts editing a table cell: mounts a focused single-line editor over it,
@@ -4834,7 +4951,7 @@ fn render_table_block(
     structure: TableStructure,
     header_markdown: Vec<Vec<CellPiece>>,
     rows_markdown: Vec<Vec<Vec<CellPiece>>>,
-    column_weights: Vec<f32>,
+    column_metrics: Vec<TableColumnMetrics>,
     editor: WeakEntity<Editor>,
     table_range: Range<Anchor>,
     indent_columns: u32,
@@ -4962,14 +5079,17 @@ fn render_table_block(
         // `px_2` on both sides, plus the cell border and rounding slack.
         let cell_padding = block_cx.window.rem_size() + gpui::px(6.);
         let column_width =
-            move |weight: f32| (character_width * weight + cell_padding).max(gpui::px(48.));
+            move |characters: f32| (character_width * characters + cell_padding).max(gpui::px(48.));
         let handle_width = gpui::px(14.);
         // The grid needs its explicit content width: fixed-width cells only
         // overflow their rows visually, so without it the scroll container
         // measures no overflow and refuses to scroll.
-        let grid_width = column_weights
+        let column_widths =
+            fit_table_column_widths(&column_metrics, grid_max_width - handle_width, column_width);
+        let fallback_column_width = column_width(8.);
+        let grid_width = column_widths
             .iter()
-            .fold(handle_width, |total, weight| total + column_width(*weight));
+            .fold(handle_width, |total, width| total + *width);
 
         let render_cell = |cell_range: &Range<Anchor>,
                            pieces: &[CellPiece],
@@ -5016,7 +5136,10 @@ fn render_table_block(
                 }
                 _ => None,
             };
-            let weight = column_weights.get(column).copied().unwrap_or(8.);
+            let width = column_widths
+                .get(column)
+                .copied()
+                .unwrap_or(fallback_column_width);
             let is_active = match (&resolved, &active_range) {
                 (Some(snapshot), Some(active)) => {
                     let start = cell_range.start.to_offset(snapshot).0;
@@ -5042,7 +5165,7 @@ fn render_table_block(
                     )
                 })
                 .flex_none()
-                .w(column_width(weight))
+                .w(width)
                 .px_2()
                 .py_1()
                 .min_h(block_cx.line_height + gpui::px(10.))
@@ -5261,13 +5384,16 @@ fn render_table_block(
         // Column handles.
         grid = grid.child(h_flex().child(div().w(handle_width)).children(
             structure.header.iter().enumerate().map(|(column, _)| {
-                let weight = column_weights.get(column).copied().unwrap_or(8.);
+                let width = column_widths
+                    .get(column)
+                    .copied()
+                    .unwrap_or(fallback_column_width);
                 let selected = selected_unit == Some(TableUnit::Column(column));
                 div()
                     .id(("mdlp-column-handle", column))
                     .debug_selector(|| format!("mdlp-column-handle-{column}"))
                     .flex_none()
-                    .w(column_width(weight))
+                    .w(width)
                     .h(gpui::px(10.))
                     .px_2()
                     .cursor_pointer()

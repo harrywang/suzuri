@@ -21,6 +21,7 @@ editor.workspace = true
 futures.workspace = true
 fuzzy.workspace = true
 gpui.workspace = true
+icu_segmenter.workspace = true
 log.workspace = true
 language.workspace = true
 markdown.workspace = true

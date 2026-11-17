@@ -5686,7 +5686,9 @@ async fn test_table_columns_fit_their_widest_cell(cx: &mut TestAppContext) {
 #[gpui::test]
 async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
-    let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
+    // Underscores, not hyphens: a line can break after a hyphen, and columns
+    // that can wrap shrink to fit instead of scrolling.
+    let long = "a_fairly_long_piece_of_cell_content_that_goes_on_and_on_for_a_while";
     let header: String = (0..7).map(|i| format!("| Column {i} ")).collect::<String>() + "|";
     let separator = "| --- ".repeat(7) + "|";
     let row: String = (0..7).map(|_| format!("| {long} ")).collect::<String>() + "|";
@@ -5745,9 +5747,169 @@ async fn test_wide_table_scrolls_horizontally_in_place(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+async fn test_table_wider_than_the_editor_wraps_every_column(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.cx
+        .simulate_resize(gpui::size(gpui::px(900.), gpui::px(1080.)));
+    // The table from #177: two columns just under the natural width cap and
+    // one over it, which used to be the only one that wrapped.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+
+        | xxxxxxxx | xxxxxxx | xxxxxxx |
+        | --- | --- | --- |
+        | **xxxxxxxxxxxx xxxxxxxxx xxxxxxxxxxxx xxxxxxxxx** | ssssssssssssss sssssssssssssss ssssssssssssssssss. | xxxxxxxxx xxxxxxxxxx xxxxxxxxxx xxxxxxxxxxxxxxx (  $\delta_{\text{xxx}}$ xx xxxx par $y_{\text{xxx}}$) xxxxxxxxxx xxxxxxxxx xxxxxxxxxxxxxs. |
+        | **ssssssssss xxxxxxxxxx yyyyyyyyy yyyyyy yyyyyyy** | ssssss xxxxxxxxxxx  cxxxxxxxx  xxxxxxxxxxxx. | xxxxxxxxxx s *xxxxxx* xxx  xxx xxxx xxxxxxxx  xxxx  xx  xxxxxxx  *xxxxx* (xxxxx de $\delta_{\text{xxxxx}}$ xx xxxxxxxxxx xxx $k_{\text{xxxxx}}$) xxxx xxxxxx xxxxxx xxxxx xx xxxxxx. |
+    "});
+    cx.executor().run_until_parked();
+
+    let (window_width, advance) = cx.update_editor(|_, window, cx| {
+        let settings = theme_settings::ThemeSettings::get_global(cx);
+        let font_id = window.text_system().resolve_font(&settings.buffer_font);
+        let advance = window
+            .text_system()
+            .ch_advance(font_id, settings.buffer_font_size(cx))
+            .expect("buffer font has a '0' glyph");
+        (window.bounds().size.width, advance)
+    });
+    let natural_characters = 50. + 51. + 60.;
+    assert!(
+        advance * natural_characters > window_width,
+        "the table must be wider than the window at its natural widths for this test to mean \
+         anything: {:?} vs {window_width:?}",
+        advance * natural_characters
+    );
+
+    let bounds = |cx: &mut EditorTestContext, selector: &'static str| {
+        cx.cx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("{selector} rendered"))
+    };
+    let container = bounds(&mut cx, "mdlp-table-scroll");
+    let last_header = bounds(&mut cx, "mdlp-cell-h-2");
+    assert!(
+        last_header.right() <= container.right(),
+        "the columns must shrink to fit instead of overflowing: {last_header:?} in {container:?}"
+    );
+    assert!(
+        container.right() <= window_width,
+        "the table must stay within the window: {container:?}"
+    );
+
+    // The leading columns are the ones that used to keep their full width.
+    for (selector, characters) in [("mdlp-cell-0-0", 50.), ("mdlp-cell-0-1", 51.)] {
+        let cell = bounds(&mut cx, selector);
+        assert!(
+            cell.size.width < advance * characters,
+            "{selector} must be too narrow for its content on one line, so it wraps: {:?} vs {:?}",
+            cell.size.width,
+            advance * characters
+        );
+    }
+    let first = bounds(&mut cx, "mdlp-cell-0-0").size.width;
+    let last = bounds(&mut cx, "mdlp-cell-0-2").size.width;
+    assert!(
+        last > first,
+        "the column holding the most text gets the most width: {last:?} vs {first:?}"
+    );
+
+    // The fit follows the editor's width while the table is on screen.
+    cx.cx
+        .simulate_resize(gpui::size(gpui::px(1920.), gpui::px(1080.)));
+    cx.executor().run_until_parked();
+    for (selector, characters) in [("mdlp-cell-0-0", 50.), ("mdlp-cell-0-1", 51.)] {
+        let cell = bounds(&mut cx, selector);
+        assert!(
+            cell.size.width >= advance * characters,
+            "{selector} returns to its natural width once the table fits: {:?}",
+            cell.size.width
+        );
+    }
+
+    cx.cx
+        .simulate_resize(gpui::size(gpui::px(760.), gpui::px(1080.)));
+    cx.executor().run_until_parked();
+    let container = bounds(&mut cx, "mdlp-table-scroll");
+    let last_header = bounds(&mut cx, "mdlp-cell-h-2");
+    assert!(
+        last_header.right() <= container.right() && container.right() <= gpui::px(760.),
+        "the columns shrink again when the editor narrows: {last_header:?} in {container:?}"
+    );
+}
+
+#[test]
+fn test_longest_unbreakable_run() {
+    assert_eq!(longest_unbreakable_run("a few short words"), 5);
+    assert_eq!(longest_unbreakable_run(""), 0);
+    assert_eq!(
+        longest_unbreakable_run("snake_case_identifier stays whole"),
+        21
+    );
+    // Text without spaces still wraps, between characters, so it must not
+    // count as one long word.
+    assert!(longest_unbreakable_run("研究写作环境的表格列宽应当自动适应编辑器的宽度") <= 2);
+}
+
+#[test]
+fn test_fit_table_column_widths() {
+    let column = |natural: f32, minimum: f32, length: f32| TableColumnMetrics {
+        natural,
+        minimum,
+        length,
+    };
+    let column_width = |characters: f32| gpui::px(characters * 10.);
+    let total = |widths: &[gpui::Pixels]| {
+        widths
+            .iter()
+            .fold(gpui::px(0.), |total, width| total + *width)
+    };
+    let metrics = [
+        column(50., 12., 50.),
+        column(8., 8., 8.),
+        column(60., 15., 180.),
+    ];
+
+    assert_eq!(
+        fit_table_column_widths(&metrics, gpui::px(1180.), column_width),
+        [gpui::px(500.), gpui::px(80.), gpui::px(600.)],
+        "a table that fits keeps its natural widths"
+    );
+
+    let fitted = fit_table_column_widths(&metrics, gpui::px(700.), column_width);
+    assert!(
+        total(&fitted) <= gpui::px(700.) && total(&fitted) > gpui::px(697.),
+        "a table that does not fit fills the available width: {fitted:?}"
+    );
+    assert_eq!(fitted[1], gpui::px(80.), "a one-word column cannot shrink");
+    assert!(
+        fitted[0] > gpui::px(120.) && fitted[2] > gpui::px(150.),
+        "no column drops below its longest word: {fitted:?}"
+    );
+    assert!(
+        fitted[2] > fitted[0],
+        "the column with more text gets more of the spare width: {fitted:?}"
+    );
+
+    // The long column's share alone would take it past its natural width, so
+    // it stops there and the first column gets the rest.
+    assert_eq!(
+        fit_table_column_widths(&metrics, gpui::px(1100.), column_width),
+        [gpui::px(420.), gpui::px(80.), gpui::px(600.)]
+    );
+
+    assert_eq!(
+        fit_table_column_widths(&metrics, gpui::px(300.), column_width),
+        [gpui::px(120.), gpui::px(80.), gpui::px(150.)],
+        "when even the longest words do not fit, the table keeps them whole and overflows"
+    );
+}
+
+#[gpui::test]
 async fn test_vertical_wheel_over_wide_table_scrolls_the_document(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
-    let long = "a-fairly-long-piece-of-cell-content-that-goes-on-and-on-for-a-while";
+    // Underscores, not hyphens: a line can break after a hyphen, and columns
+    // that can wrap shrink to fit instead of scrolling.
+    let long = "a_fairly_long_piece_of_cell_content_that_goes_on_and_on_for_a_while";
     let header: String = (0..7).map(|i| format!("| Column {i} ")).collect::<String>() + "|";
     let separator = "| --- ".repeat(7) + "|";
     let row: String = (0..7).map(|_| format!("| {long} ")).collect::<String>() + "|";
