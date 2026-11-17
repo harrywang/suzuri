@@ -18167,6 +18167,8 @@ dependencies = [
  "gpui",
  "log",
  "project",
+ "settings",
+ "tempfile",
  "util",
  "workspace",
 ]

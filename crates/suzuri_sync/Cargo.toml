@@ -24,3 +24,10 @@ log.workspace = true
 project.workspace = true
 util.workspace = true
 workspace.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }

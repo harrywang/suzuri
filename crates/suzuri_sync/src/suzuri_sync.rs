@@ -43,6 +43,7 @@ actions!(
 const CHANGE_DELAY: Duration = Duration::from_secs(5);
 const PULL_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+const CONFLICT_RECHECK_DELAY: Duration = Duration::from_secs(10);
 /// Failures in a row, other than being offline, before syncing stops and asks
 /// for help instead of retrying forever.
 const MAX_FAILURES: u32 = 3;
@@ -235,23 +236,28 @@ impl AutoSync {
                 // the common case of a repository that never opted in.
                 let enabled = read.await.is_ok_and(|value| value.trim() == "true");
                 if enabled {
-                    this.update(cx, |this, cx| this.set_enabled(id, true, cx))
-                        .ok();
+                    // Quiet on purpose: restoring a session should neither
+                    // toast "Synced" nor complain before the first scan.
+                    this.update(cx, |this, cx| {
+                        this.set_enabled(id, Some(Trigger::Timer), cx)
+                    })
+                    .ok();
                 }
             })
             .detach();
         }
     }
 
-    fn set_enabled(&mut self, id: RepositoryId, enabled: bool, cx: &mut Context<Self>) {
+    /// `first` is the trigger of the sync that starts right away, or `None`
+    /// to turn syncing off.
+    fn set_enabled(&mut self, id: RepositoryId, first: Option<Trigger>, cx: &mut Context<Self>) {
         let Some(state) = self.repositories.get_mut(&id) else {
             return;
         };
         *state = RepositorySync::default();
-        if !enabled {
-            self.dismiss(id, cx);
+        let Some(first) = first else {
             return;
-        }
+        };
         state.enabled = true;
         state.pull_timer = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -266,7 +272,12 @@ impl AutoSync {
                 }
             }
         }));
-        self.request(id, Trigger::Manual, Duration::ZERO, cx);
+        let delay = if first == Trigger::Manual {
+            Duration::ZERO
+        } else {
+            CHANGE_DELAY
+        };
+        self.request(id, first, delay, cx);
     }
 
     fn request(
@@ -355,10 +366,17 @@ impl AutoSync {
                 // lets the next change sync.
             }
             Err(Problem::Blocked(Blocker::Conflicts(paths))) => {
+                // Removing the markers from a file git still reports as
+                // unmerged changes no git status, so no event says the
+                // conflict is resolved; look again shortly instead.
+                state.pending = Some(state.pending.unwrap_or(Trigger::Timer));
                 if state.paused != Some(Pause::Conflict) {
                     state.paused = Some(Pause::Conflict);
                     self.notify_conflicts(id, paths, cx);
                 }
+            }
+            Err(Problem::Blocked(Blocker::NoBranch)) if trigger != Trigger::Manual => {
+                // Also what a repository looks like before its first scan.
             }
             Err(Problem::Blocked(blocker)) => {
                 state.paused = Some(Pause::Stopped);
@@ -419,7 +437,9 @@ impl AutoSync {
             return;
         };
         if let Some(pending) = state.pending {
-            let delay = if state.failures > 0 {
+            let delay = if state.paused == Some(Pause::Conflict) {
+                CONFLICT_RECHECK_DELAY
+            } else if state.failures > 0 {
                 RETRY_DELAY
             } else {
                 CHANGE_DELAY
@@ -733,6 +753,8 @@ fn classify_failure(message: &str) -> Failure {
         "returned error: 401",
         "returned error: 403",
         "terminal prompts disabled",
+        // What a declined background credential prompt ends with.
+        "operation cancelled by user",
     ]) {
         Failure::Auth
     } else if mentions(&[
@@ -882,7 +904,9 @@ fn turn_on(
             git_config(&["--local", MANAGED_PULL_KEY, "true"], cx).await?;
         }
 
-        auto_sync.update(cx, |auto_sync, cx| auto_sync.set_enabled(id, true, cx));
+        auto_sync.update(cx, |auto_sync, cx| {
+            auto_sync.set_enabled(id, Some(Trigger::Manual), cx)
+        });
         workspace.update(cx, |workspace, cx| {
             workspace.show_toast(
                 Toast::new(
@@ -919,7 +943,10 @@ fn turn_off(
         let repository = repository.read(cx);
         (repository.id, repository.work_directory_abs_path.clone())
     };
-    auto_sync.update(cx, |auto_sync, cx| auto_sync.set_enabled(id, false, cx));
+    auto_sync.update(cx, |auto_sync, cx| auto_sync.set_enabled(id, None, cx));
+    // Through the workspace being updated here: `AutoSync` reaching for it
+    // would update it twice and panic.
+    workspace.dismiss_toast(&notification_id(id), cx);
     let project = workspace.project().clone();
     cx.spawn(async move |workspace, cx| {
         let git_config = |args: &[&str], cx: &mut AsyncApp| {
@@ -1129,6 +1156,165 @@ mod tests {
         );
     }
 
+    /// Runs the real controller against real git: a bare remote stands in
+    /// for GitHub, and a second clone stands in for another computer.
+    #[gpui::test]
+    async fn syncs_merges_and_recovers_from_a_conflict(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext as _, UpdateGlobal as _, WeakEntity};
+        use settings::SettingsStore;
+        use std::path::Path;
+
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            project::trusted_worktrees::init(Default::default(), cx);
+            SettingsStore::update_global(cx, |store, cx| {
+                store
+                    .set_user_settings(r#"{"session":{"trust_all_worktrees":true}}"#, cx)
+                    .expect("valid settings");
+            });
+        });
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let root = temp.path().canonicalize().expect("canonical temp dir");
+        // The test plays the other computer with blocking git calls between
+        // steps, so it waits on them like a user at a terminal would.
+        #[allow(clippy::disallowed_methods)]
+        let git = |dir: &Path, args: &[&str]| -> String {
+            let output = std::process::Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git runs");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).into_owned()
+        };
+        let remote_file = |path: &str| {
+            git(
+                &root,
+                &["--git-dir", "remote.git", "show", &format!("main:{path}")],
+            )
+        };
+        let remote_commits = || {
+            git(
+                &root,
+                &["--git-dir", "remote.git", "rev-list", "--count", "main"],
+            )
+            .trim()
+            .parse::<u32>()
+            .expect("commit count")
+        };
+
+        git(&root, &["init", "-q", "--bare", "-b", "main", "remote.git"]);
+        git(&root, &["init", "-q", "-b", "main", "here"]);
+        let here = root.join("here");
+        for (key, value) in [
+            ("user.name", "Here"),
+            ("user.email", "here@example.com"),
+            ("pull.rebase", "false"),
+            (ENABLED_KEY, "true"),
+        ] {
+            git(&here, &["config", key, value]);
+        }
+        git(&here, &["remote", "add", "origin", "../remote.git"]);
+        std::fs::write(here.join("note.md"), "one\ntwo\nthree\n").expect("write");
+        git(&here, &["add", "-A"]);
+        git(&here, &["commit", "-qm", "Initial"]);
+        git(&here, &["push", "-q", "-u", "origin", "main"]);
+        git(&root, &["clone", "-q", "remote.git", "there"]);
+        let there = root.join("there");
+
+        let project =
+            project::Project::test(fs::RealFs::new(None, cx.executor()), [here.as_path()], cx)
+                .await;
+        let auto_sync = cx.new(|cx| AutoSync::new(project, WeakEntity::new_invalid(), cx));
+
+        let wait = |cx: &mut gpui::TestAppContext,
+                    what: &str,
+                    done: &dyn Fn(&mut gpui::TestAppContext) -> bool| {
+            for _ in 0..240 {
+                cx.executor().advance_clock(Duration::from_secs(1));
+                cx.run_until_parked();
+                if done(cx) {
+                    return;
+                }
+                // Git and the file watcher run in real time.
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            panic!("timed out waiting until {what}");
+        };
+        let paused = |cx: &mut gpui::TestAppContext| {
+            auto_sync.read_with(cx, |auto_sync, _| {
+                auto_sync
+                    .repositories
+                    .values()
+                    .find(|repository| repository.enabled)
+                    .and_then(|repository| repository.paused)
+            })
+        };
+
+        wait(cx, "the opt-in is read from git config", &|cx| {
+            auto_sync.read_with(cx, |auto_sync, _| {
+                auto_sync
+                    .repositories
+                    .values()
+                    .any(|repository| repository.enabled)
+            })
+        });
+
+        std::fs::write(here.join("note.md"), "one\ntwo\nthree\nfour\n").expect("write");
+        wait(cx, "the first edit reaches the remote", &|_| {
+            remote_commits() == 2
+        });
+        assert_eq!(remote_file("note.md"), "one\ntwo\nthree\nfour\n");
+
+        // Staging the same path again must not be skipped as already staged.
+        std::fs::write(here.join("note.md"), "one\ntwo\nthree\nfour\nfive\n").expect("write");
+        wait(
+            cx,
+            "a second edit to the same file reaches the remote",
+            &|_| remote_commits() == 3,
+        );
+
+        std::fs::write(there.join("other.md"), "from there\n").expect("write");
+        git(&there, &["pull", "-q"]);
+        git(&there, &["add", "-A"]);
+        git(&there, &["commit", "-qm", "Add other.md"]);
+        git(&there, &["push", "-q"]);
+        std::fs::write(here.join("mine.md"), "from here\n").expect("write");
+        wait(cx, "diverged histories are merged and pushed", &|_| {
+            here.join("other.md").exists() && remote_commits() == 6
+        });
+
+        git(&there, &["pull", "-q"]);
+        std::fs::write(there.join("note.md"), "one\nTHERE\nthree\nfour\nfive\n").expect("write");
+        git(&there, &["commit", "-qam", "Edit there"]);
+        git(&there, &["push", "-q"]);
+        std::fs::write(here.join("note.md"), "one\nHERE\nthree\nfour\nfive\n").expect("write");
+        wait(cx, "the conflict pauses syncing", &|cx| {
+            paused(cx) == Some(Pause::Conflict)
+        });
+        assert!(
+            !remote_file("note.md").contains("<<<<<<<"),
+            "conflict markers must never be pushed"
+        );
+
+        let resolved = "one\nHERE\nTHERE\nthree\nfour\nfive\n";
+        std::fs::write(here.join("note.md"), resolved).expect("write");
+        wait(cx, "resolving the conflict resumes syncing", &|cx| {
+            paused(cx).is_none() && remote_file("note.md") == resolved
+        });
+    }
+
     #[test]
     fn failures_are_classified_from_git_output() {
         assert_eq!(
@@ -1137,6 +1323,10 @@ mod tests {
         );
         assert_eq!(
             classify_failure("git@github.com: Permission denied (publickey)."),
+            Failure::Auth
+        );
+        assert_eq!(
+            classify_failure(git::repository::REMOTE_CANCELLED_BY_USER),
             Failure::Auth
         );
         assert_eq!(
