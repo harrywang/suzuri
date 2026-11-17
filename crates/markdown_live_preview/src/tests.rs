@@ -3134,6 +3134,195 @@ async fn test_display_math_keeps_rendering_while_editing(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+async fn test_bracket_inline_math_conceals_and_reveals(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // LLMs write `\(...\)`, usually padded, which renders like `$...$`.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+        energy is \(E = mc^2\) here
+        padded \( a + b \) too
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            energy is ⋯ here
+            padded ⋯ too
+        "}
+    );
+
+    cx.set_state(indoc::indoc! {r"
+        plain line
+        energy is \(E = mˇc^2\) here
+        padded \( a + b \) too
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            energy is \(E = mc^2\) here
+            padded ⋯ too
+        "}
+    );
+}
+
+#[gpui::test]
+async fn test_bracket_math_in_headings_and_after_stray_escapes(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+        ## Solving \(ax^2\)
+        a \[x] then \(y\)
+        \(1) see \(z\)
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            Solving ⋯
+            a \[x] then ⋯
+            \(1) see ⋯
+        "}
+    );
+}
+
+#[gpui::test]
+async fn test_bracket_math_hides_no_markdown_inside(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // The grammar parses a `\(...\)` formula as prose, finding emphasis and a
+    // link in it. Revealed for editing, the LaTeX must read exactly as typed.
+    cx.set_state(indoc::indoc! {r"
+        plain line
+        see \(ˇ a*b*c + [x](y) \) here
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            see \( a*b*c + [x](y) \) here
+        "}
+    );
+
+    // Emphasis the grammar pairs across the formula's edge is not emphasis.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+        see \( a*b \) and c* here
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {"
+            plain line
+            see ⋯ and c* here
+        "}
+    );
+}
+
+#[gpui::test]
+async fn test_bracket_display_math_renders_as_block(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+
+        \[
+        \int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}
+        \]
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+    assert!(
+        !cx.display_text().contains("frac"),
+        "display math should be replaced by its widget: {}",
+        cx.display_text()
+    );
+
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+
+        \[ a = b \]
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+
+    // A `\\[2pt]` line break inside the formula is not a delimiter.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+
+        \[
+        a \\[2pt] b
+        \]
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 1);
+}
+
+#[gpui::test]
+async fn test_escaped_brackets_and_parentheses_stay_text(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+
+    // Mid-line `\[...\]` is how Pandoc and Notion escape brackets, so only
+    // `\[...\]` alone on its lines is display math. An escaped backslash
+    // does not open a formula, and math never spans paragraphs.
+    cx.set_state(indoc::indoc! {r"
+        ˇplain line
+        see \[1\] and \[citation needed\]
+        a \\(x\\) b
+        open \( here
+
+        closed \) there
+    "});
+    cx.executor().run_until_parked();
+    assert_eq!(applied_block_count(&mut cx), 0);
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            see \[1\] and \[citation needed\]
+            a \\(x\\) b
+            open \( here
+
+            closed \) there
+        "}
+    );
+
+    // A link destination escapes its URL's parentheses the same way.
+    cx.set_state(indoc::indoc! {r"
+        plain line
+        see [Foo](https://example.com/Foo_\(bˇar\)) here
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            see [Foo](https://example.com/Foo_\(bar\)) here
+        "}
+    );
+
+    // Code spans keep their delimiters as code.
+    cx.set_state(indoc::indoc! {r"
+        plain line
+        write `\(xˇ\)` for math
+    "});
+    cx.executor().run_until_parked();
+    pretty_assertions::assert_eq!(
+        cx.display_text(),
+        indoc::indoc! {r"
+            plain line
+            write `\(x\)` for math
+        "}
+    );
+}
+
+#[gpui::test]
 async fn test_table_cell_br_breaks_the_line(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     cx.set_state(indoc::indoc! {"
@@ -6664,6 +6853,17 @@ fn test_split_cell_math() {
     assert_eq!(
         describe("($0.20 / $0.80 per 1M) ≈ **$1.00**"),
         ["text(($0.20 / $0.80 per 1M) ≈ **$1.00**, false, false)"]
+    );
+    assert_eq!(
+        describe(r"\( x_i \) and $y$"),
+        ["math( x_i )", "text(and, true, true)", "math(y)"]
+    );
+    assert_eq!(describe(r"`\(x\)`"), [r"text(`\(x\)`, false, false)"]);
+    assert_eq!(describe(r"\\(x\\)"), [r"text(\\(x\\), false, false)"]);
+    assert_eq!(describe(r"\[x\]"), [r"text(\[x\], false, false)"]);
+    assert_eq!(
+        describe(r"\(1) see \(z\)"),
+        [r"text(\(1) see, false, true)", "math(z)"]
     );
 }
 
