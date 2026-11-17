@@ -514,6 +514,19 @@ impl MarkdownCell {
 
         let markdown = cx.new(|cx| Markdown::new(source.clone().into(), None, None, cx));
 
+        // SUZURI: begin. With live preview on, this editor is also the cell's
+        // rendered state (see `render`), so it conceals all source until it is
+        // focused, and focusing it by a click is what starts editing.
+        markdown_live_preview::reveal_source_only_while_focused(&editor, window, cx);
+        cx.subscribe(&editor, |this, _editor, event, cx| {
+            if matches!(event, editor::EditorEvent::Focused) && !this.editing {
+                this.editing = true;
+                cx.notify();
+            }
+        })
+        .detach();
+        // SUZURI: end
+
         let editor_subscription =
             cx.subscribe(&editor, move |this, _editor, event, cx| match event {
                 editor::EditorEvent::Blurred => {
@@ -650,7 +663,11 @@ impl RenderableCell for MarkdownCell {
 impl Render for MarkdownCell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // If editing, show the editor
-        if self.editing {
+        // SUZURI: the editor also stands in for the rendered markdown below
+        // while live preview is on, so a cell renders what a note does (math,
+        // tables, citations) instead of the subset the `markdown` crate knows.
+        if self.editing || markdown_live_preview::is_live_preview_enabled(self.editor.read(cx), cx)
+        {
             return v_flex()
                 .size_full()
                 .children(self.cell_position_spacer(true, window, cx))
@@ -1653,6 +1670,64 @@ mod tests {
             "cell languages mismatch: expected {expected:?}, got {actual:?}"
         )
     }
+
+    // SUZURI: begin. The cell's editor doubles as its rendered state.
+    #[gpui::test]
+    fn suzuri_markdown_cell_renders_through_live_preview_until_focused(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(markdown_live_preview::init);
+
+        let languages = Arc::new(LanguageRegistry::test(cx.executor()));
+        languages.add(languages::markdown_lang());
+        languages.add(Arc::new(markdown_inline_lang()));
+
+        let (cell, cx) = cx.add_window_view(|window, cx| {
+            MarkdownCell::new(
+                uuid::Uuid::new_v4().into(),
+                empty_metadata(),
+                "# Title\n\nwith $n$\nand **bold** text".to_string(),
+                languages,
+                window,
+                cx,
+            )
+        });
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        let editor = cell.read_with(cx, |cell, _| cell.editor.clone());
+        let display_text = |cx: &mut gpui::VisualTestContext| {
+            editor.update(cx, |editor, cx| editor.display_text(cx))
+        };
+
+        // The cursor rests at the start of the cell, on the heading, which is
+        // where a cell that revealed source while unfocused would show it.
+        let rendered = display_text(cx);
+        assert!(!cell.read_with(cx, |cell, _| cell.is_editing()));
+        assert!(
+            !rendered.contains('#') && !rendered.contains('$') && !rendered.contains("**"),
+            "an unfocused cell shows no markdown source, got {rendered:?}"
+        );
+        assert_eq!(
+            rendered.lines().count(),
+            3,
+            "an unfocused cell flows its paragraph onto one line, got {rendered:?}"
+        );
+
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(cell.read_with(cx, |cell, _| cell.is_editing()));
+        assert!(display_text(cx).starts_with("# Title"));
+        assert_eq!(display_text(cx).lines().count(), 4);
+
+        cx.update(|window, cx| window.blur(cx));
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(!cell.read_with(cx, |cell, _| cell.is_editing()));
+        assert_eq!(display_text(cx), rendered);
+    }
+    // SUZURI: end
 
     fn run_cell_language_test(cx: &mut TestAppContext, cell_source: &str, expected_langs: &[&str]) {
         init_test(cx);

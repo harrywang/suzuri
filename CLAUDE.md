@@ -43,6 +43,7 @@ The fork's own changes are small and additive:
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
 | Document menu (formatting, citations, export; see "Document menu") and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
+| Notebook markdown cells rendered by live preview, so they show math and the rest of what a note shows (see "Jupyter notebooks") | `crates/repl/src/notebook/cell.rs`, `crates/repl/Cargo.toml`, `crates/markdown_live_preview/src/markdown_live_preview.rs` (`reveal_source_only_while_focused`) |
 | In-app updates from GitHub releases (see "Cutting a release") | `crates/suzuri_update/`, `crates/auto_update/src/auto_update.rs` (`init`, `get_release_asset`, `release_notes_url`, the macOS and Linux installers), `crates/auto_update_ui/src/auto_update_ui.rs` (app name), `crates/release_channel/src/lib.rs` (`poll_for_updates`) |
 | Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
 | Own config and data folders, separate from Zed's (`APP_NAME = "Suzuri"`, binary still `zed`): one-time copy of an existing user's state, Import from Zed, keychain credentials in shipped builds (see "Own folders") | `crates/suzuri_migration/`, `crates/paths/src/paths.rs` (`APP_NAME`), `crates/zed/src/main.rs` (assert removed, two calls), `crates/onboarding/src/basics_page.rs` and `Cargo.toml` (Zed import button) |
@@ -339,6 +340,21 @@ take upstream's `flags.rs` wholesale — nothing else is required, because the n
 editor itself was never forked. Items 2 and 3 are worth upstreaming as a PR; until they
 land, they are the only part of this that needs conflict resolution, and
 `notebook_ui.rs` is actively developed upstream, so expect to redo hunk 3 occasionally.
+
+**Markdown cells render through live preview (permanent, not part of the bridge above).**
+Upstream draws a rendered markdown cell with the `markdown` crate, which has no math,
+and swaps in the cell's editor only while editing. In Suzuri the cell's editor is both
+states: `MarkdownCell::render` in `crates/repl/src/notebook/cell.rs` shows it whenever
+live preview is enabled, and `markdown_live_preview::reveal_source_only_while_focused`
+keeps all source concealed until the editor has focus. Focusing the editor is what sets
+`editing`. With live preview off (the setting, the toggle, or a quarantined file) the
+cell falls back to upstream's renderer untouched. The delta is two `SUZURI:` hunks in
+`cell.rs` and one dependency in `crates/repl/Cargo.toml`; keep them through a merge, and
+`suzuri_markdown_cell_renders_through_live_preview_until_focused` fails if they are lost.
+An unfocused cell also joins each paragraph's soft line breaks for display (a
+concealment drawn as a space, `MarkerSet::soft_breaks`), so a hard-wrapped notebook
+reflows as it does in Jupyter; the source is never rewritten, and the lines return while
+the cell is being edited. Notes do not do this.
 
 ## Document menu
 

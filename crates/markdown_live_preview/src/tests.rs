@@ -4634,11 +4634,183 @@ async fn test_citation_key_start_finds_pandoc_contexts(cx: &mut TestAppContext) 
     }
 }
 
+#[gpui::test]
+async fn test_reveal_source_only_while_focused(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.update(|window, _| window.activate_window());
+    cx.set_state("# Tiˇtle\n\nsome **bold** text\n  wrapped \\\nhard  \nbroken\n");
+    cx.executor().run_until_parked();
+    let focused_heading = "# Title\n\nsome bold text\n  wrapped \\\nhard  \nbroken\n";
+    assert_eq!(cx.display_text(), focused_heading);
+
+    let editor = cx.editor.clone();
+    cx.update(|window, cx| crate::reveal_source_only_while_focused(&editor, window, cx));
+    cx.executor().run_until_parked();
+    assert_eq!(
+        cx.display_text(),
+        focused_heading,
+        "a focused editor still reveals at the cursor and keeps its lines"
+    );
+
+    cx.update(|window, cx| window.blur(cx));
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().run_until_parked();
+    // The paragraph's soft break joins into a space, taking the next line's
+    // indentation with it; the backslash and two-space hard breaks stay.
+    let rendered = "Title\n\nsome bold text wrapped \\\nhard  \nbroken\n";
+    assert_eq!(
+        cx.display_text(),
+        rendered,
+        "an unfocused editor reveals nothing, wherever its cursor was left"
+    );
+
+    cx.update_editor(|editor, window, cx| {
+        editor.change_selections(Default::default(), window, cx, |selections| {
+            selections.select_ranges([Point::new(2, 8)..Point::new(2, 8)]);
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(cx.display_text(), rendered);
+
+    cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().run_until_parked();
+    assert_eq!(
+        cx.display_text(),
+        "Title\n\nsome **bold** text\n  wrapped \\\nhard  \nbroken\n"
+    );
+    assert_eq!(
+        cx.buffer_text(),
+        "# Title\n\nsome **bold** text\n  wrapped \\\nhard  \nbroken\n",
+        "joining lines is display only"
+    );
+}
+
+#[gpui::test]
+async fn test_unfocused_editor_keeps_block_widget_rows(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.update(|window, _| window.activate_window());
+    let editor = cx.editor.clone();
+    cx.update(|window, cx| crate::reveal_source_only_while_focused(&editor, window, cx));
+    cx.executor().run_until_parked();
+
+    // Each paragraph holds a line that a widget replaces. Joining a line
+    // break next to one would pull prose onto the widget's row.
+    for paragraph in [
+        "text\n$$\na = b\n$$\nmore text",
+        "text\n$$x$$\nmore",
+        "text\n![alt](x.png)\nmore",
+    ] {
+        cx.set_state(&format!("{paragraph}\n\nˇtail"));
+        cx.executor().run_until_parked();
+        let focused = cx.display_text();
+
+        cx.update(|window, cx| window.blur(cx));
+        cx.executor().run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.executor().run_until_parked();
+        assert_eq!(cx.display_text(), focused, "for {paragraph:?}");
+
+        cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+        cx.executor().run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.executor().run_until_parked();
+    }
+}
+
+#[gpui::test]
+async fn test_click_into_unfocused_editor_reveals_on_mouse_up(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.update(|window, _| window.activate_window());
+    cx.set_state("ˇalpha beta\ngamma delta\n\ntail");
+    let editor = cx.editor.clone();
+    cx.update(|window, cx| crate::reveal_source_only_while_focused(&editor, window, cx));
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    // `delta` is on the second row until the lines join, so its joined
+    // position is worked out from the monospace advance of the first row.
+    let column = |cx: &mut EditorTestContext, column| {
+        cx.pixel_position_for(editor::DisplayPoint::new(
+            editor::display_map::DisplayRow(0),
+            column,
+        ))
+    };
+    let (start, end) = (column(&mut cx, 0), column(&mut cx, 10));
+    let advance = (end.x - start.x) / 10.;
+    let target = gpui::point(start.x + advance * 17.2, start.y);
+
+    cx.update(|window, cx| window.blur(cx));
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().run_until_parked();
+    let joined = "alpha beta gamma delta\n\ntail";
+    assert_eq!(cx.display_text(), joined);
+    // The blur was delivered by the draw above, so the joined layout is only
+    // on screen, and hit-testable, after another.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+
+    // With the lines joined, `delta` sits on the first row, where `target`
+    // was measured. Until the button comes up nothing may move, or the drag
+    // below would select up to wherever `delta` went.
+    cx.cx
+        .simulate_mouse_down(target, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().run_until_parked();
+    assert_eq!(cx.display_text(), joined);
+
+    let nudged = gpui::point(target.x + gpui::px(1.), target.y);
+    cx.cx
+        .simulate_mouse_move(nudged, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.cx
+        .simulate_mouse_up(nudged, gpui::MouseButton::Left, gpui::Modifiers::none());
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().run_until_parked();
+    assert_eq!(cx.display_text(), "alpha beta\ngamma delta\n\ntail");
+    cx.assert_editor_state("alpha beta\ngamma ˇdelta\n\ntail");
+}
+
 // --- Contract tests ---
 //
 // These pin behavior this crate relies on from `editor` and `gpui` rather than
 // behavior of its own. They exist so an upstream merge that changes those
 // semantics fails here, loudly, instead of silently degrading live preview.
+
+// `reveal_source_only_while_focused` learns about focus only from these two
+// events, so an editor that stopped emitting either would leave a notebook
+// cell stuck rendered or stuck revealing.
+#[gpui::test]
+async fn test_editor_emits_focused_and_blurred_contract(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.update(|window, _| window.activate_window());
+    cx.executor().run_until_parked();
+    let editor = cx.editor.clone();
+    let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let _subscription = cx.update(|_, cx| {
+        let events = events.clone();
+        cx.subscribe(
+            &editor,
+            move |_, event: &editor::EditorEvent, _| match event {
+                editor::EditorEvent::Focused => events.borrow_mut().push("focused"),
+                editor::EditorEvent::Blurred => events.borrow_mut().push("blurred"),
+                _ => {}
+            },
+        )
+    });
+
+    cx.update(|window, cx| window.blur(cx));
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.focus(&editor.focus_handle(cx), cx));
+    cx.executor().run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.executor().run_until_parked();
+    assert_eq!(*events.borrow(), ["blurred", "focused"]);
+}
 
 #[gpui::test]
 async fn test_concealed_source_selection_with_unrelated_fold_contract(cx: &mut TestAppContext) {
