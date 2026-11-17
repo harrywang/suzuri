@@ -225,6 +225,8 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         );
         settings_ui::init(cx);
         markdown_live_preview::init(cx);
+        repl::init(app_state.fs.clone(), cx);
+        repl::notebook::init(cx);
 
         // Load default keymaps so tooltips can show keybindings like "f9" for ToggleBreakpoint
         // We load a minimal set of editor keybindings needed for visual tests
@@ -687,6 +689,23 @@ fn run_visual_tests(project_path: PathBuf, update_baseline: bool) -> Result<()> 
         }
         Err(e) => {
             eprintln!("✗ math_rendering: FAILED - {}", e);
+            failed += 1;
+        }
+    }
+
+    // Run Test 14: notebook markdown cells render through live preview
+    println!("\n--- Test 14: notebook_markdown_cells ---");
+    match run_notebook_markdown_cell_visual_tests(app_state.clone(), &mut cx, update_baseline) {
+        Ok(TestResult::Passed) => {
+            println!("✓ notebook_markdown_cells: PASSED");
+            passed += 1;
+        }
+        Ok(TestResult::BaselineUpdated(_)) => {
+            println!("✓ notebook_markdown_cells: Baselines updated");
+            updated += 1;
+        }
+        Err(e) => {
+            eprintln!("✗ notebook_markdown_cells: FAILED - {}", e);
             failed += 1;
         }
     }
@@ -4122,6 +4141,231 @@ fn run_sidebar_duplicate_project_names_visual_tests(
 /// Renders a note of LaTeX math in a real window, so the glyph weight and
 /// rasterization size of live preview's formulas can be inspected directly.
 /// Formula rendering is invisible to the crate's text assertions.
+#[cfg(target_os = "macos")]
+/// A notebook's markdown cells are drawn by their own editors through live
+/// preview, so they show math. Three captures: every cell rendered, the first
+/// cell clicked into, and the code cell clicked into, which must leave the
+/// first cell exactly as it was rendered. The offscreen window is never the
+/// active one, so no focus event fires and the second capture cannot show
+/// source revealed at the cursor; the `repl` cell tests cover that.
+fn run_notebook_markdown_cell_visual_tests(
+    app_state: Arc<AppState>,
+    cx: &mut VisualTestAppContext,
+    update_baseline: bool,
+) -> Result<TestResult> {
+    let temp_dir = tempfile::tempdir()?;
+    let temp_path = temp_dir.keep();
+    let canonical_temp = temp_path.canonicalize()?;
+    let notebook_dir = canonical_temp.join("notebook");
+    std::fs::create_dir_all(&notebook_dir)?;
+    let notebook = serde_json::json!({
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "metadata": {},
+        "cells": [
+            {
+                "cell_type": "markdown",
+                "id": "intro",
+                "metadata": {},
+                "source": [
+                    "# Data Manipulation\n",
+                    "\n",
+                    "so to start, let's get our hands dirty\n",
+                    "with $n$-dimensional arrays,\n",
+                    "which we also call *tensors* and store as `ndarray`.\n",
+                    "If you already know the NumPy\n",
+                    "scientific computing package,\n",
+                    "this will be a breeze.\n",
+                    "For all modern deep learning frameworks,\n",
+                    "the *tensor class* resembles NumPy's `ndarray`,\n",
+                    "with a few killer features added.\n",
+                ],
+            },
+            {
+                "cell_type": "code",
+                "id": "code",
+                "metadata": {},
+                "execution_count": null,
+                "outputs": [],
+                "source": ["import torch"],
+            },
+            {
+                "cell_type": "markdown",
+                "id": "entropy",
+                "metadata": {},
+                "source": [
+                    "## Entropy\n",
+                    "\n",
+                    "With $p_i$ the class share\n",
+                    "and $\\frac{a}{b}$ a tall inline fraction on a joined line, entropy is\n",
+                    "\n",
+                    "$$E(S) = \\sum_{i=1}^{c} -p_i \\log_2 p_i$$\n",
+                    "\n",
+                    "| Outlook | Play |\n",
+                    "| --- | --- |\n",
+                    "| sunny | **no** |\n",
+                ],
+            },
+            {
+                "cell_type": "markdown",
+                "id": "last",
+                "metadata": {},
+                "source": ["A last cell, which must sit below the table and not under it."],
+            },
+        ],
+    });
+    std::fs::write(
+        notebook_dir.join("Cells.ipynb"),
+        serde_json::to_string_pretty(&notebook)?,
+    )?;
+
+    let project = cx.update(|cx| {
+        project::Project::local(
+            app_state.client.clone(),
+            app_state.node_runtime.clone(),
+            app_state.user_store.clone(),
+            app_state.languages.clone(),
+            app_state.fs.clone(),
+            None,
+            project::LocalProjectFlags {
+                init_worktree_trust: false,
+                ..Default::default()
+            },
+            cx,
+        )
+    });
+
+    let bounds = Bounds {
+        origin: point(px(0.0), px(0.0)),
+        size: size(px(1280.0), px(800.0)),
+    };
+    let workspace_window: WindowHandle<Workspace> = cx.update(|cx| {
+        cx.open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                focus: false,
+                show: false,
+                ..Default::default()
+            },
+            |window, cx| {
+                cx.new(|cx| Workspace::new(None, project.clone(), app_state.clone(), window, cx))
+            },
+        )
+    })?;
+    cx.run_until_parked();
+
+    let add_worktree_task = workspace_window.update(cx, |workspace, _window, cx| {
+        workspace.project().update(cx, |project, cx| {
+            project.find_or_create_worktree(&notebook_dir, true, cx)
+        })
+    })?;
+    cx.background_executor.allow_parking();
+    cx.foreground_executor
+        .block_test(add_worktree_task)
+        .context("Failed to add notebook worktree")?;
+    cx.background_executor.forbid_parking();
+    cx.run_until_parked();
+
+    let open_task = workspace_window.update(cx, |workspace, window, cx| {
+        let worktree = workspace
+            .project()
+            .read(cx)
+            .worktrees(cx)
+            .next()
+            .context("notebook worktree missing")?;
+        let worktree_id = worktree.read(cx).id();
+        let rel_path: std::sync::Arc<util::rel_path::RelPath> =
+            util::rel_path::rel_path("Cells.ipynb").into();
+        let project_path: project::ProjectPath = (worktree_id, rel_path).into();
+        anyhow::Ok(workspace.open_path(project_path, None, true, window, cx))
+    })??;
+    cx.background_executor.allow_parking();
+    let opened = cx.foreground_executor.block_test(open_task);
+    cx.background_executor.forbid_parking();
+    opened.context("Failed to open Cells.ipynb")?;
+    cx.run_until_parked();
+
+    // Formulas render on a background task and grow their rows once done.
+    cx.update_window(workspace_window.into(), |_, window, _cx| window.refresh())?;
+    cx.run_until_parked();
+
+    let mut results = vec![run_visual_test(
+        "notebook_markdown_cells_rendered",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?];
+
+    let click = |cx: &mut VisualTestAppContext, x: f32, y: f32| {
+        cx.simulate_click(
+            workspace_window.into(),
+            point(px(x), px(y)),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+    };
+
+    let (first_cell_x, first_cell_y, code_cell_x, code_cell_y) = notebook_click_points();
+    click(cx, first_cell_x, first_cell_y);
+    results.push(run_visual_test(
+        "notebook_markdown_cells_editing",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+
+    click(cx, code_cell_x, code_cell_y);
+    results.push(run_visual_test(
+        "notebook_markdown_cells_rendered_again",
+        workspace_window.into(),
+        cx,
+        update_baseline,
+    )?);
+
+    workspace_window
+        .update(cx, |workspace, _window, cx| {
+            let project = workspace.project().clone();
+            project.update(cx, |project, cx| {
+                let worktree_ids: Vec<_> =
+                    project.worktrees(cx).map(|wt| wt.read(cx).id()).collect();
+                for id in worktree_ids {
+                    project.remove_worktree(id, cx);
+                }
+            });
+        })
+        .log_err();
+    cx.run_until_parked();
+    cx.update_window(workspace_window.into(), |_, window, _cx| {
+        window.remove_window();
+    })
+    .log_err();
+    cx.run_until_parked();
+
+    Ok(results
+        .into_iter()
+        .find(|result| matches!(result, TestResult::BaselineUpdated(_)))
+        .unwrap_or(TestResult::Passed))
+}
+
+/// Where the notebook test clicks, in window points: inside the first
+/// markdown cell's heading, then inside the code cell. Overridable so the
+/// points can be re-found after a layout change without recompiling.
+#[cfg(target_os = "macos")]
+fn notebook_click_points() -> (f32, f32, f32, f32) {
+    let parse = |name: &str, default: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    };
+    (
+        parse("NOTEBOOK_MARKDOWN_CLICK_X", 200.0),
+        parse("NOTEBOOK_MARKDOWN_CLICK_Y", 110.0),
+        parse("NOTEBOOK_CODE_CLICK_X", 200.0),
+        parse("NOTEBOOK_CODE_CLICK_Y", 296.0),
+    )
+}
+
 #[cfg(target_os = "macos")]
 fn run_math_rendering_visual_tests(
     app_state: Arc<AppState>,

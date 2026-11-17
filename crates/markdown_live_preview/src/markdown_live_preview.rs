@@ -268,6 +268,16 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                 }
                 apply_decorations(editor, cx);
             }
+            EditorEvent::Focused | EditorEvent::Blurred => {
+                let focused = matches!(event, EditorEvent::Focused);
+                if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
+                    && addon.reveal_requires_focus
+                    && addon.focused != focused
+                {
+                    addon.focused = focused;
+                    apply_decorations(editor, cx);
+                }
+            }
             _ => {}
         }),
     );
@@ -631,6 +641,8 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         callout_collapse: Vec::new(),
         concealed_math: Vec::new(),
         math_line_styles: BTreeMap::new(),
+        reveal_requires_focus: false,
+        focused: false,
         _subscriptions: subscriptions,
     });
 
@@ -698,6 +710,13 @@ struct LivePreviewAddon {
     concealed_math: Vec<(Range<Anchor>, MathKey)>,
     /// Line styles `apply_math_line_styles` last applied, by key.
     math_line_styles: BTreeMap<usize, Vec<Range<Anchor>>>,
+    /// Set by [`reveal_source_only_while_focused`]: the selection reveals
+    /// source only while `focused`, so the editor reads as a rendered
+    /// document until it is clicked into.
+    reveal_requires_focus: bool,
+    /// Tracked from the editor's focus events, and only while
+    /// `reveal_requires_focus` is set.
+    focused: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -912,6 +931,11 @@ struct MarkerSet {
     /// Inline code content (between the backticks), styled like the
     /// preview's pill: plain text color on a faint background.
     code: Vec<Range<Anchor>>,
+    /// Line breaks inside a paragraph that markdown reads as a space, each
+    /// with the indentation that follows it. Joined for display only where
+    /// the editor stands in for a rendered document; see
+    /// [`reveal_source_only_while_focused`].
+    soft_breaks: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -1300,6 +1324,37 @@ pub fn is_live_preview_enabled(editor: &Editor, cx: &App) -> bool {
     editor
         .addon::<LivePreviewAddon>()
         .is_some_and(|addon| is_enabled(addon, cx))
+}
+
+/// Makes `editor` show its markdown fully rendered whenever it does not have
+/// focus, and reveal source at the selection only while it does. Unfocused,
+/// it also flows each paragraph as a renderer would, drawing a line break
+/// inside one as a space; the buffer is never changed. A notebook markdown
+/// cell uses this to show one editor as both its rendered and its editing
+/// state.
+///
+/// Live preview attaches to an editor only after the editor's constructor has
+/// returned, so this defers itself and may be called from that constructor.
+/// It does nothing for an editor live preview is not attached to.
+pub fn reveal_source_only_while_focused(
+    editor: &Entity<Editor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let editor = editor.downgrade();
+    window.defer(cx, move |window, cx| {
+        editor
+            .update(cx, |editor, cx| {
+                let focused = editor.focus_handle(cx).is_focused(window);
+                let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+                    return;
+                };
+                addon.reveal_requires_focus = true;
+                addon.focused = focused;
+                apply_decorations(editor, cx);
+            })
+            .ok();
+    });
 }
 
 fn is_enabled(addon: &LivePreviewAddon, cx: &App) -> bool {
@@ -1714,7 +1769,14 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     // decorations refresh.
     remove_stale_restored_folds(editor, cx);
 
-    let selection_rows = selection_row_ranges(editor, &snapshot);
+    let reveals_source = editor
+        .addon::<LivePreviewAddon>()
+        .is_none_or(|addon| !addon.reveal_requires_focus || addon.focused);
+    let selection_rows = if reveals_source {
+        selection_row_ranges(editor, &snapshot)
+    } else {
+        Vec::new()
+    };
     let source_revealed = editor
         .addon::<LivePreviewAddon>()
         .and_then(|addon| addon.source_revealed.clone())
@@ -1726,7 +1788,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
         addon.source_revealed = source_revealed.clone();
     }
-    let selection_offsets = selection_offset_ranges(editor, &snapshot);
+    let selection_offsets = if reveals_source {
+        selection_offset_ranges(editor, &snapshot)
+    } else {
+        Vec::new()
+    };
     let base_directory = buffer_base_directory(editor, cx);
     let project = editor.project().cloned();
 
@@ -1812,6 +1878,33 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             placeholder: fold_placeholder(&marker, weak_editor.clone()),
             content_key: 0,
         });
+    }
+    // An editor standing in for a rendered document flows a paragraph the
+    // way a renderer does, so a hard-wrapped one fills the width instead of
+    // keeping its source's short lines. Nothing in the buffer changes, and
+    // the lines come back the moment the editor is focused for editing.
+    if !reveals_source {
+        let mut taken: Vec<Range<usize>> = concealments
+            .iter()
+            .map(|concealment| {
+                concealment.range.start.to_offset(&snapshot).0
+                    ..concealment.range.end.to_offset(&snapshot).0
+            })
+            .collect();
+        taken.sort_by_key(|range| range.start);
+        for soft_break in &markers.soft_breaks {
+            let start = soft_break.start.to_offset(&snapshot).0;
+            let end = soft_break.end.to_offset(&snapshot).0;
+            let index = taken.partition_point(|range| range.end <= start);
+            if start >= end || taken.get(index).is_some_and(|range| range.start < end) {
+                continue;
+            }
+            concealments.push(Concealment {
+                range: soft_break.clone(),
+                placeholder: soft_break_placeholder(),
+                content_key: SOFT_BREAK_CONTENT_KEY,
+            });
+        }
     }
     editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), concealments, cx);
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
@@ -3258,6 +3351,31 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         merge_adjacent: false,
         type_tag: Some(TypeId::of::<LivePreviewFoldTag>()),
         collapsed_text,
+    }
+}
+
+/// Distinct from every [`marker_content_key`], which are small integers or
+/// hashes of a label.
+const SOFT_BREAK_CONTENT_KEY: u64 = u64::MAX;
+
+/// The single space a joined line break is drawn as.
+fn soft_break_placeholder() -> FoldPlaceholder {
+    FoldPlaceholder {
+        render: Arc::new(|_, _, _| {
+            at_editor_font_size(|font_size, cx| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                div()
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(font_size)
+                    .child(" ")
+                    .into_any_element()
+            })
+            .into_any_element()
+        }),
+        constrain_width: false,
+        merge_adjacent: false,
+        type_tag: Some(TypeId::of::<LivePreviewFoldTag>()),
+        collapsed_text: Some(SharedString::new_static(" ")),
     }
 }
 
@@ -8215,6 +8333,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     extraction.scan_footnotes();
     extraction.scan_highlights();
     extraction.scan_tags();
+    let soft_breaks = extraction.soft_breaks();
 
     let Extraction {
         inline,
@@ -8277,6 +8396,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         highlights,
         tags,
         code,
+        soft_breaks,
     })
 }
 
@@ -8362,6 +8482,35 @@ fn collect_bracket_math_delimiters(
 }
 
 impl Extraction<'_> {
+    /// A paragraph's line breaks that render as a space: not a hard break
+    /// (two trailing spaces or a backslash), and not followed by a block
+    /// quote marker, whose line keeps its own decoration.
+    fn soft_breaks(&self) -> Vec<Range<Anchor>> {
+        let mut soft_breaks = Vec::new();
+        for region in &self.prose_regions {
+            let Some(prose) = self.text.get(region.clone()) else {
+                continue;
+            };
+            for (index, _) in prose.match_indices('\n') {
+                let before = &prose[..index];
+                let trimmed = before.trim_end_matches([' ', '\t']);
+                let trailing = before.len() - trimmed.len();
+                if trailing >= 2 || trimmed.ends_with('\\') {
+                    continue;
+                }
+                let after = &prose[index + 1..];
+                let next = after.trim_start_matches([' ', '\t']);
+                if next.is_empty() || next.starts_with(['>', '\n']) {
+                    continue;
+                }
+                let start = region.start + trimmed.len();
+                let end = region.start + index + 1 + (after.len() - next.len());
+                soft_breaks.push(self.anchor_range(start..end));
+            }
+        }
+        soft_breaks
+    }
+
     fn anchor_range(&self, range: Range<usize>) -> Range<Anchor> {
         // Bias the anchors inward so text inserted at the boundaries falls
         // outside the hidden range rather than growing it.

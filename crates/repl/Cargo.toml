@@ -37,6 +37,9 @@ jupyter-protocol.workspace = true
 language.workspace = true
 log.workspace = true
 markdown.workspace = true
+# SUZURI: begin. Notebook markdown cells render through live preview.
+markdown_live_preview.workspace = true
+# SUZURI: end
 menu.workspace = true
 multi_buffer.workspace = true
 nbformat.workspace = true
