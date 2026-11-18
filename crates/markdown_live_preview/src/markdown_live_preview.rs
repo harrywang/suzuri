@@ -8346,22 +8346,25 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bracket_math: Vec::new(),
     };
 
+    let mut block_roots = Vec::new();
     let mut inline_roots = Vec::new();
+    let mut delimiters = Vec::new();
     for layer in buffer_snapshot.syntax_layers() {
         match layer.language.name().as_ref() {
-            MARKDOWN => extraction.walk_block_layer(layer.node()),
-            MARKDOWN_INLINE => inline_roots.push(layer.node()),
+            MARKDOWN => block_roots.push(layer.node()),
+            MARKDOWN_INLINE => {
+                collect_bracket_math_delimiters(layer.node(), &text, &mut delimiters);
+                inline_roots.push(layer.node());
+            }
             _ => {}
         }
     }
-    // `\(...\)` and `\[...\]` are claimed before the inline walk, which then
-    // skips the markdown the grammar finds inside them; it has no math node
-    // for these delimiters, so it parses a formula's `*` and `[` as prose.
-    let mut delimiters = Vec::new();
-    for root in &inline_roots {
-        collect_bracket_math_delimiters(*root, extraction.text, &mut delimiters);
+    delimiters.sort_by_key(|(range, _)| range.start);
+    for root in block_roots {
+        extraction.walk_block_layer(root, &delimiters);
     }
     extraction.claim_bracket_math(delimiters);
+    extraction.bracket_math.sort_by_key(|range| range.start);
     for root in inline_roots {
         extraction.walk_inline_layer(root);
     }
@@ -8650,11 +8653,10 @@ impl Extraction<'_> {
     /// brackets of `see \[1\]` (common in Pandoc and Notion output) as text.
     /// `\(...\)` may sit mid-line, since prose rarely escapes both
     /// parentheses, and tolerates padding like `$$`.
-    fn claim_bracket_math(&mut self, mut delimiters: Vec<(Range<usize>, BracketMathDelimiter)>) {
+    fn claim_bracket_math(&mut self, delimiters: Vec<(Range<usize>, BracketMathDelimiter)>) {
         if delimiters.is_empty() {
             return;
         }
-        delimiters.sort_by_key(|(range, _)| range.start);
         let mut regions = self.prose_regions.clone();
         regions.extend(self.heading_regions.iter().cloned());
         regions.sort_by_key(|region| region.start);
@@ -8719,17 +8721,22 @@ impl Extraction<'_> {
         })
     }
 
-    fn claim_bracket_formula(&mut self, open: Range<usize>, close: Range<usize>, display: bool) {
+    fn claim_bracket_formula(
+        &mut self,
+        open: Range<usize>,
+        close: Range<usize>,
+        display: bool,
+    ) -> bool {
         let construct = open.start..close.end;
         let Some(source) = self.text.get(open.end..close.start) else {
-            return;
+            return false;
         };
         if source.trim().is_empty() {
-            return;
+            return false;
         }
         if display {
             if !self.range_is_alone_on_its_lines(construct.clone()) {
-                return;
+                return false;
             }
             let start_row = MultiBufferOffset(construct.start)
                 .to_point(self.snapshot)
@@ -8754,6 +8761,7 @@ impl Extraction<'_> {
         }
         self.code_spans.push(construct.clone());
         self.bracket_math.push(construct);
+        true
     }
 
     fn bracket_math_overlap(&self, range: Range<usize>) -> BracketMathOverlap {
@@ -8852,7 +8860,38 @@ impl Extraction<'_> {
         });
     }
 
-    fn walk_block_layer(&mut self, root: tree_sitter::Node) {
+    /// A Setext underline inside display math splits the delimiters across
+    /// two inline trees. Only join them across this heading's underline and
+    /// into the paragraph on the very next line.
+    fn claim_math_across_underline(
+        &mut self,
+        heading: tree_sitter::Node,
+        delimiters: &[(Range<usize>, BracketMathDelimiter)],
+    ) -> bool {
+        let Some(next) = heading.next_named_sibling() else {
+            return false;
+        };
+        if next.kind() != "paragraph" || next.start_position().row != heading.end_position().row {
+            return false;
+        }
+        let boundary = delimiters.partition_point(|(range, _)| range.start < heading.end_byte());
+        let (before, after) = delimiters.split_at(boundary);
+        match (before.last(), after.first()) {
+            (
+                Some((open, BracketMathDelimiter::OpenDisplay)),
+                Some((close, BracketMathDelimiter::CloseDisplay)),
+            ) if open.start >= heading.start_byte() && close.end <= next.end_byte() => {
+                self.claim_bracket_formula(open.clone(), close.clone(), true)
+            }
+            _ => false,
+        }
+    }
+
+    fn walk_block_layer(
+        &mut self,
+        root: tree_sitter::Node,
+        delimiters: &[(Range<usize>, BracketMathDelimiter)],
+    ) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             match node.kind() {
@@ -8867,6 +8906,9 @@ impl Extraction<'_> {
                     let level = heading_level(node) as u8;
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
                     self.note_references_heading(node);
+                }
+                "setext_heading" if self.claim_math_across_underline(node, delimiters) => {
+                    push_children(node, &mut stack);
                 }
                 "setext_heading" => {
                     let (start_row, end_row) = self.node_rows(node);
