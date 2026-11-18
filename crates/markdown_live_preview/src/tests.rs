@@ -3265,7 +3265,7 @@ async fn test_bracket_display_math_renders_as_block(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-async fn test_bracket_display_math_with_setext_underline(cx: &mut TestAppContext) {
+async fn test_bracket_display_math_with_setext_underlines(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     cx.set_state(indoc::indoc! {r"
         ˇBefore
@@ -3277,11 +3277,24 @@ async fn test_bracket_display_math_with_setext_underline(cx: &mut TestAppContext
         x
         =
         y
+        =
+        z
+        -
+        w
         \]
         After
 
         Title
         =
+
+        \[
+        u
+        =
+        v
+        -
+
+        separated
+        \]
     "});
     cx.executor().run_until_parked();
     cx.update_editor(|editor, _, cx| {
@@ -3303,7 +3316,13 @@ async fn test_bracket_display_math_with_setext_underline(cx: &mut TestAppContext
             .collect();
         assert_eq!(
             blocks,
-            [(1, 3, Some("a+b")), (5, 9, Some("x\n=\ny")), (12, 13, None)]
+            [
+                (1, 3, Some("a+b")),
+                (5, 13, Some("x\n=\ny\n=\nz\n-\nw")),
+                (16, 17, None),
+                (19, 21, None),
+                (22, 23, None),
+            ]
         );
     });
 }

@@ -8860,31 +8860,37 @@ impl Extraction<'_> {
         });
     }
 
-    /// A Setext underline inside display math splits the delimiters across
-    /// two inline trees. Only join them across this heading's underline and
-    /// into the paragraph on the very next line.
-    fn claim_math_across_underline(
+    /// A run of Setext underlines can split one display formula across several inline trees.
+    fn claim_math_across_underlines(
         &mut self,
-        heading: tree_sitter::Node,
+        mut heading: tree_sitter::Node,
         delimiters: &[(Range<usize>, BracketMathDelimiter)],
     ) -> bool {
-        let Some(next) = heading.next_named_sibling() else {
-            return false;
-        };
-        if next.kind() != "paragraph" || next.start_position().row != heading.end_position().row {
-            return false;
-        }
         let boundary = delimiters.partition_point(|(range, _)| range.start < heading.end_byte());
         let (before, after) = delimiters.split_at(boundary);
-        match (before.last(), after.first()) {
-            (
-                Some((open, BracketMathDelimiter::OpenDisplay)),
-                Some((close, BracketMathDelimiter::CloseDisplay)),
-            ) if open.start >= heading.start_byte() && close.end <= next.end_byte() => {
-                self.claim_bracket_formula(open.clone(), close.clone(), true)
-            }
-            _ => false,
+        let (
+            Some((open, BracketMathDelimiter::OpenDisplay)),
+            Some((close, BracketMathDelimiter::CloseDisplay)),
+        ) = (before.last(), after.first())
+        else {
+            return false;
+        };
+        if open.start < heading.start_byte() {
+            return false;
         }
+        while let Some(next) = heading.next_named_sibling() {
+            if next.start_position().row != heading.end_position().row {
+                break;
+            }
+            match next.kind() {
+                "setext_heading" if next.end_byte() <= close.start => heading = next,
+                "paragraph" if close.end <= next.end_byte() => {
+                    return self.claim_bracket_formula(open.clone(), close.clone(), true);
+                }
+                _ => break,
+            }
+        }
+        false
     }
 
     fn walk_block_layer(
@@ -8907,7 +8913,11 @@ impl Extraction<'_> {
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
                     self.note_references_heading(node);
                 }
-                "setext_heading" if self.claim_math_across_underline(node, delimiters) => {
+                "setext_heading"
+                    if self.bracket_math.last().is_some_and(|math| {
+                        math.start <= node.start_byte() && node.end_byte() <= math.end
+                    }) => {}
+                "setext_heading" if self.claim_math_across_underlines(node, delimiters) => {
                     push_children(node, &mut stack);
                 }
                 "setext_heading" => {
