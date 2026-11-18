@@ -3265,6 +3265,50 @@ async fn test_bracket_display_math_renders_as_block(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_bracket_display_math_with_setext_underline(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {r"
+        ˇBefore
+        \[
+        a+b
+        \]
+        Between
+        \[
+        x
+        =
+        y
+        \]
+        After
+
+        Title
+        =
+    "});
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let markers = extract_markers(editor, cx).expect("markdown markers");
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let blocks: Vec<_> = markers
+            .blocks
+            .iter()
+            .map(|block| {
+                let start = block.range.start.to_point(&snapshot).row;
+                let end = block.range.end.to_point(&snapshot).row;
+                let formula = match &block.kind {
+                    BlockRenderKind::Math { source } => Some(source.trim()),
+                    BlockRenderKind::Markdown => None,
+                    _ => panic!("unexpected block"),
+                };
+                (start, end, formula)
+            })
+            .collect();
+        assert_eq!(
+            blocks,
+            [(1, 3, Some("a+b")), (5, 9, Some("x\n=\ny")), (12, 13, None)]
+        );
+    });
+}
+
+#[gpui::test]
 async fn test_escaped_brackets_and_parentheses_stay_text(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
 
