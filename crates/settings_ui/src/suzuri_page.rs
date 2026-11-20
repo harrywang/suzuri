@@ -16,7 +16,7 @@ fn auto_sync_section() -> [SettingsPageItem; 3] {
         SettingsPageItem::SectionHeader("Auto Sync"),
         SettingsPageItem::SettingItem(SettingItem {
             title: "Sync Delay",
-            description: "How many seconds a project's files must stay unchanged before they are committed and pushed. A longer delay makes fewer, larger commits. (min: 1)",
+            description: "Seconds to wait after your last edit before syncing.",
             field: Box::new(SettingField::<u64> {
                 organization_override: None,
                 json_path: Some("auto_sync.sync_delay_seconds"),
@@ -30,7 +30,7 @@ fn auto_sync_section() -> [SettingsPageItem; 3] {
         }),
         SettingsPageItem::SettingItem(SettingItem {
             title: "Pull Interval",
-            description: "How many minutes pass between checks for changes made on your other computers. Document > Sync > Sync Now checks at once. (min: 1)",
+            description: "Minutes between checks for changes from your other computers.",
             field: Box::new(SettingField::<u64> {
                 organization_override: None,
                 json_path: Some("auto_sync.pull_interval_minutes"),
