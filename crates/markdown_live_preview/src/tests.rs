@@ -944,6 +944,67 @@ async fn test_settings_changes_toggle_live_preview_without_reopening(cx: &mut Te
 }
 
 #[gpui::test]
+async fn test_font_family_applies_only_while_rendering(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state("ˇ# Title\nsome **bold** text\n");
+    cx.executor().run_until_parked();
+
+    let buffer_font_family = cx.cx.update(|_window, cx| {
+        theme_settings::ThemeSettings::get_global(cx)
+            .buffer_font
+            .family
+            .clone()
+    });
+    let editor_font_family = |cx: &mut EditorTestContext| {
+        cx.update_editor(|editor, _window, cx| editor.style(cx).text.font_family.clone())
+    };
+    assert_eq!(editor_font_family(&mut cx), buffer_font_family);
+
+    cx.cx.update(|_window, cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.markdown_preview.get_or_insert_default().font_family =
+                    Some(settings::FontFamilyName("Avenir Next".into()));
+            });
+        });
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        editor_font_family(&mut cx),
+        SharedString::from("Avenir Next")
+    );
+    cx.cx.update(|window, cx| {
+        let style = block_markdown_style(window, cx);
+        assert_eq!(
+            style.base_text_style.font_family,
+            SharedString::from("Avenir Next")
+        );
+    });
+
+    // Showing source puts the note back in the buffer font.
+    cx.update_editor(|editor, _window, cx| {
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.enabled_override = Some(false);
+        }
+        recompute(editor, cx);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(editor_font_family(&mut cx), buffer_font_family);
+
+    cx.update_editor(|editor, _window, cx| {
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.enabled_override = Some(true);
+        }
+        recompute(editor, cx);
+    });
+    cx.executor().run_until_parked();
+    assert_eq!(
+        editor_font_family(&mut cx),
+        SharedString::from("Avenir Next")
+    );
+}
+
+#[gpui::test]
 async fn test_extended_markdown_coverage(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
 
