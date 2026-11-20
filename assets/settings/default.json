@@ -143,8 +143,8 @@
     "enabled": true,
     // The font family for markdown notes while live preview renders them,
     // such as "Avenir Next" for a document look. Other files keep the
-    // buffer font, but code inside a note uses this font too. Null uses
-    // `buffer_font_family`.
+    // buffer font, and so do a note's code blocks; inline code uses this
+    // font. Null uses `buffer_font_family`.
     "font_family": null,
     // Heading typography. Font sizes multiply the editor's base font size;
     // weights use CSS values from 100 to 900.

@@ -1444,7 +1444,7 @@ pub struct MarkdownLivePreviewSettingsContent {
     pub enabled: Option<bool>,
     /// The font family for markdown notes while live preview renders them,
     /// such as a proportional document font. Other files keep the buffer
-    /// font. Code inside a note uses this font too.
+    /// font, and so do a note's code blocks; inline code uses this font.
     ///
     /// Default: null (use `buffer_font_family`)
     pub font_family: Option<FontFamilyName>,
