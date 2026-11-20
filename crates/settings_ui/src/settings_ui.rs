@@ -1,6 +1,8 @@
 mod components;
 mod page_data;
 pub mod pages;
+// SUZURI: The fork's own settings page, kept in a file Zed never edits.
+mod suzuri_page;
 
 use agent_skills::SkillIndex;
 use anyhow::{Context as _, Result};

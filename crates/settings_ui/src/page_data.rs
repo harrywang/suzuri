@@ -65,6 +65,8 @@ macro_rules! concat_sections {
 pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
     vec![
         general_page(cx),
+        // SUZURI: The fork's own settings page; see `suzuri_page.rs`.
+        crate::suzuri_page::suzuri_page(),
         appearance_page(),
         keymap_page(),
         editor_page(),

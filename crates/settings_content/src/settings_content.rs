@@ -255,6 +255,9 @@ pub struct SettingsContent {
     /// The settings for exporting markdown notes to other formats.
     pub markdown_export: Option<MarkdownExportSettingsContent>,
 
+    /// The settings for syncing a project with its git remote automatically.
+    pub auto_sync: Option<AutoSyncSettingsContent>,
+
     /// The settings for live Typst and LaTeX preview.
     pub typeset_preview: Option<TypesetPreviewSettingsContent>,
 
@@ -422,7 +425,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
         // SUZURI: begin. The fork's own settings sections must be listed here too.
-        markdown_live_preview, typeset_preview, citations, markdown_export,
+        markdown_live_preview, typeset_preview, citations, markdown_export, auto_sync,
         // SUZURI: end
         global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
@@ -1499,6 +1502,21 @@ pub struct MarkdownExportSettingsContent {
     ///
     /// Default: "typst"
     pub pdf_engine: Option<String>,
+}
+
+/// The settings for syncing a project with its git remote automatically.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct AutoSyncSettingsContent {
+    /// How many seconds a project's files must stay unchanged before they
+    /// are committed and pushed, so a run of edits becomes one commit.
+    ///
+    /// Default: 5
+    pub sync_delay_seconds: Option<std::num::NonZeroU32>,
+    /// How many minutes pass between checks for changes made elsewhere.
+    ///
+    /// Default: 5
+    pub pull_interval_minutes: Option<std::num::NonZeroU32>,
 }
 
 /// The settings for live Typst and LaTeX preview.

@@ -1,0 +1,41 @@
+[package]
+name = "suzuri_sync"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/suzuri_sync.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+askpass.workspace = true
+collections.workspace = true
+fs.workspace = true
+futures.workspace = true
+gpui.workspace = true
+git.workspace = true
+git_ui.workspace = true
+http_client.workspace = true
+log.workspace = true
+project.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+settings.workspace = true
+util.workspace = true
+workspace.workspace = true
+zed_credentials_provider.workspace = true
+
+[dev-dependencies]
+git_ui = { workspace = true, features = ["test-support"] }
+gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+project = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
+workspace = { workspace = true, features = ["test-support"] }
