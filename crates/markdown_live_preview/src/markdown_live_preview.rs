@@ -28,7 +28,7 @@ use editor::{
     },
 };
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, ElementId, Empty, Entity, Focusable as _,
+    App, AppContext as _, ClipboardItem, Context, ElementId, Empty, Entity, Focusable as _, Font,
     FontWeight, HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent,
     Resource, RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
     TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, rems, svg,
@@ -167,7 +167,7 @@ fn heading_metrics(level: Option<u8>, cx: &App) -> HeadingMetrics {
         || (base_font_size * theme.line_height()).round(),
         |_| {
             let text_system = cx.text_system();
-            let mut font = theme.buffer_font.clone();
+            let mut font = note_font(cx);
             font.weight = text.font_weight;
             let font_id = text_system.resolve_font(&font);
             let glyph_height = text_system.ascent(font_id, font_size)
@@ -187,10 +187,11 @@ fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
     let heading = heading_metrics(level, cx).content_line_height;
     (heading / base).max(1.0)
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, RegisterSetting)]
+#[derive(Clone, Debug, Default, PartialEq, RegisterSetting)]
 
 pub struct MarkdownLivePreviewSettings {
     pub enabled: bool,
+    pub font_family: Option<SharedString>,
     pub heading_styles: MarkdownHeadingStyles,
     pub block_quote_border_color: settings::MarkdownQuoteBorderColor,
     pub block_quote_border_width: Option<f32>,
@@ -205,6 +206,9 @@ impl Settings for MarkdownLivePreviewSettings {
         let defaults = MarkdownHeadingStyles::default();
         Self {
             enabled: content.enabled.unwrap_or(true),
+            font_family: content
+                .font_family
+                .map(|family| SharedString::from(family.0.to_string())),
             block_quote_border_color: content.block_quote_border_color.unwrap_or_default(),
             block_quote_border_width: content
                 .block_quote_border_width
@@ -229,6 +233,45 @@ impl Settings for MarkdownLivePreviewSettings {
 
 pub fn init(cx: &mut App) {
     cx.observe_new(register_editor).detach();
+}
+
+/// The font a rendered note is drawn in: the buffer font, with its family
+/// replaced when `markdown_live_preview.font_family` names one.
+fn note_font(cx: &App) -> Font {
+    let mut font = theme_settings::ThemeSettings::get_global(cx)
+        .buffer_font
+        .clone();
+    if let Some(family) = &MarkdownLivePreviewSettings::get_global(cx).font_family {
+        font.family = family.clone();
+    }
+    font
+}
+
+/// Puts the editor in the note font while live preview renders it, and back
+/// in the buffer font when it shows source (preview off, a non-markdown
+/// buffer, an expanded diff).
+fn apply_note_font(editor: &mut Editor, rendering: bool, cx: &mut Context<Editor>) {
+    let family = if rendering {
+        MarkdownLivePreviewSettings::get_global(cx)
+            .font_family
+            .clone()
+    } else {
+        None
+    };
+    let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+        return;
+    };
+    // Every full editor gets this addon, so leave alone the refinement of
+    // one this font never touched.
+    if addon.note_font_family == family {
+        return;
+    }
+    addon.note_font_family = family.clone();
+    editor.set_text_style_refinement(TextStyleRefinement {
+        font_family: family,
+        ..Default::default()
+    });
+    cx.notify();
 }
 
 fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Context<Editor>) {
@@ -641,6 +684,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
 
     editor.register_addon(LivePreviewAddon {
         enabled_override: quarantined.then_some(false),
+        note_font_family: None,
         image_cache,
         markers: None,
         applied_blocks: Vec::new(),
@@ -740,6 +784,8 @@ struct LivePreviewAddon {
     /// The editor took focus from a mouse press that has not been released,
     /// so `focused` is still to be set.
     focus_awaits_mouse_up: bool,
+    /// The family `apply_note_font` last put on the editor, if any.
+    note_font_family: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -1405,6 +1451,7 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
         return;
     };
     addon.markers = markers.clone();
+    apply_note_font(editor, markers.is_some(), cx);
     apply_emphasis_highlights(editor, markers.as_deref(), cx);
     apply_heading_line_styles(editor, markers.as_deref(), cx);
     apply_decorations(editor, cx);
@@ -3102,9 +3149,8 @@ fn math_source_fallback(
     font_size: Pixels,
     cx: &App,
 ) -> AnyElement {
-    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
     let text = div()
-        .font(theme_settings.buffer_font.clone())
+        .font(note_font(cx))
         .text_size(font_size)
         .text_color(cx.theme().colors().editor_foreground)
         .child(source);
@@ -3157,7 +3203,7 @@ impl InlineMathLayout {
         let theme_settings = theme_settings::ThemeSettings::get_global(cx);
         let line_height = font_size * theme_settings.line_height();
         let text_system = cx.text_system();
-        let font_id = text_system.resolve_font(&theme_settings.buffer_font);
+        let font_id = text_system.resolve_font(&note_font(cx));
         let ascent = text_system.ascent(font_id, font_size);
         // `TextSystem::descent` is negative on macOS (a signed offset below
         // the baseline), while the painted baseline's formula
@@ -3218,9 +3264,8 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         InlineKind::Hide { .. } => Arc::new(|_, _, _| Empty.into_any_element()),
         InlineKind::Bullet => Arc::new(|_, _, _| {
             at_editor_font_size(|font_size, cx| {
-                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                 div()
-                    .font(theme_settings.buffer_font.clone())
+                    .font(note_font(cx))
                     .text_size(font_size)
                     .text_color(cx.theme().colors().text)
                     .child("•")
@@ -3267,11 +3312,10 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                 let destination = destination.clone();
                 let label = label.clone();
                 at_editor_font_size(move |font_size, cx| {
-                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                     div()
                         .id(fold_id)
                         .cursor_pointer()
-                        .font(theme_settings.buffer_font.clone())
+                        .font(note_font(cx))
                         .text_size(font_size)
                         .text_color(cx.theme().colors().text_accent)
                         .hover(|style| style.underline())
@@ -3293,12 +3337,11 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
             Arc::new(move |_, _, _| {
                 let rendered = rendered.clone();
                 at_editor_font_size(move |font_size, cx| {
-                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                     let colors = cx.theme().colors();
                     // The same chip the key carries in source, so a rendered
                     // citation and a revealed one read as the same object.
                     div()
-                        .font(theme_settings.buffer_font.clone())
+                        .font(note_font(cx))
                         .text_size(font_size)
                         .text_color(colors.text)
                         .bg(colors.editor_document_highlight_read_background)
@@ -3314,14 +3357,13 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
             Arc::new(move |_, _, _| {
                 let label = label.clone();
                 at_editor_font_size(move |font_size, cx| {
-                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                     // The editor centers an inline element in the line, so the
                     // only way to raise a marker above the baseline is to pad it
                     // asymmetrically: bottom padding of 2d shifts it up by d.
                     let raise = font_size * 0.3;
                     div()
                         .pb(raise * 2.0)
-                        .font(theme_settings.buffer_font.clone())
+                        .font(note_font(cx))
                         .text_size(font_size * 0.75)
                         .text_color(cx.theme().colors().text_accent)
                         .child(label)
@@ -3401,9 +3443,8 @@ fn soft_break_placeholder() -> FoldPlaceholder {
     FoldPlaceholder {
         render: Arc::new(|_, _, _| {
             at_editor_font_size(|font_size, cx| {
-                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                 div()
-                    .font(theme_settings.buffer_font.clone())
+                    .font(note_font(cx))
                     .text_size(font_size)
                     .child(" ")
                     .into_any_element()
@@ -5223,7 +5264,7 @@ fn render_table_block(
         // advance, so it would still wrap.
         let character_width = {
             let settings = theme_settings::ThemeSettings::get_global(block_cx.app);
-            let font = settings.buffer_font.clone();
+            let font = note_font(block_cx.app);
             let font_size = settings.buffer_font_size(block_cx.app);
             let text_system = block_cx.window.text_system();
             let font_id = text_system.resolve_font(&font);
@@ -8254,7 +8295,7 @@ fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             settings::MarkdownQuoteBorderColor::LineNumber => colors.editor_line_number,
         };
     let settings = theme_settings::ThemeSettings::get_global(cx);
-    let font_family = settings.buffer_font.family.clone();
+    let font_family = note_font(cx).family;
     // Rendered prose must retain the source editor's metrics rather than the
     // UI typography that MarkdownFont::Editor uses for general Markdown views.
     let typography = TextStyleRefinement {

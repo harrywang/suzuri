@@ -1442,6 +1442,12 @@ pub struct MarkdownLivePreviewSettingsContent {
     ///
     /// Default: true
     pub enabled: Option<bool>,
+    /// The font family for markdown notes while live preview renders them,
+    /// such as a proportional document font. Other files keep the buffer
+    /// font. Code inside a note uses this font too.
+    ///
+    /// Default: null (use `buffer_font_family`)
+    pub font_family: Option<FontFamilyName>,
     // SUZURI: Keep the native heading settings during upstream schema updates.
     /// Typography overrides for rendered heading levels.
     pub heading_styles: Option<MarkdownHeadingStylesSettingsContent>,
