@@ -184,14 +184,14 @@
   "markdown_export": {
     // The program Pandoc typesets PDFs with.
     //
-    // "typst" is the default because live preview already provisions Typst,
-    // so exporting a PDF needs no TeX installation at all. Naming a LaTeX
-    // engine instead uses a TeX Live you already have, which is what a
+    // "typst" is the default because Suzuri already provisions Typst for
+    // typesetting, so exporting a PDF needs no TeX installation at all. Naming
+    // a LaTeX engine instead uses a TeX Live you already have, which is what a
     // conference template pinning \RequirePDFTeX will want:
     //   "typst", "xelatex", "lualatex", "pdflatex", "context"
     "pdf_engine": "typst",
   },
-  // Live Typst and LaTeX preview settings
+  // Live LaTeX preview settings
   "typeset_preview": {
     // Which engine compiles .tex files.
     //

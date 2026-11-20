@@ -1323,11 +1323,27 @@ impl LanguageServer {
 
     /// Checks if a notification handler has been registered via [`Self::on_notification`].
     pub fn has_notification_handler<T: notification::Notification>(&self) -> bool {
-        self.notification_handlers.lock().contains_key(T::METHOD)
+        self.has_notification_handler_for_method(T::METHOD)
     }
 
+    /// Checks if a notification handler has been registered for `method`.
+    ///
+    /// This is like [`Self::has_notification_handler`] for methods that are
+    /// only known at runtime, such as notifications forwarded by
+    /// [`Self::on_custom_notification`].
+    pub fn has_notification_handler_for_method(&self, method: &'static str) -> bool {
+        self.notification_handlers.lock().contains_key(method)
+    }
+
+    /// Register a handler for an incoming LSP notification method known only at
+    /// runtime.
+    ///
+    /// Prefer [`Self::on_notification`] when the method has a typed
+    /// `notification::Notification` implementation.
+    ///
+    /// [LSP Specification](https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#notificationMessage)
     #[must_use]
-    fn on_custom_notification<Params, F>(&self, method: &'static str, mut f: F) -> Subscription
+    pub fn on_custom_notification<Params, F>(&self, method: &'static str, mut f: F) -> Subscription
     where
         F: 'static + FnMut(Params, &mut AsyncApp) + Send,
         Params: DeserializeOwned + 'static,

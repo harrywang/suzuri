@@ -1,0 +1,66 @@
+[package]
+name = "typst_live_preview"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[features]
+# Exposes the fake preview backend and the guest RelayClient to the
+# two-client collab harness.
+test-support = []
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+editor.workspace = true
+ecow = "0.2.2"
+extension_host.workspace = true
+futures.workspace = true
+futures-lite.workspace = true
+gpui.workspace = true
+image.workspace = true
+language.workspace = true
+log.workspace = true
+lsp.workspace = true
+menu.workspace = true
+project.workspace = true
+proto.workspace = true
+remote.workspace = true
+resvg.workspace = true
+rpc.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+smol.workspace = true
+svgtypes = "0.16.1"
+tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
+tokio-tungstenite = "0.26"
+ui.workspace = true
+unicode-script.workspace = true
+util.workspace = true
+workspace.workspace = true
+
+vello = "0.7.0"
+
+# The vector IR and incremental client that Tinymist's preview data plane
+# speaks. Pinned to the revision Tinymist 0.15.10 builds against, because the
+# wire format is the rkyv layout of these very types.
+reflexo = { git = "https://github.com/Myriad-Dreamin/typst.ts", rev = "98ea19e0c32277646bf435b246477882ad818c9f", default-features = false, features = [
+    "flat-vector",
+] }
+
+[dev-dependencies]
+client = { workspace = true, features = ["test-support"] }
+clock = { workspace = true, features = ["test-support"] }
+feature_flags.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+language = { workspace = true, features = ["test-support"] }
+node_runtime.workspace = true
+project = { workspace = true, features = ["test-support"] }
+rpc = { workspace = true, features = ["test-support"] }
+settings = { workspace = true, features = ["test-support"] }
+workspace = { workspace = true, features = ["test-support"] }

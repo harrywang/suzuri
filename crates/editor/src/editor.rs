@@ -383,7 +383,9 @@ pub fn init(cx: &mut App) {
                     workspace.project(),
                     window,
                     |workspace, _, event, window, cx| {
-                        if let project::Event::LanguageServerShowDocument(request) = event {
+                        if let project::Event::LanguageServerShowDocument(request) = event
+                            && request.origin != project::lsp_store::ShowDocumentOrigin::Preview
+                        {
                             items::handle_lsp_show_document(workspace, request, window, cx)
                                 .detach();
                         }

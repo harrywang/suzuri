@@ -3794,6 +3794,9 @@ impl Project {
         cx: &mut Context<Self>,
     ) {
         match event {
+            // Forwarded only when a feature asked for the method; nothing in
+            // this crate consumes extension notifications directly.
+            LspStoreEvent::CustomNotification { .. } => {}
             LspStoreEvent::DiagnosticsUpdated { server_id, paths } => {
                 cx.emit(Event::DiagnosticsUpdated {
                     paths: paths.clone(),
@@ -5681,6 +5684,19 @@ impl Project {
             .project_path_for_absolute_path(abs_path, cx)
     }
 
+    /// Asks the editor to show a document, as if a language server requested it.
+    ///
+    /// This is the entry point for features that resolve a source location
+    /// outside the LSP request path, such as the collaborative Typst preview
+    /// forwarding a click back to the guest.
+    pub fn show_document(
+        &mut self,
+        request: LanguageServerShowDocumentRequest,
+        cx: &mut Context<Self>,
+    ) {
+        cx.emit(Event::LanguageServerShowDocument(request));
+    }
+
     pub fn get_workspace_root(&self, project_path: &ProjectPath, cx: &App) -> Option<PathBuf> {
         Some(
             self.worktree_for_id(project_path.worktree_id, cx)?
@@ -5975,6 +5991,11 @@ impl Project {
         );
         let uri = lsp::Uri::from_str(&payload.uri)
             .with_context(|| format!("parsing show document uri {}", payload.uri))?;
+        // A preview resolves a click through this path too when the host
+        // project is an SSH remote. Taking the hint here keeps that request
+        // from moving the host's editor.
+        let lsp_store = project.read_with(&cx, |project, _| project.lsp_store());
+        let origin = lsp_store.update(&mut cx, |store, _| store.take_show_document_origin());
         let (tx, rx) = async_channel::bounded(1);
         project.update(&mut cx, |_, cx| {
             cx.emit(Event::LanguageServerShowDocument(
@@ -5983,6 +6004,7 @@ impl Project {
                     external: payload.external,
                     take_focus: payload.take_focus,
                     selection,
+                    origin,
                     response_channel: tx,
                 },
             ));

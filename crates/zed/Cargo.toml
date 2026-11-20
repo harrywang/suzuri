@@ -148,6 +148,7 @@ pdf_viewer.workspace = true
 json_canvas.workspace = true
 note_graph.workspace = true
 typeset_preview.workspace = true
+typst_live_preview.workspace = true
 input_latency_ui.workspace = true
 inspector_ui.workspace = true
 install_cli.workspace = true

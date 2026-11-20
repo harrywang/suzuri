@@ -10,7 +10,7 @@
 #   work-dir   defaults to a fresh mktemp dir
 #
 # It takes keyboard focus for about a minute. Needs Accessibility permission for the
-# terminal (osascript), plus screencapture, swiftc, typst and pdftotext.
+# terminal (osascript), plus screencapture, swiftc, typst, pdftotext and Tinymist.
 set -uo pipefail
 
 APP=${1:-/Applications/Suzuri.app/Contents/MacOS/zed}
@@ -60,7 +60,7 @@ EOF
 cat > "$T/data/config/keymap.json" <<'EOF'
 [
   { "context": "Workspace", "bindings": {
-      "ctrl-alt-cmd-pageup": "typeset_preview::OpenLivePreview",
+      "ctrl-alt-cmd-pageup": "typst_live_preview::OpenPreview",
       "ctrl-alt-cmd-end": "pane::ActivatePreviousItem",
       "ctrl-alt-cmd-home": "project_panel::ToggleFocus" } },
   { "context": "ProjectPanel", "bindings": {
@@ -72,7 +72,7 @@ WINFO="$T/winfo"
 swiftc -O -o "$WINFO" "$SKILL_DIR/winfo.swift" 2>/dev/null || { echo "swiftc failed"; exit 2; }
 
 log_start=$(wc -c < "$LOG" 2>/dev/null || echo 0)
-ZED_RELEASE_CHANNEL=nightly ZED_LOG=info,pdf_viewer=debug,typeset_preview=debug \
+ZED_RELEASE_CHANNEL=nightly ZED_LOG=info,pdf_viewer=debug,typeset_preview=debug,typst_live_preview=debug \
   nohup "$APP" --user-data-dir "$T/data" "$T/vault" \
   "$T/vault/paper.typ" "$T/vault/sample.pdf" "$T/vault/note.md" > "$T/stderr.log" 2>&1 &
 launcher=$!
@@ -130,11 +130,11 @@ goto() {
 goto note.md "live preview tab" 01-note
 goto sample.pdf "PDF viewer tab" 02-pdf
 goto paper.typ "paper.typ tab" 03-typ
-chord 116; sleep 12; expect_title paper.pdf "Typst preview opened the compiled PDF" 04-typst-preview
-if pdftotext "$T/vault/paper.pdf" - 2>/dev/null | grep -q "Smoke Paper"; then
-  pass "Typst preview compiled paper.pdf"
+chord 116; sleep 12; expect_title "Preview paper.typ" "Typst live preview opened" 04-typst-preview
+if grep -q "typst live preview: connected" "$LOG"; then
+  pass "Typst live preview connected to Tinymist's data plane"
 else
-  fail "paper.pdf missing or without the expected text"
+  fail "no 'typst live preview: connected' log line; is Tinymist installed?"
 fi
 chord 115; sleep 2; chord 121; sleep 3; shot 05-panel-refresh
 if kill -0 "$pid" 2>/dev/null; then pass "alive after panel focus and refresh"; else fail "app exited during the run"; fi

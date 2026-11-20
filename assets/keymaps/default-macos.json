@@ -1729,6 +1729,42 @@
       "cmd-alt-g": "pdf_viewer::GoToPage",
     },
   },
+  // Typst live preview: scrolling, zoom, navigation, and copying selected text.
+  {
+    "context": "Editor && extension == typ",
+    "bindings": {
+      "cmd-alt-p": "typst_live_preview::ScrollPreviewToCursor",
+    },
+  },
+  {
+    "context": "TypstLivePreview",
+    "bindings": {
+      "cmd-c": "typst_live_preview::Copy",
+      "cmd-=": "typst_live_preview::ZoomIn",
+      "cmd-+": "typst_live_preview::ZoomIn",
+      "cmd--": "typst_live_preview::ZoomOut",
+      "cmd-0": "typst_live_preview::ResetZoom",
+      "cmd-g": "typst_live_preview::GoToPage",
+      "cmd-shift-o": "typst_live_preview::ToggleOutline",
+      "cmd-f": "typst_live_preview::FindInPreview",
+      "f3": "typst_live_preview::FindNext",
+      "shift-f3": "typst_live_preview::FindPrevious",
+      "escape": "typst_live_preview::CloseFind",
+      "cmd-shift-e": "typst_live_preview::ExportPdf",
+      "ctrl-pageup": "typst_live_preview::PreviousPage",
+      "ctrl-pagedown": "typst_live_preview::NextPage",
+      "up": "typst_live_preview::ScrollLineUp",
+      "down": "typst_live_preview::ScrollLineDown",
+      "left": "typst_live_preview::ScrollLeft",
+      "right": "typst_live_preview::ScrollRight",
+      "pageup": "typst_live_preview::ScrollPageUp",
+      "pagedown": "typst_live_preview::ScrollPageDown",
+      "shift-space": "typst_live_preview::ScrollPageUp",
+      "space": "typst_live_preview::ScrollPageDown",
+      "home": "typst_live_preview::ScrollToTop",
+      "end": "typst_live_preview::ScrollToBottom",
+    },
+  },
   {
     "context": "PdfViewer && not_editing",
     "bindings": {

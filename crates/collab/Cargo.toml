@@ -75,6 +75,7 @@ uuid.workspace = true
 [dev-dependencies]
 async-channel.workspace = true
 async-trait.workspace = true
+base64.workspace = true
 
 buffer_diff.workspace = true
 call = { workspace = true, features = ["test-support"] }
@@ -91,6 +92,7 @@ dap_adapters = { workspace = true, features = ["test-support"] }
 
 debugger_ui = { workspace = true, features = ["test-support"] }
 editor = { workspace = true, features = ["test-support"] }
+env_logger.workspace = true
 extension.workspace = true
 file_finder.workspace = true
 fs = { workspace = true, features = ["test-support"] }
@@ -127,6 +129,7 @@ task.workspace = true
 theme.workspace = true
 theme_settings = { workspace = true, features = ["test-support"] }
 title_bar = { workspace = true, features = ["test-support"] }
+typst_live_preview = { workspace = true, features = ["test-support"] }
 
 unindent.workspace = true
 util.workspace = true

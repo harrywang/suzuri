@@ -1,0 +1,342 @@
+#!/usr/bin/env bash
+# Run a local collaboration stack for testing the Typst live preview relay.
+#
+# It starts a Postgres cluster, a small fake zed-cloud (auth only), and the
+# real collab server from this tree. Two dev users (alice and bob) are seeded,
+# so a host and a guest can share a project without zed.dev accounts.
+#
+#   script/collab-dev setup                 # create db + users, no servers
+#   script/collab-dev serve                 # run cloud + collab until Ctrl-C
+#   script/collab-dev client alice          # host client (separate terminal)
+#   script/collab-dev client bob --host IP  # guest client, on another machine
+#   script/collab-dev env bob --host IP     # print guest env for venus
+#
+# The host needs the Typst extension. Pass --link-extensions to share the
+# typst extension from your normal Suzuri profile with the isolated test
+# profile. The preview relay itself needs no extra ports: the host's Tinymist
+# stays on its loopback and frames travel over the collab RPC websocket.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DEV_DIR="${COLLAB_DEV_DIR:-$ROOT/target/collab-dev}"
+PGDATA="$DEV_DIR/pg"
+LOGS="$DEV_DIR/logs"
+SCHEMA="$ROOT/crates/collab/migrations/20251208000000_test_schema.sql"
+COLLAB_BIN="$ROOT/target/debug/collab"
+ADMIN_TOKEN="internal-api-key-secret"
+
+CLOUD_PID=""
+COLLAB_PID=""
+
+usage() {
+    awk 'NR > 1 && /^set -euo pipefail$/ { exit } NR > 1 { sub(/^# ?/, ""); print }' "$0"
+    exit "${1:-0}"
+}
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+stop_pg() {
+    if [[ -s "$PGDATA/PG_VERSION" ]] && pg_ctl -D "$PGDATA" status >/dev/null 2>&1; then
+        pg_ctl -D "$PGDATA" stop -m fast >/dev/null 2>&1 || true
+    fi
+}
+
+cleanup() {
+    [[ -n "$COLLAB_PID" ]] && kill "$COLLAB_PID" 2>/dev/null || true
+    [[ -n "$CLOUD_PID" ]] && kill "$CLOUD_PID" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+ensure_pg() {
+    mkdir -p "$PGDATA" "$LOGS"
+    if pg_isready -h 127.0.0.1 -p 5432 -q; then
+        return
+    fi
+    if [[ ! -s "$PGDATA/PG_VERSION" ]]; then
+        log "initializing Postgres in $PGDATA"
+        initdb -D "$PGDATA" --auth=trust -U postgres --no-instructions >/dev/null
+    fi
+    log "starting Postgres"
+    # Unix sockets are optional here; TCP on loopback is enough.
+    pg_ctl -D "$PGDATA" -l "$LOGS/pg.log" \
+        -o "-p 5432 -c listen_addresses=127.0.0.1 -c unix_socket_directories=" \
+        start >/dev/null
+    for _ in $(seq 1 60); do
+        pg_isready -h 127.0.0.1 -p 5432 -q && return
+        sleep 0.25
+    done
+    die "Postgres did not become ready; see $LOGS/pg.log"
+}
+
+psql_zed() {
+    psql -h 127.0.0.1 -p 5432 -U postgres -d zed -v ON_ERROR_STOP=1 "$@"
+}
+
+ensure_db() {
+    local exists
+    exists="$(psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -tAc \
+        "select 1 from pg_database where datname='zed'")"
+    if [[ "$exists" != 1 ]]; then
+        log "creating database zed"
+        createdb -h 127.0.0.1 -p 5432 -U postgres -O postgres zed
+    fi
+
+    exists="$(psql_zed -tAc \
+        "select 1 from information_schema.tables where table_schema='public' and table_name='users'")"
+    if [[ "$exists" != 1 ]]; then
+        log "applying the collab schema"
+        psql_zed -q -f "$SCHEMA"
+    fi
+
+    log "seeding dev users alice and bob"
+    psql_zed -q <<'SQL'
+insert into users (id, admin, connected_once)
+values (1, true, false), (2, true, false)
+on conflict (id) do update set admin = excluded.admin;
+select setval('public.users_id_seq', (select max(id) from users));
+
+insert into contacts (user_id_a, user_id_b, a_to_b, should_notify, accepted)
+select 1, 2, true, true, true
+where not exists (
+    select 1 from contacts
+    where (user_id_a = 1 and user_id_b = 2) or (user_id_a = 2 and user_id_b = 1)
+);
+SQL
+}
+
+lan_ip() {
+    local ip
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    printf '%s' "${ip:-<host-ip>}"
+}
+
+urls_for_host() {
+    local host="$1"
+    if [[ "$host" == "localhost" || "$host" == "127.0.0.1" ]]; then
+        # The client maps http://localhost:3000 to the cloud at :8787.
+        printf 'http://localhost:3000 http://localhost:8080/rpc'
+    else
+        printf 'http://%s:8787 http://%s:8080/rpc' "$host" "$host"
+    fi
+}
+
+serve() {
+    command -v python3 >/dev/null || die "python3 is required for the dev cloud"
+    if [[ ! -x "$COLLAB_BIN" ]]; then
+        log "building collab"
+        (cd "$ROOT" && cargo build -p collab)
+    fi
+
+    python3 "$ROOT/script/collab-dev-cloud.py" 8787 >"$LOGS/dev-cloud.log" 2>&1 &
+    CLOUD_PID=$!
+
+    local attempt ready ip
+    for attempt in 1 2; do
+        log "starting the collab server on :8080"
+        (cd "$ROOT" && exec "$COLLAB_BIN" serve collab) >"$LOGS/collab.log" 2>&1 &
+        COLLAB_PID=$!
+
+        ready=false
+        for _ in $(seq 1 120); do
+            if curl -sf http://127.0.0.1:8080/healthz >/dev/null 2>&1; then
+                ready=true
+                break
+            fi
+            if ! kill -0 "$COLLAB_PID" 2>/dev/null; then
+                break
+            fi
+            sleep 0.5
+        done
+        [[ "$ready" == true ]] && break
+
+        # `cargo test -p collab --features test-support` overwrites
+        # target/debug/collab with a test-support build, which panics when it
+        # calls create_server outside the test harness. Rebuild once.
+        if [[ "$attempt" == 1 ]] && ! kill -0 "$COLLAB_PID" 2>/dev/null; then
+            log "collab exited immediately; rebuilding without test-support"
+            touch "$ROOT/crates/collab/src/main.rs"
+            (cd "$ROOT" && cargo build -p collab)
+            continue
+        fi
+
+        tail -n 30 "$LOGS/collab.log" >&2 || true
+        die "the collab server did not become healthy"
+    done
+
+    ip="$(lan_ip)"
+    cat <<EOF
+
+Local collaboration stack is ready.
+
+  collab RPC   http://$ip:8080/rpc
+  dev cloud    http://$ip:8787
+  logs         $LOGS
+
+Host (this machine):
+  script/collab-dev client alice
+
+Guest (on venus):
+  script/collab-dev env bob --host $ip
+  # then run the printed command on venus, in this same tree
+
+In the host window, open the collaboration panel, start a call with bob,
+and share the project. Open the Typst document on both sides; the guest pane
+starts the relay automatically.
+
+Press Ctrl-C to stop the cloud and collab server.
+EOF
+
+    wait "$COLLAB_PID"
+}
+
+client() {
+    local user="${1:-}"; shift || true
+    [[ "$user" == "alice" || "$user" == "bob" ]] || die "user must be alice or bob"
+
+    local host="localhost"
+    local binary=""
+    local link_extensions=false
+    local extensions_source=""
+    local -a user_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --host) host="$2"; shift 2 ;;
+            --binary) binary="$2"; shift 2 ;;
+            --link-extensions) link_extensions=true; shift ;;
+            --extensions) extensions_source="$2"; shift 2 ;;
+            --) shift; user_args=("$@"); break ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    if [[ -z "$binary" ]]; then
+        for candidate in \
+            "$ROOT/target/x86_64-unknown-linux-gnu/release/zed" \
+            "$ROOT/target/release/zed" \
+            "$ROOT/target/debug/zed" \
+            "/usr/lib/suzuri/libexec/zed-editor"; do
+            if [[ -x "$candidate" ]]; then
+                binary="$candidate"
+                break
+            fi
+        done
+    fi
+    [[ -n "$binary" && -x "$binary" ]] || die "no client binary; build one with 'cargo build -p zed' or pass --binary"
+    command -v script >/dev/null || die "the 'script' command is required to allocate the PTY that enables dev sign-in"
+
+    # A host without the relay builds a relay that only fails at runtime with
+    # "language server 0 not found" on the guest. Catch that here instead.
+    if ! grep -aq "suzuri.typstPreview.start" "$binary"; then
+        log "warning: $binary does not contain the collaborative preview relay"
+        log "         build the current tree or pass --binary with a relay-capable build"
+    fi
+
+    local dir="$DEV_DIR/clients/$user"
+    mkdir -p "$dir/config" "$dir/cache" "$dir/data" "$LOGS"
+
+    if [[ "$link_extensions" == true ]]; then
+        if [[ -z "$extensions_source" ]]; then
+            for candidate in "$HOME/.local/share/suzuri/extensions" "$HOME/.local/share/zed/extensions"; do
+                if [[ -d "$candidate" ]]; then
+                    extensions_source="$candidate"
+                    break
+                fi
+            done
+        fi
+        [[ -n "$extensions_source" && -d "$extensions_source" ]] || die "no extensions dir found; pass --extensions PATH"
+        if [[ -e "$dir/data/extensions" || -L "$dir/data/extensions" ]]; then
+            log "extensions already present in $dir/data; leaving them alone"
+        else
+            ln -s "$extensions_source" "$dir/data/extensions"
+            log "linked extensions from $extensions_source"
+        fi
+    fi
+
+    local server_url rpc_url
+    read -r server_url rpc_url <<<"$(urls_for_host "$host")"
+
+    local wrapper="$dir/launch.sh"
+    {
+        echo '#!/usr/bin/env bash'
+        printf 'exec '
+        printf '%q ' "$binary" --user-data-dir "$dir/data"
+        if (( ${#user_args[@]} )); then
+            printf '%q ' "${user_args[@]}"
+        fi
+        echo
+    } >"$wrapper"
+    chmod +x "$wrapper"
+
+    log "launching $user against $rpc_url (log: $dir/data/logs/Suzuri.log)"
+    env \
+        ZED_SERVER_URL="$server_url" \
+        ZED_RPC_URL="$rpc_url" \
+        ZED_IMPERSONATE="$user" \
+        ZED_ADMIN_API_TOKEN="$ADMIN_TOKEN" \
+        ZED_STATELESS=1 \
+        ZED_ALWAYS_ACTIVE=1 \
+        ZED_WINDOW_POSITION="${ZED_WINDOW_POSITION:-0,0}" \
+        ZED_WINDOW_SIZE="${ZED_WINDOW_SIZE:-1200,800}" \
+        XDG_CONFIG_HOME="$dir/config" \
+        XDG_CACHE_HOME="$dir/cache" \
+        RUST_LOG="${RUST_LOG:-info,client=debug,collab=debug,typst_live_preview=debug}" \
+        script -qefc "$wrapper" /dev/null
+}
+
+print_env() {
+    local user="${1:-}"; shift || true
+    [[ "$user" == "alice" || "$user" == "bob" ]] || die "user must be alice or bob"
+
+    local host="localhost"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --host) host="$2"; shift 2 ;;
+            *) die "unknown option: $1" ;;
+        esac
+    done
+
+    local server_url rpc_url
+    read -r server_url rpc_url <<<"$(urls_for_host "$host")"
+    cat <<EOF
+# Run these on the guest machine, in this tree:
+export ZED_SERVER_URL=$server_url
+export ZED_RPC_URL=$rpc_url
+export ZED_IMPERSONATE=$user
+export ZED_ADMIN_API_TOKEN=$ADMIN_TOKEN
+export ZED_STATELESS=1
+
+# Then:
+#   script/collab-dev client $user --host $host
+EOF
+}
+
+cmd="${1:-}"
+[[ $# -gt 0 ]] && shift
+case "$cmd" in
+    setup)
+        ensure_pg
+        ensure_db
+        log "ready; start the stack with: script/collab-dev serve"
+        ;;
+    serve)
+        ensure_pg
+        ensure_db
+        serve
+        ;;
+    client)
+        client "$@"
+        ;;
+    env)
+        print_env "$@"
+        ;;
+    stop)
+        stop_pg
+        ;;
+    -h | --help | help)
+        usage 0
+        ;;
+    *)
+        usage 2
+        ;;
+esac

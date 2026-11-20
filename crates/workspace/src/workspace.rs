@@ -1667,6 +1667,12 @@ pub struct Workspace {
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
     active_pane: Entity<Pane>,
     last_active_center_pane: Option<WeakEntity<Pane>>,
+    /// Center panes ordered by focus recency, most recent first.
+    ///
+    /// `last_active_center_pane` only remembers one pane. Language-server
+    /// "show document" requests also need the pane the user was in *before*
+    /// focusing a preview or another auxiliary view.
+    recent_center_panes: Vec<WeakEntity<Pane>>,
     last_active_view_id: Option<proto::ViewId>,
     status_bar: Entity<StatusBar>,
     pub(crate) modal_layer: Entity<ModalLayer>,
@@ -2167,6 +2173,7 @@ impl Workspace {
             panes_by_item: Default::default(),
             active_pane: center_pane.clone(),
             last_active_center_pane: Some(center_pane.downgrade()),
+            recent_center_panes: vec![center_pane.downgrade()],
             last_active_view_id: None,
             status_bar,
             modal_layer,
@@ -5240,10 +5247,27 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
+        self.open_abs_path_in_pane(abs_path, None, options, window, cx)
+    }
+
+    /// Like [`Self::open_abs_path`], but opens the file in `pane` when it has
+    /// to create a new item.
+    ///
+    /// Passing `None` uses the default destination. An explicit pane also
+    /// applies to files outside the project's worktrees, which `open_abs_path`
+    /// otherwise resolves through `open_paths` without a pane hint.
+    pub fn open_abs_path_in_pane(
+        &mut self,
+        abs_path: PathBuf,
+        pane: Option<WeakEntity<Pane>>,
+        options: OpenOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
         cx.spawn_in(window, async move |workspace, cx| {
             let open_paths_task_result = workspace
                 .update_in(cx, |workspace, window, cx| {
-                    workspace.open_paths(vec![abs_path.clone()], options, None, window, cx)
+                    workspace.open_paths(vec![abs_path.clone()], options, pane, window, cx)
                 })
                 .with_context(|| format!("open abs path {abs_path:?} task spawn"))?
                 .await;
@@ -6332,6 +6356,7 @@ impl Workspace {
 
         if self.last_active_center_pane.is_none() {
             self.last_active_center_pane = Some(pane.downgrade());
+            self.remember_active_center_pane(&pane);
         }
 
         // If this pane is in a dock, preserve that dock when dismissing zoomed items.
@@ -6382,6 +6407,21 @@ impl Workspace {
         self.active_pane = pane.clone();
         self.active_item_path_changed(true, window, cx);
         self.last_active_center_pane = Some(pane.downgrade());
+        self.remember_active_center_pane(pane);
+    }
+
+    /// Moves `pane` to the front of the focus-recency list.
+    ///
+    /// Only center panes are remembered. `handle_pane_focused` also runs for
+    /// panes inside docks (terminals, debuggers), and targeting one of those
+    /// would put an editor tab in the dock.
+    fn remember_active_center_pane(&mut self, pane: &Entity<Pane>) {
+        if !self.panes.contains(pane) {
+            return;
+        }
+        self.recent_center_panes
+            .retain(|recent| recent.upgrade().is_some_and(|recent| recent != *pane));
+        self.recent_center_panes.insert(0, pane.downgrade());
     }
 
     fn handle_panel_focused(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6680,6 +6720,65 @@ impl Workspace {
 
     pub fn active_pane(&self) -> &Entity<Pane> {
         &self.active_pane
+    }
+
+    /// The center pane a document opened by a language server should target.
+    ///
+    /// This follows focus recency, not edit history. If the most recently
+    /// highlighted pane is showing an auxiliary view (preview, PDF viewer,
+    /// terminal), the pane that was highlighted before it is used instead,
+    /// whatever it contains. A click in the preview therefore opens its source
+    /// next to the preview instead of covering it.
+    pub fn pane_for_lsp_jump(&self, cx: &App) -> Option<WeakEntity<Pane>> {
+        let is_center_pane = |pane: &Entity<Pane>| self.panes.contains(pane);
+        let mut seen = HashSet::default();
+        let mut panes = std::iter::once(self.active_pane.clone())
+            .filter(is_center_pane)
+            .chain(
+                self.recent_center_panes
+                    .iter()
+                    .filter_map(|pane| pane.upgrade())
+                    .filter(|pane| is_center_pane(pane)),
+            )
+            .chain(self.panes.iter().cloned())
+            .filter(|pane| seen.insert(pane.entity_id()));
+
+        let most_recent = panes.next()?;
+        if Self::is_editor_pane(&most_recent, cx) {
+            return Some(most_recent.downgrade());
+        }
+        panes.next().map(|pane| pane.downgrade())
+    }
+
+    /// Whether `pane` is currently showing something that can host an editor
+    /// tab without covering an auxiliary view.
+    fn is_editor_pane(pane: &Entity<Pane>, cx: &App) -> bool {
+        pane.read(cx)
+            .active_item()
+            .is_none_or(|item| item.buffer_kind(cx) != ItemBufferKind::None)
+    }
+
+    /// Returns the center pane that already has a singleton tab for
+    /// `project_path`, if any.
+    ///
+    /// Language-server "show document" requests use this to reveal the file's
+    /// existing tab instead of opening a second copy. Only singleton items are
+    /// considered: multi-buffers that happen to contain the file are not the
+    /// tab the user means.
+    pub fn pane_containing_project_path(
+        &self,
+        project_path: &ProjectPath,
+        cx: &App,
+    ) -> Option<WeakEntity<Pane>> {
+        self.panes
+            .iter()
+            .find(|pane| {
+                pane.read(cx).items().any(|item| {
+                    item.buffer_kind(cx) == ItemBufferKind::Singleton
+                        && item.project_path(cx).as_ref() == Some(project_path)
+                })
+            })
+            .map(|pane| pane.downgrade())
     }
 
     pub fn focused_pane(&self, window: &Window, cx: &App) -> Entity<Pane> {
@@ -8022,6 +8121,8 @@ impl Workspace {
         if self.last_active_center_pane == Some(pane.downgrade()) {
             self.last_active_center_pane = None;
         }
+        self.recent_center_panes
+            .retain(|recent| recent.upgrade().is_some_and(|recent| recent != *pane));
         cx.notify();
     }
 
@@ -15108,6 +15209,49 @@ mod tests {
                 "Switching to another item should trigger deferred save of the previous item"
             );
         });
+    }
+
+    #[gpui::test]
+    async fn test_pane_for_lsp_jump_targets_center_panes_only(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+
+        let center_pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+
+        // A pane that is not part of `Workspace::panes` stands in for a dock
+        // pane (terminal, debugger). Focusing it must not make it the target
+        // for an editor tab: `open_path` would put the tab in the dock.
+        let dock_pane = workspace.update_in(cx, |workspace, window, cx| {
+            let pane = cx.new(|cx| {
+                Pane::new(
+                    workspace.weak_handle(),
+                    workspace.project().clone(),
+                    workspace.pane_history_timestamp.clone(),
+                    None,
+                    NewFile.boxed_clone(),
+                    true,
+                    window,
+                    cx,
+                )
+            });
+            workspace.active_pane = pane.clone();
+            workspace.remember_active_center_pane(&pane);
+            pane
+        });
+
+        assert_ne!(dock_pane.entity_id(), center_pane.entity_id());
+        let target = workspace.read_with(cx, |workspace, cx| workspace.pane_for_lsp_jump(cx));
+        assert_eq!(
+            target
+                .and_then(|pane| pane.upgrade())
+                .map(|pane| pane.entity_id()),
+            Some(center_pane.entity_id()),
+            "a dock pane must never receive the editor tab"
+        );
     }
 
     #[gpui::test]

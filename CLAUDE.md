@@ -28,7 +28,8 @@ The fork's own changes are small and additive:
 | Live preview (the feature) | `crates/markdown_live_preview/` |
 | LaTeX math rendering for live preview | `crates/math_render/` |
 | PDF viewer (adopted from zed#51040) | `crates/pdf_viewer/` |
-| Live Typst/LaTeX preview | `crates/typeset_preview/` |
+| Live LaTeX/HTML preview, and the Typst provisioning markdown export shares | `crates/typeset_preview/` |
+| Live Typst preview (Tinymist stream rendered with Vello) | `crates/typst_live_preview/` |
 | Read-only JSON Canvas viewer (`.canvas`; agents write the file, the view follows it) | `crates/json_canvas/`, `crates/zed/src/main.rs` (`init` after `editor::init`, so it wins over the text editor) |
 | Local graph: the notes linked to and from the active note, in a split that follows it (Document → Show Local Graph). Links are read from disk and resolved with live preview's `WikilinkTarget`, so a wikilink is drawn to the note that clicking it opens (markdown-link paths are matched as written, without the filesystem's case folding) | `crates/note_graph/`, `crates/markdown_live_preview/src/markdown_live_preview.rs` (`WikilinkTarget`), `crates/zed/src/main.rs` (`init`) |
 | Concealment + highlight hooks live preview needs | `crates/editor/src/display_map.rs`, `display_map/fold_map.rs`, `fold.rs`, `crates/editor/src/selections_collection.rs` |
@@ -40,7 +41,7 @@ The fork's own changes are small and additive:
 | Markdown attachments: drag-and-drop and clipboard paste | `crates/editor/src/items.rs` |
 | Project panel header (file/sort/refresh/collapse) and typeset preview menu entry | `crates/project_panel/src/project_panel.rs` |
 | Built-in markdown-oxide language server | `crates/languages/src/markdown_oxide.rs`, `crates/languages/src/lib.rs` |
-| Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
+| Preview button for `.tex`/HTML files (`typeset_preview::preview_label` decides) | `crates/zed/src/zed/quick_action_bar/preview.rs` |
 | Document menu (formatting, citations, export; see "Document menu") and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
 | Notebook markdown cells rendered by live preview, so they show math and the rest of what a note shows (see "Jupyter notebooks") | `crates/repl/src/notebook/cell.rs`, `crates/repl/Cargo.toml`, `crates/markdown_live_preview/src/markdown_live_preview.rs` (`reveal_source_only_while_focused`) |
@@ -79,6 +80,8 @@ sets a 60s slow-timeout that terminates hung tests, serializes `db` tests, and g
 300s to specific known-slow tests. Plain `cargo test --workspace` also tends to fail on
 macOS with `Too many open files (os error 24)`.
 
+For ad-hoc text inspection and extraction, prefer `sed` over `awk`.
+
 Other checks CI runs: `./script/prettier`, `./script/check-todos`, `./script/check-keymaps`.
 `docs/` is upstream Zed's mdBook (vendor; must pass Prettier at 80 cols:
 `cd docs && npx prettier --write src/`). **Suzuri's own user docs are not in this repo.**
@@ -96,6 +99,11 @@ Visual regression tests: `cargo run -p zed --bin zed-visual-test-runner --featur
 Gotcha: running Zed from `cargo run` and then opening *this* repo inside it leaks Cargo's
 env vars into the inner rust-analyzer, causing it to fight the outer build for the target
 dir. Open a different folder when dogfooding.
+
+Remote projects from a debug build compile `remote_server` for
+`<arch>-unknown-linux-musl` from source. On machines without the musl Rust target, run
+with `ZED_BUILD_REMOTE_SERVER=nomusl` to build the native GNU binary instead, or set
+`ZED_COPY_REMOTE_SERVER` to a prebuilt server for this commit.
 
 ## Live preview architecture
 
@@ -138,6 +146,180 @@ are edited through their widgets and only reveal source via the `</>` button
 measures and resizes them during prepaint; doing it yourself fights the editor. This
 invalidates the obvious-looking fix for image-sizing bugs.
 
+## Typst live preview architecture
+
+`crates/typst_live_preview/` replaces the old save-triggered CLI compile with a
+`workspace::Item` pane fed by Tinymist's preview **data plane**:
+
+```text
+editor buffer ──LSP (on type)──> tinymist ──ws diff-v1/new──> connection.rs
+                                                                    │
+                                            session thread: rkyv merge + page metas
+                                                                    │
+                                    Vello scene ──> wgpu readback ──> BGRA image
+                                                                    │
+                                              SessionEvent::{Document,Rendered}
+                                                                    │
+                                                       GPUI page column
+```
+
+**Threading.** `SessionHandle::spawn` owns a dedicated thread running its own Tokio
+runtime (WebSocket), the incremental IR (`PreviewSession`), and a `SceneRasterizer` with
+its own wgpu 27 device. The GPUI thread only receives page metadata and finished BGRA
+images. Vello's wgpu (27) cannot share GPUI's device (30), and GPUI has no GPU-texture
+import, so a CPU readback is the boundary by design.
+
+**Input-latency invariants.** These are why typing stays smooth. Measure them with
+`cargo run --release -p typst_live_preview --example input_latency`:
+
+- A keystroke costs parse + merge + page metadata on the session thread (~2 µs p50) and
+  an O(pages) `apply_document` on the GPUI thread. It must never touch Vello scenes.
+  `PreviewSession::page_metas` returns sizes and content hashes only; scenes are built
+  inside the render request, and every unchanged page reuses its cached scene.
+- Updates render immediately, at `DRAFT_SCALE_FACTOR` (half the display scale, a 4x
+  reduction in pixels). A settle timer (`SETTLE_DELAY`, 120 ms of quiet) re-renders at
+  display resolution. Only one render batch is ever in flight; a document change while
+  it runs sets `render_pending` and the newest content is requested when it finishes, so
+  a slow rasterizer cannot accumulate a queue.
+- `PreviewPage::needs_render` only upgrades resolution: an image crisper than the current
+  target is kept (it is downscaled on screen). Otherwise draft and full passes would
+  replace each other forever.
+- Always `yield_now()` after a session event. `recv()` returns `Ready` while frames are
+  queued, so a compile burst would otherwise starve GPUI's foreground executor and stall
+  input and painting.
+- Never rasterize or swizzle pixels on the GPUI thread. `RasterizedPage::into_render_image`
+  walks the whole page and runs on the session thread.
+
+**Interactions.** There is no DOM or PDF layer: the pane hit-tests the IR's accessibility
+data (`PageAccessibility`, page-coordinate links and text runs). A single click jumps to the
+source location in the editor: the pane sends Tinymist a `src-point` message on the data
+plane, and Tinymist answers with an LSP `window/showDocument` request that Zed turns into
+"open the file and select the range". Clicking a link opens the URL instead. Drag selects,
+double/triple click select a word/run, shift-click extends, copy spans pages,
+`ctrl/cmd+scroll` and `ctrl/cmd+=/-/0` zoom around the cursor, and arrows/page/home/end
+scroll. The page column is laid out at its real width, so the container owns both axes:
+shift+wheel pans horizontally while zoomed in and both axes get native scrollbars (they
+hang off a wrapper, not the scroll container, so the thumb does not scroll away with the
+pages). Bindings live in `assets/keymaps/default-*.json` under the `TypstLivePreview`
+context.
+
+**Links.** `links.rs` classifies page hrefs. typst.ts encodes internal locations as
+`@typst:handleTypstLocation(this, page, x, y)` (one-based page, Typst points); those scroll
+the pane. Navigation uses the same painted page bounds as hit testing, so layout rounding
+and the current zoom cannot make a click and its destination disagree. A target already
+visible inside the viewport is left alone; otherwise only the axes that need it move, with
+the point placed a third of the way down. `file://` and relative paths resolve against the
+previewed document's directory and open in the editor (unsupported types fall back to the
+platform). `http(s)`, `mailto`, and friends go through `cx.open_url`.
+
+**Toolbar and navigation.** Each pane renders a compact toolbar: previous/next page, an
+editable page box, zoom out/percent/zoom in, fit width, fit page, actual size, outline,
+find, and Export PDF (`tinymist.exportPdf` writes the PDF next to the source and opens it
+in PDF viewer; collaborative guests ask for the bytes instead, see *Collaborative
+projects*). `ctrl/cmd+f` searches the rendered text runs and highlights matches;
+`ctrl/cmd+shift+o` toggles the heading outline built from Tinymist's
+`tinymist/documentOutline` notification. The outline payload has no task id, so only the
+preview that most recently called `tinymist.focusMain` applies it (`set_primary_preview`).
+The method name and payload parsing live in this crate; `LspStore` only forwards
+extension notifications that a feature registered with
+`LspStore::watch_custom_notification` (the core crate has no Typst-specific event).
+
+**Zoom and multiple previews.** Zoom mode/scale are stored per canonical file path in a
+process-global map, so closing and reopening a preview restores its zoom. Every preview
+pane owns its own WebSocket session, GPU rasterizer, and Tinymist task; opening the same
+file again reveals the existing pane, while different files get independent panes.
+
+**Forward sync.** `scroll_to_source` sends `tinymist.scrollPreview` with
+`{event: "panelScrollTo", filepath, line, character}`; Tinymist resolves the source
+position and answers with a binary `jump,<page> <x> <y>` frame, which `protocol.rs` parses
+into `SessionEvent::ScrollTo` and the pane scrolls to. It is bound to `ctrl/cmd+alt+p` in
+the editor context, and the source editor's `SelectionsChanged` events also drive it
+automatically after a 200 ms debounce (`SYNC_DEBOUNCE`). It is disabled in collaborative
+projects, where one Tinymist viewport is shared by every participant.
+
+**Compile status.** The status bar shows page count, zoom, and the error/warning counts
+for the previewed file from the project's diagnostic summary. Tinymist's LSP mode does
+not forward its `CompileStatus`, so there is no separate "compiling" spinner.
+
+**Tinymist provisioning.** The `typst` extension checks GitHub releases for the newest
+Tinymist binary on every language-server start (`checking-for-update` in the activity
+indicator). On a slow or blocked network that stalls the first preview for seconds. Pin a
+local build with
+`"lsp": {"tinymist": {"binary": {"path": "/path/to/tinymist"}}}` in settings; the
+extension then launches it directly and skips the release check.
+
+The `click_source` example verifies this path against a real Tinymist without a GUI:
+`cargo run -p typst_live_preview --example click_source -- <tinymist>` clicks the centre of
+the first text run and asserts that `window/showDocument` arrives with a selection.
+`handle_lsp_show_document` targets the pane that already contains the file, so the jump
+reuses that tab instead of opening another copy (the global `reveal_if_open` setting is
+left alone). When the file isn't open, it targets `Workspace::pane_for_lsp_jump`, which
+follows center-pane focus recency: if the highlighted pane is an auxiliary view such as
+the preview, the pane highlighted before it is used. The pane hint also survives files
+without a project path (Typst package sources, external includes) through
+`Workspace::open_abs_path_in_pane`. Clicking a source location in the preview therefore
+opens the file next to the preview instead of covering it.
+
+**Remote projects.** Tinymist runs on the project host, so the data plane usually
+listens on *its* loopback. When the host shares this machine's network interface (WSL)
+the pane uses the returned port directly. For SSH, `tunnel.rs` asks the project's
+`RemoteClient` for an `ssh -N -L` command template, reserves a local port, waits until
+the tunnel accepts connections, and hands the child process to `PreviewOwner`; closing
+the pane kills it. The `Origin` header stays `http://localhost:<local port>`, which
+Tinymist accepts from any loopback origin.
+
+**Collaborative projects.** Tinymist stays on the machine that shares the project. The
+public collab server (`collab.zed.dev`) only forwards message types it knows, so the relay
+must not add proto messages. It rides on `ExecuteLspCommand`, which the server already
+forwards to the host:
+
+- `suzuri.typstPreview.start` starts (or joins) the host's Tinymist task and returns the
+  stream id plus the host Tinymist server id.
+- `suzuri.typstPreview.poll` long-polls a bounded batch of queued items. Each item is a
+  base64 chunk of a `new,`/`diff-v1,` frame, an outline, or a stop notice. Frames are
+  chunked at 96 KiB and one poll returns at most 1 MiB. Items stay queued until the
+  guest's cursor acknowledges them, so a lost response is retried instead of leaving a
+  hole.
+- `suzuri.typstPreview.stop` releases one pane's subscription.
+- `suzuri.typstPreview.resolve` resolves a page point and returns `{uri, selection}`.
+
+`LspStore::register_command_handler` is the generic host hook: matching commands are
+answered by the app before they reach a language server. The host registers the relay
+handler on each non-guest project; a guest's `execute_lsp_command` forwards to the host
+through its existing remote LSP store. Each guest merges the IR and renders locally, so
+guests need neither Tinymist nor the compiler. Remote+shared composes: guest → collab
+host → SSH tunnel → Tinymist.
+
+- **Forward sync is off.** One Tinymist task has one viewport, so a guest's cursor would
+  scroll every participant's preview. The host relay drops `viewport`/`jump` frames, the
+  guest never subscribes to `SelectionsChanged`, and `ScrollPreviewToCursor` shows a
+  toast instead of sending `tinymist.scrollPreview`.
+- **Click-through is per user.** The guest sends `suzuri.typstPreview.resolve`; the host
+  sends `src-point` to Tinymist and routes the resulting `window/showDocument` request
+  with `ShowDocumentOrigin::Preview`, so the host's own editor does not jump. The host
+  answers `{uri, selection}` and only the requesting guest navigates.
+- **PDF export is per user.** The guest calls `tinymist.exportPdf` with `write: false`,
+  decodes the returned base64 and writes it to its own temp file (`write_temp_pdf`); the
+  host's disk is never written.
+- **Outline** notifications are queued on the host's streams and applied by the guest's
+  primary preview only, matching the local single-preview behavior.
+
+The two-client harness lives in `crates/collab/tests/integration/typst_preview_tests.rs`.
+It runs a real in-process collab server and a host with a fake preview backend, then
+exercises frames, IR merging, viewport suppression, outlines, pane joining, click
+resolution, and per-user PDF export through the guest `RelayClient` and the real
+`ExecuteLspCommand` forwarding path. It would fail if the relay ever used a message the
+public server does not forward.
+
+**Handler registration.** `Project::client()` is the app-wide collab client; every
+project shares it. Message handlers must therefore never be registered per project; the
+relay avoids that class of bug entirely by using `ExecuteLspCommand` and command handlers
+on each project's `LspStore`. `collab::init` registers exactly one command prefix per
+non-guest project. The regression harness
+`collab::tests::projects_sharing_one_collab_client_get_separate_relays` builds one client
+and two projects — the exact startup shape (local project + SSH/collab project) — and
+asserts each gets its own relay.
+
 ## Tests
 
 `crates/markdown_live_preview/src/tests.rs` uses `EditorTestContext` with `cx.set_state`
@@ -163,11 +345,11 @@ drift the same way: an upstream dep-cleanup can delete a shared crate's dependen
 only fork code uses — also conflict-free, caught only by `cargo check`. Restore the dep
 with a `SUZURI:` tag so the next merge keeps it. Order the checks so drift surfaces early:
 
-1. `cargo check -p markdown_live_preview -p pdf_viewer -p typeset_preview -p languages` first
+1. `cargo check -p markdown_live_preview -p pdf_viewer -p typeset_preview -p typst_live_preview -p languages` first
    — signature drift in `editor`/`markdown`/`gpui`/`workspace` surfaces in the fork's own
    crates and nowhere earlier.
 2. `cargo check -p zed -p editor -p project_panel` — the shared files the fork patches.
-3. `cargo nextest run -p markdown_live_preview -p pdf_viewer -p typeset_preview` — the
+3. `cargo nextest run -p markdown_live_preview -p pdf_viewer -p typeset_preview -p typst_live_preview` — the
    contract tests catch semantic drift a clean compile hides.
 4. `cargo nextest run -p project_panel -p languages`.
 5. Bundle and smoke-test the real app: live preview, a PDF, a Typst preview, the panel's

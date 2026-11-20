@@ -50814,6 +50814,403 @@ async fn test_lsp_show_document(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_lsp_show_document_reuses_an_open_tab(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    let target_path = EditorLspTestContext::root_path()
+        .join("dir")
+        .join("target.rs");
+    let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+    fs.as_fake()
+        .insert_file(&target_path, b"fn target() {}".to_vec())
+        .await;
+
+    let project_path = cx
+        .update_workspace(|workspace, _, cx| {
+            workspace
+                .project()
+                .read(cx)
+                .project_path_for_absolute_path(&target_path, cx)
+        })
+        .expect("the target file should be part of the project");
+    let target_item_id = cx
+        .update_workspace(|workspace, window, cx| {
+            workspace.open_path(project_path, None, true, window, cx)
+        })
+        .await
+        .expect("the target file should open")
+        .item_id();
+
+    // Switch back to the original editor so the target tab is in the background.
+    let origin_editor = cx.editor.clone();
+    cx.update_workspace(|workspace, window, cx| {
+        assert!(workspace.activate_item(&origin_editor, true, true, window, cx));
+    });
+    let item_count =
+        cx.update_workspace(|workspace, _, cx| workspace.active_pane().read(cx).items().count());
+
+    let response = cx
+        .lsp
+        .server
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: lsp::Uri::from_file_path(&target_path).unwrap(),
+                external: None,
+                take_focus: Some(true),
+                selection: Some(lsp::Range::new(
+                    lsp::Position::new(0, 3),
+                    lsp::Position::new(0, 9),
+                )),
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("show document request should not error");
+    assert_eq!(response, lsp::ShowDocumentResult { success: true });
+    cx.run_until_parked();
+
+    cx.update_workspace(|workspace, _, cx| {
+        let active = workspace
+            .active_item(cx)
+            .expect("the shown document should become active");
+        assert_eq!(
+            active.item_id(),
+            target_item_id,
+            "the tab that already shows the file should be reused"
+        );
+        assert_eq!(
+            workspace.active_pane().read(cx).items().count(),
+            item_count,
+            "showing an open document should not add a tab"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_lsp_show_document_avoids_the_focused_aux_pane(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    let target_path = EditorLspTestContext::root_path()
+        .join("dir")
+        .join("target.rs");
+    let second_path = EditorLspTestContext::root_path()
+        .join("dir")
+        .join("second.rs");
+    let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+    fs.as_fake()
+        .insert_file(&target_path, b"fn target() {}".to_vec())
+        .await;
+    fs.as_fake()
+        .insert_file(&second_path, b"fn second() {}".to_vec())
+        .await;
+
+    // Split off an auxiliary pane (standing in for the Typst preview) and
+    // focus it, the way clicking the preview does.
+    let (editor_pane, aux_pane) = cx.update_workspace(|workspace, window, cx| {
+        let editor_pane = workspace.active_pane().clone();
+        let aux_pane = workspace.split_pane(editor_pane.clone(), SplitDirection::Right, window, cx);
+        let aux_item = cx.new(|cx| {
+            workspace::item::test::TestItem::new(cx).with_buffer_kind(ItemBufferKind::None)
+        });
+        aux_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(aux_item), true, true, None, window, cx);
+        });
+        window.focus(&aux_pane.focus_handle(cx), cx);
+        (editor_pane, aux_pane)
+    });
+    cx.run_until_parked();
+
+    let response = cx
+        .lsp
+        .server
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: lsp::Uri::from_file_path(&target_path).unwrap(),
+                external: None,
+                take_focus: Some(true),
+                selection: None,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("show document request should not error");
+    assert_eq!(response, lsp::ShowDocumentResult { success: true });
+    cx.run_until_parked();
+
+    cx.update_workspace(|workspace, _, cx| {
+        assert_eq!(
+            workspace.active_pane().entity_id(),
+            editor_pane.entity_id(),
+            "the document should open in the editor pane, not the focused aux pane"
+        );
+        assert_eq!(
+            editor_pane.read(cx).items().count(),
+            2,
+            "the editor pane should gain the new tab"
+        );
+        assert_eq!(
+            aux_pane.read(cx).items().count(),
+            1,
+            "the aux pane should keep showing its item"
+        );
+        assert!(
+            workspace.active_item_as::<Editor>(cx).is_some(),
+            "the newly opened item should be an editor"
+        );
+    });
+
+    // Focus the aux pane again and ask for another unseen file: the recency
+    // list must still put the editor pane next.
+    cx.update_workspace(|_, window, cx| {
+        window.focus(&aux_pane.focus_handle(cx), cx);
+    });
+    cx.run_until_parked();
+
+    let response = cx
+        .lsp
+        .server
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: lsp::Uri::from_file_path(&second_path).unwrap(),
+                external: None,
+                take_focus: Some(true),
+                selection: None,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("show document request should not error");
+    assert_eq!(response, lsp::ShowDocumentResult { success: true });
+    cx.run_until_parked();
+
+    cx.update_workspace(|workspace, _, cx| {
+        assert_eq!(
+            workspace.active_pane().entity_id(),
+            editor_pane.entity_id(),
+            "the second document should also open in the editor pane"
+        );
+        assert_eq!(editor_pane.read(cx).items().count(), 3);
+        assert_eq!(
+            aux_pane.read(cx).items().count(),
+            1,
+            "the aux pane should never collect editor tabs"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_lsp_show_document_uses_the_previously_highlighted_pane(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    let target_path = EditorLspTestContext::root_path()
+        .join("dir")
+        .join("target.rs");
+    let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+    fs.as_fake()
+        .insert_file(&target_path, b"fn target() {}".to_vec())
+        .await;
+
+    // The pane highlighted before the preview is also an auxiliary view. A
+    // click in the preview must still go back to that pane rather than
+    // replacing the preview.
+    let (previous_pane, preview_pane) = cx.update_workspace(|workspace, window, cx| {
+        let previous_pane = workspace.active_pane().clone();
+        let previous_item = cx.new(|cx| {
+            workspace::item::test::TestItem::new(cx).with_buffer_kind(ItemBufferKind::None)
+        });
+        previous_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(previous_item), true, true, None, window, cx);
+        });
+
+        let preview_pane =
+            workspace.split_pane(previous_pane.clone(), SplitDirection::Right, window, cx);
+        let preview_item = cx.new(|cx| {
+            workspace::item::test::TestItem::new(cx).with_buffer_kind(ItemBufferKind::None)
+        });
+        preview_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(preview_item), true, true, None, window, cx);
+        });
+        window.focus(&preview_pane.focus_handle(cx), cx);
+        (previous_pane, preview_pane)
+    });
+    cx.run_until_parked();
+
+    let response = cx
+        .lsp
+        .server
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: lsp::Uri::from_file_path(&target_path).unwrap(),
+                external: None,
+                take_focus: Some(true),
+                selection: None,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("show document request should not error");
+    assert_eq!(response, lsp::ShowDocumentResult { success: true });
+    cx.run_until_parked();
+
+    cx.update_workspace(|workspace, _, cx| {
+        assert_eq!(
+            workspace.active_pane().entity_id(),
+            previous_pane.entity_id(),
+            "the document should open in the pane highlighted before the preview"
+        );
+        assert_eq!(previous_pane.read(cx).items().count(), 3);
+        assert_eq!(
+            preview_pane.read(cx).items().count(),
+            1,
+            "the preview pane should keep showing its item"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_lsp_show_document_opens_out_of_project_file_in_previous_pane(
+    cx: &mut TestAppContext,
+) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    // A file without a project path, like a Typst package source or an include
+    // outside the worktree. The pane hint has to survive the `open_abs_path`
+    // route, which used to drop it.
+    let outside_path = std::path::Path::new("/outside/second.rs").to_path_buf();
+    let fs = cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).fs().clone());
+    fs.as_fake()
+        .insert_tree(
+            "/",
+            json!({
+                "outside": {
+                    "second.rs": "fn second() {}",
+                },
+            }),
+        )
+        .await;
+
+    let (editor_pane, preview_pane) = cx.update_workspace(|workspace, window, cx| {
+        let editor_pane = workspace.active_pane().clone();
+        let preview_pane =
+            workspace.split_pane(editor_pane.clone(), SplitDirection::Right, window, cx);
+        let preview_item = cx.new(|cx| {
+            workspace::item::test::TestItem::new(cx).with_buffer_kind(ItemBufferKind::None)
+        });
+        preview_pane.update(cx, |pane, cx| {
+            pane.add_item(Box::new(preview_item), true, true, None, window, cx);
+        });
+        window.focus(&preview_pane.focus_handle(cx), cx);
+        (editor_pane, preview_pane)
+    });
+    cx.run_until_parked();
+
+    let response = cx
+        .lsp
+        .server
+        .request::<lsp::request::ShowDocument>(
+            lsp::ShowDocumentParams {
+                uri: lsp::Uri::from_file_path(&outside_path).unwrap(),
+                external: None,
+                take_focus: Some(true),
+                selection: None,
+            },
+            DEFAULT_LSP_REQUEST_TIMEOUT,
+        )
+        .await
+        .into_response()
+        .expect("show document request should not error");
+    assert_eq!(response, lsp::ShowDocumentResult { success: true });
+    cx.run_until_parked();
+
+    cx.update_workspace(|workspace, _, cx| {
+        assert_eq!(
+            workspace.active_pane().entity_id(),
+            editor_pane.entity_id(),
+            "the out-of-project file should open in the editor pane"
+        );
+        assert_eq!(
+            editor_pane.read(cx).items().count(),
+            2,
+            "the editor pane should gain the new tab"
+        );
+        assert_eq!(
+            preview_pane.read(cx).items().count(),
+            1,
+            "the preview pane should keep showing its item"
+        );
+    });
+}
+
+#[gpui::test]
+async fn test_lsp_store_forwards_watched_custom_notifications(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;
+
+    struct CustomNotification;
+    impl lsp::notification::Notification for CustomNotification {
+        type Params = serde_json::Value;
+        const METHOD: &'static str = "test/customNotification";
+    }
+    use lsp::notification::Notification as _;
+
+    let server_id = cx.lsp.server.server_id();
+    let lsp_store =
+        cx.update_workspace(|workspace, _, cx| workspace.project().read(cx).lsp_store());
+
+    let received = Rc::new(RefCell::new(Vec::new()));
+    let received_events = received.clone();
+    let _subscription = cx.update(|_, cx| {
+        cx.subscribe(&lsp_store, move |_, event: &project::LspStoreEvent, _| {
+            if let project::LspStoreEvent::CustomNotification {
+                server_id,
+                method,
+                params,
+            } = event
+            {
+                received_events
+                    .borrow_mut()
+                    .push((*server_id, *method, params.clone()));
+            }
+        })
+    });
+
+    cx.update(|_, cx| {
+        lsp_store.update(cx, |lsp_store, cx| {
+            lsp_store.watch_custom_notification(server_id, CustomNotification::METHOD, cx);
+            // Watching the same method twice must not register a second
+            // handler; the language server asserts on duplicate handlers.
+            lsp_store.watch_custom_notification(server_id, CustomNotification::METHOD, cx);
+        });
+    });
+
+    cx.lsp
+        .server
+        .notify::<CustomNotification>(json!({ "items": [1, 2] }))
+        .ok();
+
+    for _ in 0..10 {
+        cx.run_until_parked();
+        if !received.borrow().is_empty() {
+            break;
+        }
+    }
+
+    let received = received.borrow();
+    assert_eq!(received.len(), 1, "expected one forwarded notification");
+    assert_eq!(received[0].0, server_id);
+    assert_eq!(received[0].1, CustomNotification::METHOD);
+    assert_eq!(received[0].2, json!({ "items": [1, 2] }));
+}
+
+#[gpui::test]
 async fn test_lsp_show_document_external(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorLspTestContext::new_rust(lsp::ServerCapabilities::default(), cx).await;

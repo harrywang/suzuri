@@ -11,8 +11,11 @@ enum PreviewTarget {
     Markdown(Entity<Editor>),
     Svg(Entity<MultiBuffer>),
     TabularData(Entity<Editor>),
-    /// Carries its own label: Typst and LaTeX preview as a PDF in a split,
-    /// HTML opens in the browser.
+    /// Typst's own live preview, rendered from Tinymist's preview stream.
+    TypstLive(Entity<Editor>),
+    /// Carries its own label: LaTeX previews as a PDF in a split, HTML opens
+    /// in the browser. Typst is not routed here — it has its own live
+    /// preview backed by Tinymist.
     Typeset(Entity<Editor>, &'static str),
 }
 
@@ -36,6 +39,10 @@ impl QuickActionBar {
             && TabularDataPreviewPane::is_tabular_data_file(editor, cx)
         {
             PreviewTarget::TabularData(editor.clone())
+        } else if let Some(editor) = &editor
+            && typst_live_preview::is_typst_editor(editor, cx)
+        {
+            PreviewTarget::TypstLive(editor.clone())
         } else if let Some(editor) = editor
             && let Some(label) = typeset_preview::preview_label_for_editor(&editor, cx)
         {
@@ -59,6 +66,11 @@ impl QuickActionBar {
                 "toggle-tabular-preview",
                 "Preview Tabular Data",
                 &tabular_data_preview::OpenPreview as &dyn gpui::Action,
+            ),
+            PreviewTarget::TypstLive(_) => (
+                "open-typst-live-preview",
+                "Open Live Typst Preview",
+                &typst_live_preview::OpenPreview as &dyn gpui::Action,
             ),
             PreviewTarget::Typeset(_, label) => (
                 "open-typeset-preview",
@@ -170,6 +182,14 @@ impl QuickActionBar {
                                         editor, pane, window, cx,
                                     );
                                 }
+                            }
+                            PreviewTarget::TypstLive(editor) => {
+                                typst_live_preview::open_preview_for_editor(
+                                    workspace,
+                                    editor.clone(),
+                                    window,
+                                    cx,
+                                );
                             }
                             PreviewTarget::Typeset(editor, _) => {
                                 typeset_preview::open_live_preview_for_editor(

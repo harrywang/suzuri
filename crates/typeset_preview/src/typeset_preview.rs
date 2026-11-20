@@ -1,6 +1,11 @@
-//! Live typeset preview: write Typst or LaTeX in one pane and watch the
-//! compiled PDF in another. HTML opens in the system browser instead —
-//! GPUI has no webview, and a real browser beats any approximation.
+//! Live typeset preview: write LaTeX in one pane and watch the compiled PDF
+//! in another. HTML opens in the system browser instead — GPUI has no
+//! webview, and a real browser beats any approximation.
+//!
+//! Typst is deliberately not a target here. Its live preview is driven by
+//! Tinymist's incremental stream and rendered directly, so `.typ` no longer
+//! round-trips through a compiler and a PDF. Typst provisioning stays in
+//! this crate only because markdown export shares it.
 //!
 //! `typeset_preview::OpenLivePreview` compiles the active buffer's file and
 //! opens the resulting PDF in a split. From then on, every save of that file
@@ -8,11 +13,11 @@
 //! PDF item notices the changed bytes on disk and re-renders in place, so
 //! the loop is: type → pause → page updates.
 //!
-//! Compilers are discovered on PATH: `typst` for .typ, and for .tex whichever
-//! engine `latex_engine` selects — by default `latexmk`. When nothing is
-//! installed, the first preview offers to download a managed compiler rather
-//! than fetching one unannounced; for LaTeX that is a TeX Live installation
-//! (TinyTeX), whose missing packages are then installed on demand.
+//! Compilers are discovered on PATH: for .tex whichever engine `latex_engine`
+//! selects — by default `latexmk`. When nothing is installed, the first
+//! preview offers to download a managed compiler rather than fetching one
+//! unannounced: a TeX Live installation (TinyTeX), whose missing packages are
+//! then installed on demand.
 //!
 //! The engine is a setting because conference templates pin one: AAAI and
 //! many IEEE styles call `\RequirePDFTeX` and refuse to build under XeTeX,
@@ -75,8 +80,8 @@ impl settings::Settings for TypesetPreviewSettings {
 actions!(
     typeset_preview,
     [
-        /// Previews the current file: Typst and LaTeX compile to a PDF in a
-        /// split and recompile on every save; HTML opens in the browser.
+        /// Previews the current file: LaTeX compiles to a PDF in a split and
+        /// recompiles on every save; HTML opens in the browser.
         OpenLivePreview
     ]
 );
@@ -94,7 +99,6 @@ impl Global for LiveCompileRegistry {}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Typesetter {
-    Typst,
     Latex,
     /// GPUI has no webview, so HTML opens in the system browser rather than
     /// being rendered in a pane — a real browser beats any approximation.
@@ -108,7 +112,10 @@ fn typesetter_for(path: &Path) -> Option<Typesetter> {
         .map(|extension| extension.to_ascii_lowercase())
         .as_deref()
     {
-        Some("typ") => Some(Typesetter::Typst),
+        // `.typ` intentionally falls through: Typst is previewed from
+        // Tinymist's live stream, not compiled to a PDF on save. Returning
+        // `None` here is also what hides this crate's preview affordances
+        // (quick action bar, project panel menu) for Typst files.
         Some("tex") | Some("latex") => Some(Typesetter::Latex),
         Some("html") | Some("htm") => Some(Typesetter::Html),
         _ => None,
@@ -159,7 +166,7 @@ fn editor_file_path(editor: &Editor, cx: &App) -> Option<PathBuf> {
 pub fn preview_label(path: &Path) -> Option<&'static str> {
     match typesetter_for(path)? {
         Typesetter::Html => Some("Open in Browser"),
-        Typesetter::Typst | Typesetter::Latex => Some("Open Live PDF Preview"),
+        Typesetter::Latex => Some("Open Live PDF Preview"),
     }
 }
 
@@ -180,8 +187,8 @@ fn open_live_preview(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
     open_live_preview_for_editor(workspace, editor, window, cx);
 }
 
-/// Previews `editor`'s file: HTML goes to the browser, Typst and LaTeX
-/// compile to a PDF in a split that recompiles on every save.
+/// Previews `editor`'s file: HTML goes to the browser, LaTeX compiles to a
+/// PDF in a split that recompiles on every save.
 pub fn open_live_preview_for_editor(
     workspace: &mut Workspace,
     editor: Entity<Editor>,
@@ -200,7 +207,7 @@ pub fn open_live_preview_for_editor(
         None => {
             show_toast(
                 workspace,
-                "Live preview works on Typst (.typ), LaTeX (.tex), and HTML files.",
+                "Live preview works on LaTeX (.tex) and HTML files.",
                 cx,
             );
             return;
@@ -458,9 +465,6 @@ fn typst_asset_stem() -> Result<String> {
 /// one and failing later leaves the user with an error they cannot act on.
 fn pending_download(path: &Path, engine: &LatexEngine) -> Option<&'static str> {
     match typesetter_for(path)? {
-        Typesetter::Typst => (which::which("typst").is_err()
-            && !provisioned_typst().ok()?.exists())
-        .then_some("the Typst compiler (~30 MB)"),
         Typesetter::Latex => {
             // An external command is the user's own; never provision for it.
             let program = match engine {
@@ -513,20 +517,6 @@ async fn compile_command(
         .to_string_lossy()
         .into_owned();
     match typesetter_for(path).context("not a previewable document")? {
-        Typesetter::Typst => {
-            let program = match which::which("typst") {
-                Ok(program) => program,
-                Err(_) => ensure_typst(http).await?,
-            };
-            Ok(CompileCommand {
-                program,
-                arguments: vec!["compile".into(), file],
-                working_directory,
-                artifact: None,
-                path_prepend: None,
-                managed_texlive: None,
-            })
-        }
         Typesetter::Latex => {
             let (name, mut arguments) = latex_invocation(&engine);
             arguments.push(file);
@@ -1443,5 +1433,17 @@ mod tests {
             pending_download(Path::new("page.html"), &LatexEngine::Auto),
             None
         );
+    }
+
+    /// Typst is previewed from Tinymist's live stream rather than compiled to
+    /// a PDF on save, so this crate must no longer claim it. `preview_label`
+    /// returning `None` is also what hides the quick action bar button and the
+    /// project panel menu entry, so pin the whole surface here.
+    #[test]
+    fn typst_is_not_a_typeset_preview_target() {
+        let path = Path::new("paper.typ");
+        assert!(typesetter_for(path).is_none());
+        assert_eq!(preview_label(path), None);
+        assert_eq!(pending_download(path, &LatexEngine::Auto), None);
     }
 }

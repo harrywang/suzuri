@@ -18,6 +18,7 @@ mod random_project_collaboration_tests;
 mod randomized_test_helpers;
 mod remote_editing_collaboration_tests;
 mod test_server;
+mod typst_preview_tests;
 
 pub use randomized_test_helpers::{
     RandomizedTest, TestError, UserTestPlan, run_randomized_test, save_randomized_test_plan,

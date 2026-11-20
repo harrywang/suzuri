@@ -2929,16 +2929,40 @@ pub(crate) fn handle_lsp_show_document(
         request.respond(false);
         return Task::ready(());
     };
-    let open_task = workspace.open_abs_path(
-        abs_path,
-        OpenOptions {
-            visible: Some(OpenVisible::None),
-            focus: Some(request.take_focus),
-            ..OpenOptions::default()
-        },
-        window,
-        cx,
-    );
+    let project_path = workspace
+        .project()
+        .read(cx)
+        .project_path_for_absolute_path(&abs_path, cx);
+    // Jump to a tab that already shows this file rather than opening a second
+    // copy of it. `open_abs_path` only searches other panes when
+    // `reveal_if_open` is set, so target the pane that holds the item directly.
+    let existing = project_path.and_then(|project_path| {
+        let pane = workspace.pane_containing_project_path(&project_path, cx)?;
+        Some((project_path, pane))
+    });
+    let open_task = match existing {
+        Some((project_path, pane)) => {
+            workspace.open_path(project_path, Some(pane), request.take_focus, window, cx)
+        }
+        // Not open yet: prefer the pane that was highlighted before the
+        // focused preview/aux pane, which would otherwise be covered by a new
+        // editor tab. `open_abs_path_in_pane` also honors that pane for files
+        // outside the project's worktrees (package sources, external includes).
+        None => {
+            let pane = workspace.pane_for_lsp_jump(cx);
+            workspace.open_abs_path_in_pane(
+                abs_path,
+                pane,
+                OpenOptions {
+                    visible: Some(OpenVisible::None),
+                    focus: Some(request.take_focus),
+                    ..OpenOptions::default()
+                },
+                window,
+                cx,
+            )
+        }
+    };
     cx.spawn_in(window, async move |_, cx| {
         let success = match open_task.await {
             Ok(item) => match item.downcast::<Editor>().zip(request.selection) {

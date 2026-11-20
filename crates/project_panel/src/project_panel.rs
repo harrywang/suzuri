@@ -460,8 +460,10 @@ actions!(
         /// Opens an SVG preview for the selected file.
         OpenSvgPreview,
         // SUZURI: begin. The panel header's typeset preview, refresh, and sort controls.
-        /// Opens a live-compiling PDF preview for the selected Typst or LaTeX file.
+        /// Opens a live-compiling PDF preview for the selected LaTeX file.
         OpenTypesetPreview,
+        /// Opens a live Typst preview for the selected Typst file.
+        OpenTypstLivePreview,
         /// Rescans the visible worktrees from disk.
         RefreshFileTree,
         /// Lists directories before files in the project panel.
@@ -1217,6 +1219,7 @@ impl ProjectPanel {
             let is_markdown =
                 !is_dir && MarkdownPreviewView::is_markdown_path(file_name, project.languages());
             let is_svg = !is_dir && SvgPreviewView::is_svg_path(file_name);
+            let is_typst = !is_dir && typst_live_preview::is_typst_path(file_name);
             // Single source of truth for what is previewable and what the
             // entry should be called — HTML opens in a browser, not a PDF.
             let typeset_label = (!is_dir)
@@ -1256,6 +1259,9 @@ impl ProjectPanel {
                         .when(is_svg, |menu| {
                             menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
                         })
+                        .when(is_typst, |menu| {
+                            menu.action("Open Live Typst Preview", Box::new(OpenTypstLivePreview))
+                        })
                         .when_some(typeset_label, |menu, label| {
                             menu.action(label, Box::new(OpenTypesetPreview))
                         })
@@ -1281,6 +1287,12 @@ impl ProjectPanel {
                             })
                             .when(is_svg, |menu| {
                                 menu.action("Open SVG Preview", Box::new(OpenSvgPreview))
+                            })
+                            .when(is_typst, |menu| {
+                                menu.action(
+                                    "Open Live Typst Preview",
+                                    Box::new(OpenTypstLivePreview),
+                                )
                             })
                             .when_some(typeset_label, |menu, label| {
                                 menu.action(label, Box::new(OpenTypesetPreview))
@@ -2146,6 +2158,40 @@ impl ProjectPanel {
                     if open.await.log_err().is_some() {
                         cx.update(|window, cx| {
                             window.dispatch_action(Box::new(typeset_preview::OpenLivePreview), cx);
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+            })
+            .ok();
+    }
+
+    fn open_typst_live_preview(
+        &mut self,
+        _: &OpenTypstLivePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((worktree, entry)) = self.selected_entry(cx) else {
+            return;
+        };
+        if !entry.is_file() {
+            return;
+        }
+        let project_path = ProjectPath {
+            worktree_id: worktree.id(),
+            path: entry.path.clone(),
+        };
+        // Open the file focused, then hand off to the workspace-level action,
+        // which reads the now-active editor.
+        self.workspace
+            .update(cx, |workspace, cx| {
+                let open = workspace.open_path(project_path, None, true, window, cx);
+                cx.spawn_in(window, async move |_, cx| {
+                    if open.await.log_err().is_some() {
+                        cx.update(|window, cx| {
+                            window.dispatch_action(Box::new(typst_live_preview::OpenPreview), cx);
                         })
                         .ok();
                     }
@@ -7966,6 +8012,7 @@ impl Render for ProjectPanel {
                 .on_action(cx.listener(Self::open_split_horizontal))
                 .on_action(cx.listener(Self::open_markdown_preview))
                 .on_action(cx.listener(Self::open_typeset_preview))
+                .on_action(cx.listener(Self::open_typst_live_preview))
                 .on_action(cx.listener(Self::refresh_file_tree))
                 .on_action(cx.listener(Self::open_svg_preview))
                 .on_action(cx.listener(Self::confirm))

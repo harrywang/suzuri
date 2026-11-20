@@ -750,6 +750,7 @@ fn main() {
         json_canvas::init(cx);
         note_graph::init(cx);
         typeset_preview::init(cx);
+        typst_live_preview::init(cx);
         repl::notebook::init(cx);
         diagnostics::init(cx);
 

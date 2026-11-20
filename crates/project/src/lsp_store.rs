@@ -1313,11 +1313,15 @@ impl LocalLspStore {
                     let mut cx = cx.clone();
                     async move {
                         let (tx, rx) = async_channel::bounded(1);
+                        let origin = lsp_store.update(&mut cx, |lsp_store, _| {
+                            lsp_store.take_show_document_origin()
+                        })?;
                         let request = LanguageServerShowDocumentRequest {
                             uri: params.uri,
                             external: params.external.unwrap_or(false),
                             take_focus: params.take_focus.unwrap_or(false),
                             selection: params.selection,
+                            origin,
                             response_channel: tx,
                         };
                         lsp_store.update(&mut cx, |_, cx| {
@@ -4612,11 +4616,30 @@ impl LspStoreMode {
     }
 }
 
+/// A command handled by this app rather than a language server.
+pub type LspCommandHandler = Arc<
+    dyn Send
+        + Sync
+        + Fn(
+            Entity<LspStore>,
+            String,
+            Vec<serde_json::Value>,
+            Option<proto::PeerId>,
+            AsyncApp,
+        )
+            -> futures::future::LocalBoxFuture<'static, anyhow::Result<Option<serde_json::Value>>>,
+>;
+
 pub struct LspStore {
     mode: LspStoreMode,
     last_formatting_failure: Option<String>,
     downstream_client: Option<(AnyProtoClient, u64)>,
     nonce: u128,
+    /// Origin to attach to the next `window/showDocument` request.
+    next_show_document_origin: ShowDocumentOrigin,
+    /// Commands handled by this app instead of a language server. See
+    /// [`LspStore::register_command_handler`].
+    command_handlers: Vec<(String, LspCommandHandler)>,
     buffer_store: Entity<BufferStore>,
     worktree_store: Entity<WorktreeStore>,
     pub languages: Arc<LanguageRegistry>,
@@ -4734,6 +4757,13 @@ pub enum LspStoreEvent {
     },
     Notification(String),
     LanguageServerShowDocument(LanguageServerShowDocumentRequest),
+    /// A notification from an extension, forwarded because a feature asked for
+    /// it with [`LspStore::watch_custom_notification`].
+    CustomNotification {
+        server_id: LanguageServerId,
+        method: &'static str,
+        params: serde_json::Value,
+    },
     RefreshInlayHints {
         server_id: LanguageServerId,
     },
@@ -5031,6 +5061,8 @@ impl LspStore {
             languages: languages.clone(),
             language_server_statuses: Default::default(),
             nonce: StdRng::from_os_rng().random(),
+            next_show_document_origin: ShowDocumentOrigin::default(),
+            command_handlers: Vec::new(),
             diagnostic_summaries: HashMap::default(),
             lsp_server_capabilities: HashMap::default(),
             lsp_server_initial_capabilities: HashMap::default(),
@@ -5098,6 +5130,8 @@ impl LspStore {
             languages: languages.clone(),
             language_server_statuses: Default::default(),
             nonce: StdRng::from_os_rng().random(),
+            next_show_document_origin: ShowDocumentOrigin::default(),
+            command_handlers: Vec::new(),
             diagnostic_summaries: HashMap::default(),
             lsp_server_capabilities: HashMap::default(),
             lsp_server_initial_capabilities: HashMap::default(),
@@ -11696,9 +11730,27 @@ impl LspStore {
             .map(|argument| serde_json::from_str(argument))
             .collect::<Result<Vec<serde_json::Value>, _>>()
             .context("deserializing executeCommand arguments")?;
+        let command = envelope.payload.command;
+        let sender = envelope.original_sender_id.or(Some(envelope.sender_id));
+
+        // A feature can own a command prefix and answer it on this host
+        // without involving the language server. This is how collab features
+        // use the public server, which only forwards known message types such
+        // as `ExecuteLspCommand`.
+        let handler = lsp_store.update(&mut cx, |lsp_store, _| {
+            lsp_store.command_handler_for(&command)
+        });
+        if let Some(handler) = handler {
+            log::info!("handling LSP command {command} with a local command handler");
+            let result = handler(lsp_store.clone(), command, arguments, sender, cx.clone()).await?;
+            return Ok(proto::ExecuteLspCommandResponse {
+                result: result.map(|result| result.to_string()),
+            });
+        }
+
         let result = lsp_store
             .update(&mut cx, |lsp_store, cx| {
-                lsp_store.execute_lsp_command(server_id, envelope.payload.command, arguments, cx)
+                lsp_store.execute_lsp_command(server_id, command, arguments, cx)
             })
             .await?;
         Ok(proto::ExecuteLspCommandResponse {
@@ -12052,6 +12104,128 @@ impl LspStore {
 
     pub fn language_server_for_id(&self, id: LanguageServerId) -> Option<Arc<LanguageServer>> {
         self.as_local()?.language_server_for_id(id)
+    }
+
+    /// Registers interest in a server-specific notification method.
+    ///
+    /// `LspStore` normally registers handlers for the methods it knows about.
+    /// This lets a feature opt into an extension's notification without
+    /// teaching this crate the extension's schema: matching notifications are
+    /// forwarded as [`LspStoreEvent::CustomNotification`]. Registering the
+    /// same method twice for one server is a no-op.
+    ///
+    /// Remote projects are not supported: the language server lives on the
+    /// remote host, so no handler can be attached here.
+    pub fn watch_custom_notification(
+        &self,
+        server_id: LanguageServerId,
+        method: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(language_server) = self.language_server_for_id(server_id) else {
+            return;
+        };
+        if language_server.has_notification_handler_for_method(method) {
+            return;
+        }
+
+        let this = cx.weak_entity();
+        language_server
+            .on_custom_notification(method, move |params: serde_json::Value, cx| {
+                let Some(this) = this.upgrade() else {
+                    return;
+                };
+                this.update(cx, |_, cx| {
+                    cx.emit(LspStoreEvent::CustomNotification {
+                        server_id,
+                        method,
+                        params,
+                    });
+                });
+            })
+            .detach();
+    }
+
+    /// Registers a handler for commands that arrive through
+    /// `ExecuteLspCommand`.
+    ///
+    /// Collaborative peers can only send message types the public collab
+    /// server knows, and that includes `ExecuteLspCommand`. A feature can use
+    /// this to accept its own command names on the project host without
+    /// changing the server. The first matching prefix wins; registering the
+    /// same prefix again replaces the previous handler.
+    pub fn register_command_handler(
+        &mut self,
+        prefix: impl Into<String>,
+        handler: LspCommandHandler,
+    ) {
+        let prefix = prefix.into();
+        self.command_handlers
+            .retain(|(existing, _)| existing != &prefix);
+        self.command_handlers.push((prefix, handler));
+    }
+
+    fn command_handler_for(&self, command: &str) -> Option<LspCommandHandler> {
+        self.command_handlers
+            .iter()
+            .find(|(prefix, _)| command.starts_with(prefix.as_str()))
+            .map(|(_, handler)| handler.clone())
+    }
+
+    /// Registers a live language server for tests.
+    ///
+    /// Lets a harness exercise the real `execute_lsp_command` path without
+    /// launching a process or an adapter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn add_test_language_server(
+        &mut self,
+        server_id: LanguageServerId,
+        name: LanguageServerName,
+        worktree: Option<WorktreeId>,
+        server: Arc<lsp::LanguageServer>,
+    ) {
+        if let Some(local) = self.as_local_mut() {
+            local
+                .supplementary_language_servers
+                .insert(server_id, (name.clone(), server));
+        }
+        self.language_server_statuses.insert(
+            server_id,
+            LanguageServerStatus {
+                name,
+                language_name: None,
+                server_version: None,
+                server_readable_version: None,
+                pending_work: Default::default(),
+                has_pending_diagnostic_updates: false,
+                progress_tokens: Default::default(),
+                worktree,
+                binary: None,
+                configuration: None,
+                workspace_folders: BTreeSet::new(),
+                process_id: None,
+            },
+        );
+    }
+
+    /// Routes the next `window/showDocument` request to a preview pane.
+    ///
+    /// The request is still emitted as [`LspStoreEvent::LanguageServerShowDocument`],
+    /// but carries [`ShowDocumentOrigin::Preview`] so the editor hosting the
+    /// language server can ignore it. A preview-only subscriber answers it.
+    /// Call [`Self::clear_show_document_origin`] if the expected request never
+    /// arrives.
+    pub fn route_next_show_document_to_preview(&mut self) {
+        self.next_show_document_origin = ShowDocumentOrigin::Preview;
+    }
+
+    /// Restores the default origin after a preview click produced no request.
+    pub fn clear_show_document_origin(&mut self) {
+        self.next_show_document_origin = ShowDocumentOrigin::LanguageServer;
+    }
+
+    pub(crate) fn take_show_document_origin(&mut self) -> ShowDocumentOrigin {
+        std::mem::take(&mut self.next_show_document_origin)
     }
 
     fn on_lsp_progress(
@@ -16589,16 +16763,47 @@ impl PartialEq for LanguageServerPromptRequest {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShowDocumentOrigin {
+    /// A normal language-server request for the editor that hosts the server.
+    #[default]
+    LanguageServer,
+    /// A preview pane asked the server to resolve a click. The request belongs
+    /// to that pane, so the hosting editor must not also jump.
+    Preview,
+}
+
 #[derive(Clone, Debug)]
 pub struct LanguageServerShowDocumentRequest {
     pub uri: lsp::Uri,
     pub external: bool,
     pub take_focus: bool,
     pub selection: Option<lsp::Range>,
+    pub origin: ShowDocumentOrigin,
     pub(crate) response_channel: async_channel::Sender<bool>,
 }
 
 impl LanguageServerShowDocumentRequest {
+    /// Creates a request that does not need a response from the opener.
+    ///
+    /// A preview pane uses this to hand a resolved source location to the
+    /// editor after Tinymist has already been answered.
+    pub fn without_response(
+        uri: lsp::Uri,
+        take_focus: bool,
+        selection: Option<lsp::Range>,
+    ) -> Self {
+        let (response_channel, _) = async_channel::bounded(1);
+        Self {
+            uri,
+            external: false,
+            take_focus,
+            selection,
+            origin: ShowDocumentOrigin::LanguageServer,
+            response_channel,
+        }
+    }
+
     pub fn respond(self, success: bool) {
         self.response_channel.try_send(success).ok();
     }
