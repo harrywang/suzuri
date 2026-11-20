@@ -32,11 +32,11 @@ body:
     attributes:
       label: Log file
       description: |
-        Suzuri writes the panic and its backtrace to the log. Run `zed: reveal log in file manager` and attach `Zed.log`, or `Zed.log.old` if Suzuri has restarted since.
+        Suzuri writes the panic and its backtrace to the log. Run `zed: reveal log in file manager` and attach `Suzuri.log`, or `Suzuri.log.old` if Suzuri has restarted since.
 
         ⚠️ **Review the log for secrets (API keys, tokens, etc.) and redact them before posting.**
       value: |
-        <details><summary>Zed.log</summary>
+        <details><summary>Suzuri.log</summary>
 
         ```log
 

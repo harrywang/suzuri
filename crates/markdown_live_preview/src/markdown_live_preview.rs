@@ -28,7 +28,7 @@ use editor::{
     },
 };
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, ElementId, Empty, Entity, Focusable as _,
+    App, AppContext as _, ClipboardItem, Context, ElementId, Empty, Entity, Focusable as _, Font,
     FontWeight, HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent,
     Resource, RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
     TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, rems, svg,
@@ -167,7 +167,7 @@ fn heading_metrics(level: Option<u8>, cx: &App) -> HeadingMetrics {
         || (base_font_size * theme.line_height()).round(),
         |_| {
             let text_system = cx.text_system();
-            let mut font = theme.buffer_font.clone();
+            let mut font = note_font(cx);
             font.weight = text.font_weight;
             let font_id = text_system.resolve_font(&font);
             let glyph_height = text_system.ascent(font_id, font_size)
@@ -187,10 +187,11 @@ fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
     let heading = heading_metrics(level, cx).content_line_height;
     (heading / base).max(1.0)
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, RegisterSetting)]
+#[derive(Clone, Debug, Default, PartialEq, RegisterSetting)]
 
 pub struct MarkdownLivePreviewSettings {
     pub enabled: bool,
+    pub font_family: Option<SharedString>,
     pub heading_styles: MarkdownHeadingStyles,
     pub block_quote_border_color: settings::MarkdownQuoteBorderColor,
     pub block_quote_border_width: Option<f32>,
@@ -200,11 +201,20 @@ pub struct MarkdownLivePreviewSettings {
 
 impl Settings for MarkdownLivePreviewSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
+        // Notes share Zed's markdown preview font. Unlike the preview pane,
+        // an unset font keeps the buffer font rather than the UI font, so a
+        // note looks like the rest of the editor unless a font is chosen.
+        let font_family = content
+            .markdown_preview
+            .as_ref()
+            .and_then(|preview| preview.font_family.as_ref())
+            .map(|family| SharedString::from(family.0.to_string()));
         let content = content.markdown_live_preview.clone().unwrap_or_default();
         let heading_content = content.heading_styles.unwrap_or_default();
         let defaults = MarkdownHeadingStyles::default();
         Self {
             enabled: content.enabled.unwrap_or(true),
+            font_family,
             block_quote_border_color: content.block_quote_border_color.unwrap_or_default(),
             block_quote_border_width: content
                 .block_quote_border_width
@@ -229,6 +239,45 @@ impl Settings for MarkdownLivePreviewSettings {
 
 pub fn init(cx: &mut App) {
     cx.observe_new(register_editor).detach();
+}
+
+/// The font a rendered note is drawn in: the buffer font, with its family
+/// replaced when `markdown_preview.font_family` names one.
+fn note_font(cx: &App) -> Font {
+    let mut font = theme_settings::ThemeSettings::get_global(cx)
+        .buffer_font
+        .clone();
+    if let Some(family) = &MarkdownLivePreviewSettings::get_global(cx).font_family {
+        font.family = family.clone();
+    }
+    font
+}
+
+/// Puts the editor in the note font while live preview renders it, and back
+/// in the buffer font when it shows source (preview off, a non-markdown
+/// buffer, an expanded diff).
+fn apply_note_font(editor: &mut Editor, rendering: bool, cx: &mut Context<Editor>) {
+    let family = if rendering {
+        MarkdownLivePreviewSettings::get_global(cx)
+            .font_family
+            .clone()
+    } else {
+        None
+    };
+    let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+        return;
+    };
+    // Every full editor gets this addon, so leave alone the refinement of
+    // one this font never touched.
+    if addon.note_font_family == family {
+        return;
+    }
+    addon.note_font_family = family.clone();
+    editor.set_text_style_refinement(TextStyleRefinement {
+        font_family: family,
+        ..Default::default()
+    });
+    cx.notify();
 }
 
 fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Context<Editor>) {
@@ -266,7 +315,36 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
                     }
                     addon.selected_cells = None;
                 }
+                let mouse_released = editor.selections.pending_anchor().is_none();
+                if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
+                    && addon.focus_awaits_mouse_up
+                    && mouse_released
+                {
+                    addon.focus_awaits_mouse_up = false;
+                    addon.focused = true;
+                }
                 apply_decorations(editor, cx);
+            }
+            EditorEvent::Focused | EditorEvent::Blurred => {
+                let focused = matches!(event, EditorEvent::Focused);
+                // A click focuses the editor with the button still down.
+                // Revealing then would move the text out from under the
+                // pointer, and the slightest drag would select up to wherever
+                // it had moved, so the reveal waits for the button's release.
+                let mouse_down = editor.selections.pending_anchor().is_some();
+                if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
+                    && addon.reveal_requires_focus
+                {
+                    if focused && mouse_down {
+                        addon.focus_awaits_mouse_up = true;
+                    } else {
+                        addon.focus_awaits_mouse_up = false;
+                        if addon.focused != focused {
+                            addon.focused = focused;
+                            apply_decorations(editor, cx);
+                        }
+                    }
+                }
             }
             _ => {}
         }),
@@ -612,6 +690,7 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
 
     editor.register_addon(LivePreviewAddon {
         enabled_override: quarantined.then_some(false),
+        note_font_family: None,
         image_cache,
         markers: None,
         applied_blocks: Vec::new(),
@@ -631,6 +710,9 @@ fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Co
         callout_collapse: Vec::new(),
         concealed_math: Vec::new(),
         math_line_styles: BTreeMap::new(),
+        reveal_requires_focus: false,
+        focused: false,
+        focus_awaits_mouse_up: false,
         _subscriptions: subscriptions,
     });
 
@@ -698,6 +780,18 @@ struct LivePreviewAddon {
     concealed_math: Vec<(Range<Anchor>, MathKey)>,
     /// Line styles `apply_math_line_styles` last applied, by key.
     math_line_styles: BTreeMap<usize, Vec<Range<Anchor>>>,
+    /// Set by [`reveal_source_only_while_focused`]: the selection reveals
+    /// source only while `focused`, so the editor reads as a rendered
+    /// document until it is clicked into.
+    reveal_requires_focus: bool,
+    /// Tracked from the editor's focus events, and only while
+    /// `reveal_requires_focus` is set.
+    focused: bool,
+    /// The editor took focus from a mouse press that has not been released,
+    /// so `focused` is still to be set.
+    focus_awaits_mouse_up: bool,
+    /// The family `apply_note_font` last put on the editor, if any.
+    note_font_family: Option<SharedString>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -912,6 +1006,11 @@ struct MarkerSet {
     /// Inline code content (between the backticks), styled like the
     /// preview's pill: plain text color on a faint background.
     code: Vec<Range<Anchor>>,
+    /// Line breaks inside a paragraph that markdown reads as a space, each
+    /// with the indentation that follows it. Joined for display only where
+    /// the editor stands in for a rendered document; see
+    /// [`reveal_source_only_while_focused`].
+    soft_breaks: Vec<Range<Anchor>>,
 }
 
 #[derive(Clone)]
@@ -1302,6 +1401,37 @@ pub fn is_live_preview_enabled(editor: &Editor, cx: &App) -> bool {
         .is_some_and(|addon| is_enabled(addon, cx))
 }
 
+/// Makes `editor` show its markdown fully rendered whenever it does not have
+/// focus, and reveal source at the selection only while it does. Unfocused,
+/// it also flows each paragraph as a renderer would, drawing a line break
+/// inside one as a space; the buffer is never changed. A notebook markdown
+/// cell uses this to show one editor as both its rendered and its editing
+/// state.
+///
+/// Live preview attaches to an editor only after the editor's constructor has
+/// returned, so this defers itself and may be called from that constructor.
+/// It does nothing for an editor live preview is not attached to.
+pub fn reveal_source_only_while_focused(
+    editor: &Entity<Editor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let editor = editor.downgrade();
+    window.defer(cx, move |window, cx| {
+        editor
+            .update(cx, |editor, cx| {
+                let focused = editor.focus_handle(cx).is_focused(window);
+                let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+                    return;
+                };
+                addon.reveal_requires_focus = true;
+                addon.focused = focused;
+                apply_decorations(editor, cx);
+            })
+            .ok();
+    });
+}
+
 fn is_enabled(addon: &LivePreviewAddon, cx: &App) -> bool {
     addon
         .enabled_override
@@ -1327,6 +1457,7 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
         return;
     };
     addon.markers = markers.clone();
+    apply_note_font(editor, markers.is_some(), cx);
     apply_emphasis_highlights(editor, markers.as_deref(), cx);
     apply_heading_line_styles(editor, markers.as_deref(), cx);
     apply_decorations(editor, cx);
@@ -1714,7 +1845,14 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     // decorations refresh.
     remove_stale_restored_folds(editor, cx);
 
-    let selection_rows = selection_row_ranges(editor, &snapshot);
+    let reveals_source = editor
+        .addon::<LivePreviewAddon>()
+        .is_none_or(|addon| !addon.reveal_requires_focus || addon.focused);
+    let selection_rows = if reveals_source {
+        selection_row_ranges(editor, &snapshot)
+    } else {
+        Vec::new()
+    };
     let source_revealed = editor
         .addon::<LivePreviewAddon>()
         .and_then(|addon| addon.source_revealed.clone())
@@ -1726,7 +1864,11 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
         addon.source_revealed = source_revealed.clone();
     }
-    let selection_offsets = selection_offset_ranges(editor, &snapshot);
+    let selection_offsets = if reveals_source {
+        selection_offset_ranges(editor, &snapshot)
+    } else {
+        Vec::new()
+    };
     let base_directory = buffer_base_directory(editor, cx);
     let project = editor.project().cloned();
 
@@ -1812,6 +1954,48 @@ fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
             placeholder: fold_placeholder(&marker, weak_editor.clone()),
             content_key: 0,
         });
+    }
+    // An editor standing in for a rendered document flows a paragraph the
+    // way a renderer does, so a hard-wrapped one fills the width instead of
+    // keeping its source's short lines. Nothing in the buffer changes, and
+    // the lines come back the moment the editor is focused for editing.
+    if !reveals_source {
+        let mut taken: Vec<Range<usize>> = concealments
+            .iter()
+            .map(|concealment| {
+                concealment.range.start.to_offset(&snapshot).0
+                    ..concealment.range.end.to_offset(&snapshot).0
+            })
+            .collect();
+        taken.sort_by_key(|range| range.start);
+        // A paragraph can hold lines a widget stands in for (display math
+        // written without blank lines around it, an image on its own line),
+        // and those keep their rows.
+        let block_rows: Vec<Range<u32>> = markers
+            .blocks
+            .iter()
+            .map(|block| {
+                block.range.start.to_point(&snapshot).row..block.range.end.to_point(&snapshot).row
+            })
+            .collect();
+        for soft_break in &markers.soft_breaks {
+            let start = soft_break.start.to_offset(&snapshot).0;
+            let end = soft_break.end.to_offset(&snapshot).0;
+            let index = taken.partition_point(|range| range.end <= start);
+            if start >= end || taken.get(index).is_some_and(|range| range.start < end) {
+                continue;
+            }
+            let start_row = soft_break.start.to_point(&snapshot).row;
+            let end_row = soft_break.end.to_point(&snapshot).row;
+            if rows_intersect(&block_rows, start_row, end_row) {
+                continue;
+            }
+            concealments.push(Concealment {
+                range: soft_break.clone(),
+                placeholder: soft_break_placeholder(),
+                content_key: SOFT_BREAK_CONTENT_KEY,
+            });
+        }
     }
     editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), concealments, cx);
     if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
@@ -2971,9 +3155,8 @@ fn math_source_fallback(
     font_size: Pixels,
     cx: &App,
 ) -> AnyElement {
-    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
     let text = div()
-        .font(theme_settings.buffer_font.clone())
+        .font(note_font(cx))
         .text_size(font_size)
         .text_color(cx.theme().colors().editor_foreground)
         .child(source);
@@ -3026,7 +3209,7 @@ impl InlineMathLayout {
         let theme_settings = theme_settings::ThemeSettings::get_global(cx);
         let line_height = font_size * theme_settings.line_height();
         let text_system = cx.text_system();
-        let font_id = text_system.resolve_font(&theme_settings.buffer_font);
+        let font_id = text_system.resolve_font(&note_font(cx));
         let ascent = text_system.ascent(font_id, font_size);
         // `TextSystem::descent` is negative on macOS (a signed offset below
         // the baseline), while the painted baseline's formula
@@ -3087,9 +3270,8 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         InlineKind::Hide { .. } => Arc::new(|_, _, _| Empty.into_any_element()),
         InlineKind::Bullet => Arc::new(|_, _, _| {
             at_editor_font_size(|font_size, cx| {
-                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                 div()
-                    .font(theme_settings.buffer_font.clone())
+                    .font(note_font(cx))
                     .text_size(font_size)
                     .text_color(cx.theme().colors().text)
                     .child("•")
@@ -3136,11 +3318,10 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
                 let destination = destination.clone();
                 let label = label.clone();
                 at_editor_font_size(move |font_size, cx| {
-                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                     div()
                         .id(fold_id)
                         .cursor_pointer()
-                        .font(theme_settings.buffer_font.clone())
+                        .font(note_font(cx))
                         .text_size(font_size)
                         .text_color(cx.theme().colors().text_accent)
                         .hover(|style| style.underline())
@@ -3162,12 +3343,11 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
             Arc::new(move |_, _, _| {
                 let rendered = rendered.clone();
                 at_editor_font_size(move |font_size, cx| {
-                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                     let colors = cx.theme().colors();
                     // The same chip the key carries in source, so a rendered
                     // citation and a revealed one read as the same object.
                     div()
-                        .font(theme_settings.buffer_font.clone())
+                        .font(note_font(cx))
                         .text_size(font_size)
                         .text_color(colors.text)
                         .bg(colors.editor_document_highlight_read_background)
@@ -3183,14 +3363,13 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
             Arc::new(move |_, _, _| {
                 let label = label.clone();
                 at_editor_font_size(move |font_size, cx| {
-                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
                     // The editor centers an inline element in the line, so the
                     // only way to raise a marker above the baseline is to pad it
                     // asymmetrically: bottom padding of 2d shifts it up by d.
                     let raise = font_size * 0.3;
                     div()
                         .pb(raise * 2.0)
-                        .font(theme_settings.buffer_font.clone())
+                        .font(note_font(cx))
                         .text_size(font_size * 0.75)
                         .text_color(cx.theme().colors().text_accent)
                         .child(label)
@@ -3258,6 +3437,30 @@ fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPl
         merge_adjacent: false,
         type_tag: Some(TypeId::of::<LivePreviewFoldTag>()),
         collapsed_text,
+    }
+}
+
+/// Distinct from every [`marker_content_key`], which are small integers or
+/// hashes of a label.
+const SOFT_BREAK_CONTENT_KEY: u64 = u64::MAX;
+
+/// The single space a joined line break is drawn as.
+fn soft_break_placeholder() -> FoldPlaceholder {
+    FoldPlaceholder {
+        render: Arc::new(|_, _, _| {
+            at_editor_font_size(|font_size, cx| {
+                div()
+                    .font(note_font(cx))
+                    .text_size(font_size)
+                    .child(" ")
+                    .into_any_element()
+            })
+            .into_any_element()
+        }),
+        constrain_width: false,
+        merge_adjacent: false,
+        type_tag: Some(TypeId::of::<LivePreviewFoldTag>()),
+        collapsed_text: Some(SharedString::new_static(" ")),
     }
 }
 
@@ -5067,7 +5270,7 @@ fn render_table_block(
         // advance, so it would still wrap.
         let character_width = {
             let settings = theme_settings::ThemeSettings::get_global(block_cx.app);
-            let font = settings.buffer_font.clone();
+            let font = note_font(block_cx.app);
             let font_size = settings.buffer_font_size(block_cx.app);
             let text_system = block_cx.window.text_system();
             let font_id = text_system.resolve_font(&font);
@@ -8098,7 +8301,7 @@ fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
             settings::MarkdownQuoteBorderColor::LineNumber => colors.editor_line_number,
         };
     let settings = theme_settings::ThemeSettings::get_global(cx);
-    let font_family = settings.buffer_font.family.clone();
+    let font_family = note_font(cx).family;
     // Rendered prose must retain the source editor's metrics rather than the
     // UI typography that MarkdownFont::Editor uses for general Markdown views.
     let typography = TextStyleRefinement {
@@ -8190,22 +8393,25 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         bracket_math: Vec::new(),
     };
 
+    let mut block_roots = Vec::new();
     let mut inline_roots = Vec::new();
+    let mut delimiters = Vec::new();
     for layer in buffer_snapshot.syntax_layers() {
         match layer.language.name().as_ref() {
-            MARKDOWN => extraction.walk_block_layer(layer.node()),
-            MARKDOWN_INLINE => inline_roots.push(layer.node()),
+            MARKDOWN => block_roots.push(layer.node()),
+            MARKDOWN_INLINE => {
+                collect_bracket_math_delimiters(layer.node(), &text, &mut delimiters);
+                inline_roots.push(layer.node());
+            }
             _ => {}
         }
     }
-    // `\(...\)` and `\[...\]` are claimed before the inline walk, which then
-    // skips the markdown the grammar finds inside them; it has no math node
-    // for these delimiters, so it parses a formula's `*` and `[` as prose.
-    let mut delimiters = Vec::new();
-    for root in &inline_roots {
-        collect_bracket_math_delimiters(*root, extraction.text, &mut delimiters);
+    delimiters.sort_by_key(|(range, _)| range.start);
+    for root in block_roots {
+        extraction.walk_block_layer(root, &delimiters);
     }
     extraction.claim_bracket_math(delimiters);
+    extraction.bracket_math.sort_by_key(|range| range.start);
     for root in inline_roots {
         extraction.walk_inline_layer(root);
     }
@@ -8215,6 +8421,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
     extraction.scan_footnotes();
     extraction.scan_highlights();
     extraction.scan_tags();
+    let soft_breaks = extraction.soft_breaks();
 
     let Extraction {
         inline,
@@ -8277,6 +8484,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         highlights,
         tags,
         code,
+        soft_breaks,
     })
 }
 
@@ -8362,6 +8570,35 @@ fn collect_bracket_math_delimiters(
 }
 
 impl Extraction<'_> {
+    /// A paragraph's line breaks that render as a space: not a hard break
+    /// (two trailing spaces or a backslash), and not followed by a block
+    /// quote marker, whose line keeps its own decoration.
+    fn soft_breaks(&self) -> Vec<Range<Anchor>> {
+        let mut soft_breaks = Vec::new();
+        for region in &self.prose_regions {
+            let Some(prose) = self.text.get(region.clone()) else {
+                continue;
+            };
+            for (index, _) in prose.match_indices('\n') {
+                let before = &prose[..index];
+                let trimmed = before.trim_end_matches([' ', '\t']);
+                let trailing = before.len() - trimmed.len();
+                if trailing >= 2 || trimmed.ends_with('\\') {
+                    continue;
+                }
+                let after = &prose[index + 1..];
+                let next = after.trim_start_matches([' ', '\t']);
+                if next.is_empty() || next.starts_with(['>', '\n']) {
+                    continue;
+                }
+                let start = region.start + trimmed.len();
+                let end = region.start + index + 1 + (after.len() - next.len());
+                soft_breaks.push(self.anchor_range(start..end));
+            }
+        }
+        soft_breaks
+    }
+
     fn anchor_range(&self, range: Range<usize>) -> Range<Anchor> {
         // Bias the anchors inward so text inserted at the boundaries falls
         // outside the hidden range rather than growing it.
@@ -8463,11 +8700,10 @@ impl Extraction<'_> {
     /// brackets of `see \[1\]` (common in Pandoc and Notion output) as text.
     /// `\(...\)` may sit mid-line, since prose rarely escapes both
     /// parentheses, and tolerates padding like `$$`.
-    fn claim_bracket_math(&mut self, mut delimiters: Vec<(Range<usize>, BracketMathDelimiter)>) {
+    fn claim_bracket_math(&mut self, delimiters: Vec<(Range<usize>, BracketMathDelimiter)>) {
         if delimiters.is_empty() {
             return;
         }
-        delimiters.sort_by_key(|(range, _)| range.start);
         let mut regions = self.prose_regions.clone();
         regions.extend(self.heading_regions.iter().cloned());
         regions.sort_by_key(|region| region.start);
@@ -8532,17 +8768,22 @@ impl Extraction<'_> {
         })
     }
 
-    fn claim_bracket_formula(&mut self, open: Range<usize>, close: Range<usize>, display: bool) {
+    fn claim_bracket_formula(
+        &mut self,
+        open: Range<usize>,
+        close: Range<usize>,
+        display: bool,
+    ) -> bool {
         let construct = open.start..close.end;
         let Some(source) = self.text.get(open.end..close.start) else {
-            return;
+            return false;
         };
         if source.trim().is_empty() {
-            return;
+            return false;
         }
         if display {
             if !self.range_is_alone_on_its_lines(construct.clone()) {
-                return;
+                return false;
             }
             let start_row = MultiBufferOffset(construct.start)
                 .to_point(self.snapshot)
@@ -8567,6 +8808,7 @@ impl Extraction<'_> {
         }
         self.code_spans.push(construct.clone());
         self.bracket_math.push(construct);
+        true
     }
 
     fn bracket_math_overlap(&self, range: Range<usize>) -> BracketMathOverlap {
@@ -8665,7 +8907,44 @@ impl Extraction<'_> {
         });
     }
 
-    fn walk_block_layer(&mut self, root: tree_sitter::Node) {
+    /// A run of Setext underlines can split one display formula across several inline trees.
+    fn claim_math_across_underlines(
+        &mut self,
+        mut heading: tree_sitter::Node,
+        delimiters: &[(Range<usize>, BracketMathDelimiter)],
+    ) -> bool {
+        let boundary = delimiters.partition_point(|(range, _)| range.start < heading.end_byte());
+        let (before, after) = delimiters.split_at(boundary);
+        let (
+            Some((open, BracketMathDelimiter::OpenDisplay)),
+            Some((close, BracketMathDelimiter::CloseDisplay)),
+        ) = (before.last(), after.first())
+        else {
+            return false;
+        };
+        if open.start < heading.start_byte() {
+            return false;
+        }
+        while let Some(next) = heading.next_named_sibling() {
+            if next.start_position().row != heading.end_position().row {
+                break;
+            }
+            match next.kind() {
+                "setext_heading" if next.end_byte() <= close.start => heading = next,
+                "paragraph" if close.end <= next.end_byte() => {
+                    return self.claim_bracket_formula(open.clone(), close.clone(), true);
+                }
+                _ => break,
+            }
+        }
+        false
+    }
+
+    fn walk_block_layer(
+        &mut self,
+        root: tree_sitter::Node,
+        delimiters: &[(Range<usize>, BracketMathDelimiter)],
+    ) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
             match node.kind() {
@@ -8680,6 +8959,13 @@ impl Extraction<'_> {
                     let level = heading_level(node) as u8;
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
                     self.note_references_heading(node);
+                }
+                "setext_heading"
+                    if self.bracket_math.last().is_some_and(|math| {
+                        math.start <= node.start_byte() && node.end_byte() <= math.end
+                    }) => {}
+                "setext_heading" if self.claim_math_across_underlines(node, delimiters) => {
+                    push_children(node, &mut stack);
                 }
                 "setext_heading" => {
                     let (start_row, end_row) = self.node_rows(node);

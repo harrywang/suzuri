@@ -61,6 +61,7 @@ Suzuri's own code is the work of:
 - [Harry Wang](https://github.com/harrywang)
 - [Silouan Wright](https://github.com/silouanwright) — live-preview concealment fixes
 - [David Turnbull](https://github.com/dsturnbull) — the PDF viewer ([zed#51040](https://github.com/zed-industries/zed/pull/51040)) and the hayro text-extraction work it builds on
+- [Junsen Wang](https://github.com/phyjswang) — live-preview display math fixes
 
 GitHub's contributors sidebar also lists everyone who has contributed to [Zed](https://github.com/zed-industries/zed) since this fork began, because Suzuri merges upstream weekly.
 

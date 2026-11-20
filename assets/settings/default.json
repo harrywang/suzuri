@@ -1840,10 +1840,15 @@
   "word_diff_enabled": true,
   // Control what info is collected by Zed.
   "telemetry": {
+    // SUZURI: begin. Off by default: these go to Zed's servers, which
+    // Suzuri's maintainers never see, so they would only send a Suzuri user's
+    // data to a third party. Suzuri collects no telemetry of its own.
+    //
     // Send debug info like crash reports.
-    "diagnostics": true,
+    "diagnostics": false,
     // Send anonymized usage data like what languages you're using Zed with.
-    "metrics": true,
+    "metrics": false,
+    // SUZURI: end
     // Allow sending requests to Anthropic models that cannot be offered with
     // Zero Data Retention
     "anthropic_retention": false,

@@ -45,7 +45,7 @@ body:
 
         ⚠️ **Review the log for secrets (API keys, tokens, etc.) and redact them before posting.**
       value: |
-        <details><summary>Zed.log</summary>
+        <details><summary>Suzuri.log</summary>
 
         ```log
 

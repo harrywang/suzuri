@@ -15810,6 +15810,7 @@ dependencies = [
  "languages",
  "log",
  "markdown",
+ "markdown_live_preview",
  "menu",
  "multi_buffer",
  "nbformat",

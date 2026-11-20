@@ -43,13 +43,14 @@ The fork's own changes are small and additive:
 | Preview button for `.typ`/`.tex` | `crates/zed/src/zed/quick_action_bar/preview.rs` |
 | Document menu (formatting, citations, export; see "Document menu") and File → Export; new Suzuri items go in the fork-owned file, not `app_menus.rs` | `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/zed/src/zed/app_menus.rs` (three tagged hunks) |
 | Jupyter notebooks enabled by default (temporary; see below) | `crates/feature_flags/src/flags.rs`, `crates/repl/src/notebook/notebook_ui.rs`, `crates/repl/src/repl_editor.rs` |
+| Notebook markdown cells rendered by live preview, so they show math and the rest of what a note shows (see "Jupyter notebooks") | `crates/repl/src/notebook/cell.rs`, `crates/repl/Cargo.toml`, `crates/markdown_live_preview/src/markdown_live_preview.rs` (`reveal_source_only_while_focused`) |
 | In-app updates from GitHub releases (see "Cutting a release") | `crates/suzuri_update/`, `crates/auto_update/src/auto_update.rs` (`init`, `get_release_asset`, `release_notes_url`, the macOS and Linux installers), `crates/auto_update_ui/src/auto_update_ui.rs` (app name), `crates/release_channel/src/lib.rs` (`poll_for_updates`) |
 | Crash recovery: panic logging and quarantining the file blamed for a launch crash (see "Crash recovery") | `crates/suzuri_recovery/`, `crates/zed/src/main.rs` (panic hook, init), `crates/editor/src/items.rs` (skip on restore), `crates/markdown_live_preview/src/markdown_live_preview.rs` (`register_editor`) |
 | Auto sync with a git remote, SoloMD-style: commit, pull (merge) and push a few seconds after changes, pull every 5 minutes; opted into per repository with `suzuri.autosync` in its `.git/config` (Document → Sync). Turn On always targets the opened folder; a plain folder is connected through GitHub's device flow (Suzuri OAuth app owned by the datamonet org, client id in `github.rs`, no secret), which creates the private repository. Timings are the `auto_sync` settings (`sync_delay_seconds`, `pull_interval_minutes`), shown on the settings window's Suzuri page, which is where a fork setting that needs UI goes | `crates/suzuri_sync/` (`suzuri_sync.rs`, `connect.rs`, `github.rs`), `crates/zed/src/main.rs` (`init`), `crates/zed/src/zed/app_menus/document_menu.rs`, `crates/settings_ui/src/suzuri_page.rs`, `crates/settings_ui/src/settings_ui.rs` and `page_data.rs` (one tagged line each) |
 | Own config and data folders, separate from Zed's (`APP_NAME = "Suzuri"`, binary still `zed`): one-time copy of an existing user's state, Import from Zed, keychain credentials in shipped builds (see "Own folders") | `crates/suzuri_migration/`, `crates/paths/src/paths.rs` (`APP_NAME`), `crates/zed/src/main.rs` (assert removed, two calls), `crates/onboarding/src/basics_page.rs` and `Cargo.toml` (Zed import button) |
 | Remote server provisioning on the dev channel (SSH/Docker/WSL remotes; see "Cutting a release") | `crates/auto_update/src/auto_update.rs` (`get_release_asset`), `crates/remote/src/transport/ssh.rs`, `docker.rs`, `wsl.rs` (`ensure_server_binary`) |
 | Issue chooser (Bug, Crash, Feature request; labels, since a user-owned repo has no issue types). Zed's `10_`/`11_` templates are deleted: a merge that brings them back as a modify/delete conflict resolves by keeping them deleted | `.github/ISSUE_TEMPLATE/config.yml`, `.github/ISSUE_TEMPLATE/suzuri_*.yml` |
-| Settings plumbing | `crates/settings_content/`, `assets/settings/default.json` |
+| Settings plumbing, including Zed's telemetry turned off by default (Suzuri collects none of its own) | `crates/settings_content/`, `assets/settings/default.json` |
 | Branding, CLI name, release infrastructure | `crates/zed/Cargo.toml` (bundle metadata), `crates/zed/resources/app-icon-suzuri*`, `crates/zed/resources/windows/app-icon-suzuri.ico`, `assets/images/suzuri_logo.svg`, `crates/install_cli/src/install_cli_binary.rs`, `script/bundle-mac`, `script/bundle-windows.ps1`, `script/bundle-linux`, `.github/workflows/suzuri-release.yml` |
 
 `git log --author="Harry Wang" --name-only` is the authoritative list of touched files.
@@ -185,6 +186,7 @@ merge chasing them:
 | --- | --- |
 | 11 save-prompt tests in `workspace` and `zed`, plus `project_panel tests::undo::undo_create_dirty_file` | The fork's `autosave` default in `assets/settings/default.json`. Tests load the shipped defaults, so buffers save themselves and upstream's tests never see the prompt they wait for. Setting `"autosave": "off"` in that file makes all twelve pass. |
 | `project_panel project_panel_tests::test_focus_follows_mouse_into_blank_area`, `zed tests::test_open_paths_action` | The fork docks the project panel left (`project_panel.dock` in `assets/settings/default.json`, #146). The first test hovers where the right dock would be, and the second asserts the right dock is open. Setting that default back to `"right"` makes both pass (the second also needs `"autosave": "off"`). |
+| `client telemetry::tests::test_telemetry_flush_on_flush_interval`, `test_telemetry_flush_on_max_queue_size`, `test_report_remote_event_tags_origin` | The fork turns Zed's telemetry off (`telemetry.metrics` and `telemetry.diagnostics` in `assets/settings/default.json`), and these tests load the shipped defaults, so no event is ever queued. Setting `"metrics": true` there makes all three pass. |
 | `zed tests::test_action_namespaces` | The test pins the exact set of action namespaces, and the fork adds `pdf_viewer`, `typeset_preview`, `json_canvas`, `note_graph`, and `auto_sync`. |
 | `collab db_tests::*_postgres` (14) | Need a local Postgres; CI provisions one. |
 
@@ -339,6 +341,21 @@ take upstream's `flags.rs` wholesale — nothing else is required, because the n
 editor itself was never forked. Items 2 and 3 are worth upstreaming as a PR; until they
 land, they are the only part of this that needs conflict resolution, and
 `notebook_ui.rs` is actively developed upstream, so expect to redo hunk 3 occasionally.
+
+**Markdown cells render through live preview (permanent, not part of the bridge above).**
+Upstream draws a rendered markdown cell with the `markdown` crate, which has no math,
+and swaps in the cell's editor only while editing. In Suzuri the cell's editor is both
+states: `MarkdownCell::render` in `crates/repl/src/notebook/cell.rs` shows it whenever
+live preview is enabled, and `markdown_live_preview::reveal_source_only_while_focused`
+keeps all source concealed until the editor has focus. Focusing the editor is what sets
+`editing`. With live preview off (the setting, the toggle, or a quarantined file) the
+cell falls back to upstream's renderer untouched. The delta is two `SUZURI:` hunks in
+`cell.rs` and one dependency in `crates/repl/Cargo.toml`; keep them through a merge, and
+`suzuri_markdown_cell_renders_through_live_preview_until_focused` fails if they are lost.
+An unfocused cell also joins each paragraph's soft line breaks for display (a
+concealment drawn as a space, `MarkerSet::soft_breaks`), so a hard-wrapped notebook
+reflows as it does in Jupyter; the source is never rewritten, and the lines return while
+the cell is being edited. Notes do not do this.
 
 ## Document menu
 
