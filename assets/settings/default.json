@@ -141,11 +141,6 @@
     // preview): syntax markers are hidden until editing. Headings retain
     // their typography while editing; tables and images use inline widgets.
     "enabled": true,
-    // The font family for markdown notes while live preview renders them,
-    // such as "Avenir Next" for a document look. Other files keep the
-    // buffer font, and so do a note's code blocks; inline code uses this
-    // font. Null uses `buffer_font_family`.
-    "font_family": null,
     // Heading typography. Font sizes multiply the editor's base font size;
     // weights use CSS values from 100 to 900.
     "heading_styles": {

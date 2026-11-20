@@ -963,10 +963,8 @@ async fn test_font_family_applies_only_while_rendering(cx: &mut TestAppContext) 
     cx.cx.update(|_window, cx| {
         SettingsStore::update_global(cx, |store, cx| {
             store.update_user_settings(cx, |content| {
-                content
-                    .markdown_live_preview
-                    .get_or_insert_default()
-                    .font_family = Some(settings::FontFamilyName("Avenir Next".into()));
+                content.markdown_preview.get_or_insert_default().font_family =
+                    Some(settings::FontFamilyName("Avenir Next".into()));
             });
         });
     });

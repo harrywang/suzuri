@@ -201,14 +201,20 @@ pub struct MarkdownLivePreviewSettings {
 
 impl Settings for MarkdownLivePreviewSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
+        // Notes share Zed's markdown preview font. Unlike the preview pane,
+        // an unset font keeps the buffer font rather than the UI font, so a
+        // note looks like the rest of the editor unless a font is chosen.
+        let font_family = content
+            .markdown_preview
+            .as_ref()
+            .and_then(|preview| preview.font_family.as_ref())
+            .map(|family| SharedString::from(family.0.to_string()));
         let content = content.markdown_live_preview.clone().unwrap_or_default();
         let heading_content = content.heading_styles.unwrap_or_default();
         let defaults = MarkdownHeadingStyles::default();
         Self {
             enabled: content.enabled.unwrap_or(true),
-            font_family: content
-                .font_family
-                .map(|family| SharedString::from(family.0.to_string())),
+            font_family,
             block_quote_border_color: content.block_quote_border_color.unwrap_or_default(),
             block_quote_border_width: content
                 .block_quote_border_width
@@ -236,7 +242,7 @@ pub fn init(cx: &mut App) {
 }
 
 /// The font a rendered note is drawn in: the buffer font, with its family
-/// replaced when `markdown_live_preview.font_family` names one.
+/// replaced when `markdown_preview.font_family` names one.
 fn note_font(cx: &App) -> Font {
     let mut font = theme_settings::ThemeSettings::get_global(cx)
         .buffer_font
