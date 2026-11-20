@@ -2,6 +2,8 @@
 //! file Zed never edits, so `page_data.rs` carries one line for it instead of
 //! sections woven into Zed's pages.
 
+use std::num::NonZeroU32;
+
 use crate::{SettingField, SettingItem, SettingsPage, SettingsPageItem, USER};
 
 pub(crate) fn suzuri_page() -> SettingsPage {
@@ -17,7 +19,7 @@ fn auto_sync_section() -> [SettingsPageItem; 3] {
         SettingsPageItem::SettingItem(SettingItem {
             title: "Sync Delay",
             description: "Seconds to wait after your last edit before syncing.",
-            field: Box::new(SettingField::<u64> {
+            field: Box::new(SettingField::<NonZeroU32> {
                 organization_override: None,
                 json_path: Some("auto_sync.sync_delay_seconds"),
                 pick: |content| content.auto_sync.as_ref()?.sync_delay_seconds.as_ref(),
@@ -31,7 +33,7 @@ fn auto_sync_section() -> [SettingsPageItem; 3] {
         SettingsPageItem::SettingItem(SettingItem {
             title: "Pull Interval",
             description: "Minutes between checks for changes from your other computers.",
-            field: Box::new(SettingField::<u64> {
+            field: Box::new(SettingField::<NonZeroU32> {
                 organization_override: None,
                 json_path: Some("auto_sync.pull_interval_minutes"),
                 pick: |content| content.auto_sync.as_ref()?.pull_interval_minutes.as_ref(),

@@ -1512,11 +1512,11 @@ pub struct AutoSyncSettingsContent {
     /// are committed and pushed, so a run of edits becomes one commit.
     ///
     /// Default: 5
-    pub sync_delay_seconds: Option<u64>,
+    pub sync_delay_seconds: Option<std::num::NonZeroU32>,
     /// How many minutes pass between checks for changes made elsewhere.
     ///
     /// Default: 5
-    pub pull_interval_minutes: Option<u64>,
+    pub pull_interval_minutes: Option<std::num::NonZeroU32>,
 }
 
 /// The settings for live Typst and LaTeX preview.

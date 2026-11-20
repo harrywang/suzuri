@@ -66,20 +66,20 @@ pub struct AutoSyncSettings {
 impl Settings for AutoSyncSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let content = content.auto_sync.clone().unwrap_or_default();
-        // A zero would commit on every keystroke's autosave, or pull in a
-        // tight loop, so both have a floor of one.
+        // Both are non-zero by type: a zero would commit on every
+        // keystroke's autosave, or pull in a tight loop.
         Self {
             sync_delay: Duration::from_secs(
                 content
                     .sync_delay_seconds
-                    .unwrap_or(DEFAULT_SYNC_DELAY_SECONDS)
-                    .max(1),
+                    .map_or(DEFAULT_SYNC_DELAY_SECONDS, |seconds| seconds.get().into()),
             ),
             pull_interval: Duration::from_secs(
                 content
                     .pull_interval_minutes
-                    .unwrap_or(DEFAULT_PULL_INTERVAL_MINUTES)
-                    .max(1)
+                    .map_or(DEFAULT_PULL_INTERVAL_MINUTES, |minutes| {
+                        minutes.get().into()
+                    })
                     .saturating_mul(60),
             ),
         }
@@ -1802,11 +1802,11 @@ mod tests {
         );
     }
 
-    /// Pins the shipped defaults and the floor, and that `default.json`
+    /// Pins the shipped defaults, that zero is refused, and that `default.json`
     /// really has the section: `from_settings` falls back to the same
     /// constants when it is missing, so only the raw text can tell.
     #[gpui::test]
-    fn settings_default_to_five_and_never_reach_zero(cx: &mut gpui::App) {
+    fn settings_default_to_five_and_refuse_zero(cx: &mut gpui::App) {
         let defaults = settings::default_settings();
         assert!(
             defaults.contains("\n  \"auto_sync\": {"),
@@ -1818,16 +1818,23 @@ mod tests {
         assert_eq!(settings.sync_delay, Duration::from_secs(5));
         assert_eq!(settings.pull_interval, Duration::from_secs(5 * 60));
 
+        assert!(
+            serde_json::from_str::<settings::AutoSyncSettingsContent>(
+                r#"{"sync_delay_seconds": 0}"#
+            )
+            .is_err(),
+            "a zero delay must not parse"
+        );
         let content = settings::SettingsContent {
-            auto_sync: Some(settings::AutoSyncSettingsContent {
-                sync_delay_seconds: Some(0),
-                pull_interval_minutes: Some(0),
-            }),
+            auto_sync: serde_json::from_str(
+                r#"{"sync_delay_seconds": 1, "pull_interval_minutes": 30}"#,
+            )
+            .expect("valid settings"),
             ..Default::default()
         };
-        let floored = AutoSyncSettings::from_settings(&content);
-        assert_eq!(floored.sync_delay, Duration::from_secs(1));
-        assert_eq!(floored.pull_interval, Duration::from_secs(60));
+        let custom = AutoSyncSettings::from_settings(&content);
+        assert_eq!(custom.sync_delay, Duration::from_secs(1));
+        assert_eq!(custom.pull_interval, Duration::from_secs(30 * 60));
     }
 
     #[test]
