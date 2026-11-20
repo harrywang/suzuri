@@ -31,6 +31,7 @@ use project::{
     git_store::{GitStoreEvent, Repository, RepositoryEvent, RepositoryId},
     trusted_worktrees::TrustedWorktrees,
 };
+use settings::{RegisterSetting, Settings};
 use util::ResultExt as _;
 use workspace::{Toast, Workspace, notifications::NotificationId};
 
@@ -48,10 +49,47 @@ actions!(
     ]
 );
 
-/// How long the working tree must stay unchanged before a sync, so a burst of
-/// autosaves becomes one commit.
-const CHANGE_DELAY: Duration = Duration::from_secs(5);
-const PULL_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const DEFAULT_SYNC_DELAY_SECONDS: u64 = 5;
+const DEFAULT_PULL_INTERVAL_MINUTES: u64 = 5;
+
+/// Settings for auto sync. Which repositories sync is not among them: that
+/// is opted into per repository, in its own git config.
+#[derive(Clone, Debug, PartialEq, RegisterSetting)]
+pub struct AutoSyncSettings {
+    /// How long the working tree must stay unchanged before a sync, so a
+    /// burst of autosaves becomes one commit.
+    pub sync_delay: Duration,
+    /// How often changes made elsewhere are pulled.
+    pub pull_interval: Duration,
+}
+
+impl Settings for AutoSyncSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let content = content.auto_sync.clone().unwrap_or_default();
+        // A zero would commit on every keystroke's autosave, or pull in a
+        // tight loop, so both have a floor of one.
+        Self {
+            sync_delay: Duration::from_secs(
+                content
+                    .sync_delay_seconds
+                    .unwrap_or(DEFAULT_SYNC_DELAY_SECONDS)
+                    .max(1),
+            ),
+            pull_interval: Duration::from_secs(
+                content
+                    .pull_interval_minutes
+                    .unwrap_or(DEFAULT_PULL_INTERVAL_MINUTES)
+                    .max(1)
+                    .saturating_mul(60),
+            ),
+        }
+    }
+}
+
+fn sync_delay(cx: &App) -> Duration {
+    AutoSyncSettings::get_global(cx).sync_delay
+}
+
 const RETRY_DELAY: Duration = Duration::from_secs(30);
 const CONFLICT_RECHECK_DELAY: Duration = Duration::from_secs(10);
 /// Failures in a row, other than being offline, before syncing stops and asks
@@ -197,7 +235,7 @@ impl AutoSync {
                 this.reconcile(cx)
             }
             GitStoreEvent::RepositoryUpdated(id, RepositoryEvent::StatusesChanged, _) => {
-                this.request(*id, Trigger::Change, CHANGE_DELAY, cx)
+                this.request(*id, Trigger::Change, sync_delay(cx), cx)
             }
             _ => {}
         });
@@ -281,7 +319,10 @@ impl AutoSync {
         state.enabled = true;
         state.pull_timer = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(PULL_INTERVAL).await;
+                // Read each time round, so a changed setting applies from
+                // the next pull without restarting anything.
+                let interval = cx.update(|cx| AutoSyncSettings::get_global(cx).pull_interval);
+                cx.background_executor().timer(interval).await;
                 if this
                     .update(cx, |this, cx| {
                         this.request(id, Trigger::Timer, Duration::ZERO, cx)
@@ -295,7 +336,7 @@ impl AutoSync {
         let delay = if first == Trigger::Manual {
             Duration::ZERO
         } else {
-            CHANGE_DELAY
+            sync_delay(cx)
         };
         self.request(id, first, delay, cx);
     }
@@ -509,7 +550,7 @@ impl AutoSync {
             } else if state.failures > 0 {
                 RETRY_DELAY
             } else {
-                CHANGE_DELAY
+                sync_delay(cx)
             };
             self.request(id, pending, delay, cx);
         }
@@ -1759,6 +1800,34 @@ mod tests {
             git(&notes, &["config", "--local", ENABLED_KEY]).trim(),
             "true"
         );
+    }
+
+    /// Pins the shipped defaults and the floor, and that `default.json`
+    /// really has the section: `from_settings` falls back to the same
+    /// constants when it is missing, so only the raw text can tell.
+    #[gpui::test]
+    fn settings_default_to_five_and_never_reach_zero(cx: &mut gpui::App) {
+        let defaults = settings::default_settings();
+        assert!(
+            defaults.contains("\n  \"auto_sync\": {"),
+            "default.json has no top-level auto_sync section"
+        );
+        let store = settings::SettingsStore::new(cx, &defaults);
+        cx.set_global(store);
+        let settings = AutoSyncSettings::get_global(cx);
+        assert_eq!(settings.sync_delay, Duration::from_secs(5));
+        assert_eq!(settings.pull_interval, Duration::from_secs(5 * 60));
+
+        let content = settings::SettingsContent {
+            auto_sync: Some(settings::AutoSyncSettingsContent {
+                sync_delay_seconds: Some(0),
+                pull_interval_minutes: Some(0),
+            }),
+            ..Default::default()
+        };
+        let floored = AutoSyncSettings::from_settings(&content);
+        assert_eq!(floored.sync_delay, Duration::from_secs(1));
+        assert_eq!(floored.pull_interval, Duration::from_secs(60));
     }
 
     #[test]

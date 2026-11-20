@@ -191,6 +191,16 @@
     //   "typst", "xelatex", "lualatex", "pdflatex", "context"
     "pdf_engine": "typst",
   },
+  // Auto sync settings (Document > Sync). Which projects sync is not a
+  // setting: each one is turned on from the menu.
+  "auto_sync": {
+    // How many seconds a project's files must stay unchanged before they are
+    // committed and pushed. A longer delay makes fewer, larger commits.
+    "sync_delay_seconds": 5,
+    // How many minutes pass between checks for changes made on your other
+    // computers. Sync Now checks at once.
+    "pull_interval_minutes": 5,
+  },
   // Live Typst and LaTeX preview settings
   "typeset_preview": {
     // Which engine compiles .tex files.
