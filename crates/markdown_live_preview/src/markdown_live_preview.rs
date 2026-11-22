@@ -4539,12 +4539,7 @@ fn commit_active_cell(editor: &mut Editor, cx: &mut Context<Editor>) {
     else {
         return;
     };
-    let text = active
-        .editor
-        .read(cx)
-        .text(cx)
-        .replace('\n', " ")
-        .replace('|', "\\|");
+    let text = active.editor.read(cx).text(cx).replace('\n', " ");
     let snapshot = editor.buffer().read(cx).snapshot(cx);
     let start = active.cell_range.start.to_offset(&snapshot);
     let end = active.cell_range.end.to_offset(&snapshot);
@@ -4556,22 +4551,25 @@ fn commit_active_cell(editor: &mut Editor, cx: &mut Context<Editor>) {
         cx.notify();
         return;
     }
-    let replacement = format!(" {} ", text.trim());
+    let text = text.trim();
+    let mut pipes = unescaped_table_pipes(text);
+    exclude_math_pipes(text, &mut pipes);
+    let mut replacement = String::from(" ");
+    let mut start_of_part = 0;
+    for pipe in pipes {
+        replacement.push_str(&text[start_of_part..pipe]);
+        replacement.push('\\');
+        start_of_part = pipe;
+    }
+    replacement.push_str(&text[start_of_part..]);
+    replacement.push(' ');
     editor.buffer().update(cx, |multibuffer, cx| {
         multibuffer.edit([(start..end, replacement)], None, cx);
     });
     cx.notify();
 }
 
-/// Splits one table row line into cell ranges at unescaped pipes (the GFM
-/// rule). Each range spans the full text between two pipes, padding included,
-/// so a cell edit can rewrite it in place. Segments outside the outer pipes
-/// are kept only when non-blank (tables without outer pipes).
-fn split_table_row_text(
-    text: &str,
-    base_offset: usize,
-    snapshot: &MultiBufferSnapshot,
-) -> Vec<Range<Anchor>> {
+fn unescaped_table_pipes(text: &str) -> Vec<usize> {
     let mut boundaries = Vec::new();
     let mut escaped = false;
     for (offset, byte) in text.bytes().enumerate() {
@@ -4580,18 +4578,36 @@ fn split_table_row_text(
         } else if byte == b'\\' {
             escaped = true;
         } else if byte == b'|' {
-            boundaries.push(base_offset + offset);
+            boundaries.push(offset);
         }
     }
+    boundaries
+}
+
+fn exclude_math_pipes(text: &str, pipes: &mut Vec<usize>) {
+    if pipes.is_empty() || !(text.contains('$') || text.contains(r"\(")) {
+        return;
+    }
+    let formulas = cell_math_ranges(text);
+    let mut formulas = formulas.iter().peekable();
+    pipes.retain(|pipe| {
+        while formulas.next_if(|(range, _)| range.end <= *pipe).is_some() {}
+        !formulas
+            .peek()
+            .is_some_and(|(range, _)| range.contains(pipe))
+    });
+}
+
+fn table_cell_ranges(text: &str, boundaries: &[usize]) -> Vec<Range<usize>> {
     let mut segments = Vec::new();
-    let mut segment_start = base_offset;
-    for boundary in boundaries {
+    let mut segment_start = 0;
+    for &boundary in boundaries {
         segments.push(segment_start..boundary);
         segment_start = boundary + 1;
     }
-    segments.push(segment_start..base_offset + text.len());
+    segments.push(segment_start..text.len());
     let is_blank = |range: &Range<usize>| {
-        text.get(range.start - base_offset..range.end - base_offset)
+        text.get(range.clone())
             .is_none_or(|segment| segment.trim().is_empty())
     };
     if segments.len() > 1 && is_blank(&segments[0]) {
@@ -4601,29 +4617,54 @@ fn split_table_row_text(
         segments.pop();
     }
     segments
-        .into_iter()
-        .map(|range| {
-            // Outward bias: the range must survive its own rewrite when a
-            // cell edit commits.
-            snapshot.anchor_before(MultiBufferOffset(range.start))
-                ..snapshot.anchor_after(MultiBufferOffset(range.end))
+}
+
+fn table_alignments(line: &str) -> Option<Vec<CellAlignment>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    trimmed
+        .split('|')
+        .map(|cell| {
+            let cell = cell.trim();
+            let dashes = cell.strip_prefix(':').unwrap_or(cell);
+            let dashes = dashes.strip_suffix(':').unwrap_or(dashes);
+            if dashes.is_empty() || !dashes.bytes().all(|byte| byte == b'-') {
+                return None;
+            }
+            Some(match (cell.starts_with(':'), cell.ends_with(':')) {
+                (true, true) => CellAlignment::Center,
+                (true, false) => CellAlignment::Left,
+                (false, true) => CellAlignment::Right,
+                (false, false) => CellAlignment::None,
+            })
         })
         .collect()
 }
 
-fn is_delimiter_row(line: &str) -> bool {
-    let mut cells = line
-        .trim()
-        .trim_start_matches('|')
-        .trim_end_matches('|')
-        .split('|')
-        .peekable();
-    cells.peek().is_some()
-        && cells.all(|cell| {
-            let cell = cell.trim();
-            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
-            !dashes.is_empty() && dashes.bytes().all(|byte| byte == b'-')
-        })
+fn split_table_row_text(text: &str, columns: usize) -> (Vec<Range<usize>>, bool) {
+    let mut pipes = unescaped_table_pipes(text);
+    let cells = table_cell_ranges(text, &pipes);
+    // Prices in adjacent cells can pair as math when parsed as a single line.
+    // Keep the ordinary split whenever it already fits the delimiter row.
+    if cells.len() > columns {
+        let excess = cells.len() - columns;
+        let original = pipes.len();
+        exclude_math_pipes(text, &mut pipes);
+        if original - pipes.len() == excess {
+            return (table_cell_ranges(text, &pipes), true);
+        }
+    }
+    (cells, false)
+}
+
+fn table_line(snapshot: &MultiBufferSnapshot, row: u32) -> (String, MultiBufferOffset) {
+    let start = Point::new(row, 0).to_offset(snapshot);
+    let end = Point::new(row, snapshot.line_len(MultiBufferRow(row))).to_offset(snapshot);
+    (snapshot.text_for_range(start..end).collect(), start)
 }
 
 /// Parses the pipe table containing `near` straight from buffer text. Widget
@@ -4637,13 +4678,8 @@ fn parse_table_at(
     let near = near.min(snapshot.len());
     let click_row = near.to_point(snapshot).row;
     let max_row = snapshot.max_point().row;
-    let line_at = |row: u32| -> (String, MultiBufferOffset, MultiBufferOffset) {
-        let start = Point::new(row, 0).to_offset(snapshot);
-        let end = Point::new(row, snapshot.line_len(MultiBufferRow(row))).to_offset(snapshot);
-        (snapshot.text_for_range(start..end).collect(), start, end)
-    };
     let is_table_line = |row: u32| -> bool {
-        let (text, ..) = line_at(row);
+        let (text, _) = table_line(snapshot, row);
         !text.trim().is_empty() && text.contains('|')
     };
 
@@ -4660,34 +4696,47 @@ fn parse_table_at(
     }
     // The block may over-extend into adjacent prose that happens to contain a
     // pipe; anchor on the delimiter row and take the line above as header.
-    let delimiter_row =
-        (first_row + 1..=last_row).find(|row| is_delimiter_row(&line_at(*row).0))?;
-    let header_row = delimiter_row - 1;
+    let (delimiter_row, alignments) = (first_row + 1..=last_row)
+        .find_map(|row| Some((row, table_alignments(&table_line(snapshot, row).0)?)))?;
+    parse_table_rows(
+        snapshot,
+        delimiter_row - 1,
+        alignments,
+        delimiter_row + 1..=last_row,
+        false,
+    )
+}
 
-    let split_row = |row: u32| -> Vec<Range<Anchor>> {
-        let (text, start, _) = line_at(row);
-        split_table_row_text(&text, start.0, snapshot)
+fn parse_table_rows(
+    snapshot: &MultiBufferSnapshot,
+    header_row: u32,
+    alignments: Vec<CellAlignment>,
+    body_rows: impl Iterator<Item = u32>,
+    require_math_header: bool,
+) -> Option<(Range<MultiBufferOffset>, TableStructure)> {
+    let split_row = |row| {
+        let (text, start) = table_line(snapshot, row);
+        let (cells, recovered) = split_table_row_text(&text, alignments.len());
+        let cells: Vec<_> = cells
+            .into_iter()
+            .map(|range| {
+                // Outward bias lets a cell's anchors survive its own rewrite.
+                snapshot.anchor_before(MultiBufferOffset(start.0 + range.start))
+                    ..snapshot.anchor_after(MultiBufferOffset(start.0 + range.end))
+            })
+            .collect();
+        (cells, recovered)
     };
-    let header = split_row(header_row);
-    if header.is_empty() {
+    let (header, recovered) = split_row(header_row);
+    if require_math_header && !recovered {
         return None;
     }
-    let alignments = split_row(delimiter_row)
-        .into_iter()
-        .map(|range| {
-            let start = range.start.to_offset(snapshot);
-            let end = range.end.to_offset(snapshot);
-            let text: String = snapshot.text_for_range(start..end).collect();
-            let text = text.trim();
-            match (text.starts_with(':'), text.ends_with(':')) {
-                (true, true) => CellAlignment::Center,
-                (true, false) => CellAlignment::Left,
-                (false, true) => CellAlignment::Right,
-                (false, false) => CellAlignment::None,
-            }
-        })
-        .collect();
-    let mut rows: Vec<Vec<Range<Anchor>>> = (delimiter_row + 1..=last_row).map(split_row).collect();
+    let mut rows = Vec::new();
+    let mut last_row = header_row + 1;
+    for row in body_rows {
+        rows.push(split_row(row).0);
+        last_row = row;
+    }
 
     let mut header = header;
     let columns = header
@@ -4895,6 +4944,33 @@ enum CellSegment<'a> {
 /// dollar ones, so a `$` inside a code span or escaped as `\$` stays text. A
 /// cell is one line, so `\[...\]` there is never display math.
 fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
+    let formulas = cell_math_ranges(text);
+    if formulas.is_empty() {
+        return vec![CellSegment::Text {
+            text,
+            space_before: false,
+            space_after: false,
+        }];
+    }
+
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (construct, source) in formulas {
+        if let Some(between) = text.get(cursor..construct.start) {
+            push_cell_text(&mut segments, between);
+        }
+        if let Some(source) = text.get(source) {
+            segments.push(CellSegment::Math(source));
+        }
+        cursor = construct.end;
+    }
+    if let Some(rest) = text.get(cursor..) {
+        push_cell_text(&mut segments, rest);
+    }
+    segments
+}
+
+fn cell_math_ranges(text: &str) -> Vec<(Range<usize>, Range<usize>)> {
     let mut formulas = Vec::new();
     let mut code = Vec::new();
     let parser = pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::ENABLE_MATH);
@@ -4947,29 +5023,7 @@ fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
         }
     }
     formulas.sort_by_key(|(construct, _)| construct.start);
-    if formulas.is_empty() {
-        return vec![CellSegment::Text {
-            text,
-            space_before: false,
-            space_after: false,
-        }];
-    }
-
-    let mut segments = Vec::new();
-    let mut cursor = 0;
-    for (construct, source) in formulas {
-        if let Some(between) = text.get(cursor..construct.start) {
-            push_cell_text(&mut segments, between);
-        }
-        if let Some(source) = text.get(source) {
-            segments.push(CellSegment::Math(source));
-        }
-        cursor = construct.end;
-    }
-    if let Some(rest) = text.get(cursor..) {
-        push_cell_text(&mut segments, rest);
-    }
-    segments
+    formulas
 }
 
 /// The `\(...\)` formulas of one line of text, as (construct, source) byte
@@ -8940,6 +8994,45 @@ impl Extraction<'_> {
         false
     }
 
+    fn push_table(&mut self, offsets: Range<MultiBufferOffset>, table: TableStructure) {
+        let start = offsets.start.to_point(self.snapshot).row;
+        let end = offsets.end.to_point(self.snapshot).row;
+        // One textual table can contain several syntax nodes.
+        if self.last_table_end_row.is_none_or(|last| start > last) {
+            self.last_table_end_row = Some(end);
+            self.push_block_rows(start, end, end - start + 2, BlockRenderKind::Table(table));
+        }
+    }
+
+    fn recover_paragraph_tables(&mut self, paragraph: tree_sitter::Node) {
+        // The block grammar sees an over-wide header as prose, before it recognizes inline math.
+        let text = &self.text[paragraph.byte_range()];
+        let mut lines = text.lines().zip(paragraph.start_position().row as u32..);
+        while let Some((header, row)) = lines.next() {
+            if self.last_table_end_row.is_some_and(|end| row <= end)
+                || !header.contains('|')
+                || !(header.contains('$') || header.contains(r"\("))
+            {
+                continue;
+            }
+            let mut following = lines.clone();
+            let Some(alignments) = following
+                .next()
+                .and_then(|(line, _)| table_alignments(line))
+            else {
+                continue;
+            };
+            let body = following
+                .take_while(|(line, _)| line.contains('|'))
+                .map(|(_, row)| row);
+            if let Some((range, table)) =
+                parse_table_rows(self.snapshot, row, alignments, body, true)
+            {
+                self.push_table(range, table);
+            }
+        }
+    }
+
     fn walk_block_layer(
         &mut self,
         root: tree_sitter::Node,
@@ -8976,39 +9069,24 @@ impl Extraction<'_> {
                     let (start_row, end_row) = self.node_rows(node);
                     self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Rule);
                 }
+                "paragraph" => {
+                    self.recover_paragraph_tables(node);
+                    push_children(node, &mut stack);
+                }
                 "pipe_table" => {
-                    // Extent and structure come from the text parser, not the
-                    // tree: tree-sitter-md chokes on valid GFM like a row of
-                    // all-empty cells, ending the table node early.
-                    let near = MultiBufferOffset(node.start_byte());
-                    match parse_table_at(self.snapshot, near) {
-                        Some((offsets, structure)) => {
-                            let start_row = offsets.start.to_point(self.snapshot).row;
-                            let end_row = offsets.end.to_point(self.snapshot).row;
-                            // One textual table can contain several table
-                            // nodes; only the first one produces the block.
-                            let claimed = self
-                                .last_table_end_row
-                                .is_some_and(|last| start_row <= last);
-                            if !claimed {
-                                self.last_table_end_row = Some(end_row);
-                                self.push_block_rows(
-                                    start_row,
-                                    end_row,
-                                    end_row - start_row + 2,
-                                    BlockRenderKind::Table(structure),
-                                );
-                            }
-                        }
-                        None => {
-                            let (start_row, end_row) = self.node_rows(node);
-                            self.push_block_rows(
-                                start_row,
-                                end_row,
-                                end_row - start_row + 2,
-                                BlockRenderKind::Markdown,
-                            );
-                        }
+                    // Tree-sitter can end a table early at an all-empty row.
+                    if let Some((range, table)) =
+                        parse_table_at(self.snapshot, MultiBufferOffset(node.start_byte()))
+                    {
+                        self.push_table(range, table);
+                    } else {
+                        let (start, end) = self.node_rows(node);
+                        self.push_block_rows(
+                            start,
+                            end,
+                            end - start + 2,
+                            BlockRenderKind::Markdown,
+                        );
                     }
                 }
                 "fenced_code_block" => {
