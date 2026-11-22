@@ -7431,3 +7431,99 @@ async fn test_inline_fraction_row_keeps_clear_of_its_neighbours(cx: &mut TestApp
         "subscripts and delimiters keep the base height: {heights:?}"
     );
 }
+
+#[gpui::test]
+async fn test_table_with_math_pipes_renders_and_edits(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let source = indoc::indoc! {r"
+        Measurements
+        | Run | Count | Mean | Range | Amplitude $\langle\max|m_h|\rangle$, $\langle|b_v|\rangle$ |
+        | --- | ---: | ---: | ---: | --- |
+        | First | 25 | 1.2 | 0.8 | $|β|$ |
+        | Final | 50 | 1.4 | 1.1 | 1.2 |
+    "};
+    cx.set_state(&format!("ˇ{source}"));
+    cx.executor().run_until_parked();
+    assert!(cx.cx.debug_bounds("mdlp-cell-1-4").is_some());
+    let cell = cx.update_editor(|editor, _, cx| {
+        let markers = extract_markers(editor, cx).expect("Markdown markers");
+        let tables: Vec<_> = markers
+            .blocks
+            .iter()
+            .filter_map(|block| match &block.kind {
+                BlockRenderKind::Table(table) => Some(table),
+                _ => None,
+            })
+            .collect();
+        let [table] = tables.as_slice() else {
+            panic!("expected one table")
+        };
+        assert_eq!(table.header.len(), 5);
+        assert_eq!(table.rows.len(), 2);
+        assert!(table.rows.iter().all(|row| row.len() == 5));
+        for formula in [r"\langle\max|m_h|\rangle", r"\langle|b_v|\rangle", "|β|"] {
+            assert!(
+                cx.global::<MathCache>().entries.iter().any(|(key, entry)| {
+                    key.source.as_ref() == formula && matches!(entry, MathEntry::Ready { .. })
+                }),
+                "missing rendered formula {formula}"
+            );
+        }
+        table.rows[0][3].clone()
+    });
+    let editor = cx.editor.downgrade();
+    cx.update(|window, cx| start_cell_edit(editor, cell, window, cx));
+    cx.update_editor(|editor, window, cx| {
+        let cell = editor
+            .addon::<LivePreviewAddon>()
+            .unwrap()
+            .active_cell
+            .as_ref()
+            .unwrap()
+            .editor
+            .clone();
+        cell.update(cx, |editor, cx| {
+            editor.set_text("0.7 $|x|$ (a|b)", window, cx)
+        });
+        commit_active_cell(editor, cx);
+    });
+    assert_eq!(cx.buffer_text(), source.replace("0.8", r"0.7 $|x|$ (a\|b)"));
+}
+
+#[gpui::test]
+async fn test_table_math_recovery_requires_a_matching_width(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    cx.set_state(indoc::indoc! {r"
+        ˇPrices
+
+        | $5 | US$ |
+        | --- | --- |
+        | $|x|$ | ok |
+
+        | $|x|$ | extra | extra |
+        | --- | --- |
+
+        ```markdown
+        | $|x|$ | code |
+        | --- | --- |
+        ```
+    "});
+    cx.executor().run_until_parked();
+    cx.update_editor(|editor, _, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let markers = extract_markers(editor, cx).unwrap();
+        let mut tables = markers.blocks.iter().filter_map(|block| match &block.kind {
+            BlockRenderKind::Table(table) => Some(table),
+            _ => None,
+        });
+        let table = tables.next().expect("price table");
+        assert!(tables.next().is_none());
+        let texts = |row: &[Range<Anchor>]| {
+            row.iter()
+                .map(|cell| table_cell_text(cell, &snapshot))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(texts(&table.header), ["$5", "US$"]);
+        assert_eq!(texts(&table.rows[0]), ["$|x|$", "ok"]);
+    });
+}
