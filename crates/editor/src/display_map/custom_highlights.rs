@@ -251,6 +251,10 @@ impl<'a> Iterator for CustomHighlightsChunks<'a> {
         if !self.active_highlights.is_empty() {
             let mut active_highlights = self.active_highlights.iter().peekable();
             while let Some((tag, style)) = active_highlights.next() {
+                if *tag == HighlightKey::MarkdownLivePreviewPlainText {
+                    prefix.syntax_highlight_id = None;
+                    continue;
+                }
                 let overridden_by_later_semantic_token =
                     matches!(tag, HighlightKey::SemanticToken(_))
                         && matches!(
