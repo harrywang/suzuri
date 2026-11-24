@@ -6993,11 +6993,19 @@ fn open_markdown_link(
         .unwrap_or_else(|_| path.to_string());
     let Some((workspace, project, source_directory)) = editor
         .read_with(cx, |editor, cx| {
-            Some((
-                editor.workspace()?,
-                editor.project()?.clone(),
-                buffer_base_directory(editor, cx),
-            ))
+            let project = editor.project()?.clone();
+            let source_directory = if project.read(cx).is_via_remote_server() {
+                editor.buffer().read(cx).as_singleton().and_then(|buffer| {
+                    let file = buffer.read(cx).file()?;
+                    let source_path = file.file_system_abs_path(cx)?;
+                    file.path_style(cx)
+                        .parent(&source_path)
+                        .map(Path::to_path_buf)
+                })
+            } else {
+                buffer_base_directory(editor, cx)
+            };
+            Some((editor.workspace()?, project, source_directory))
         })
         .ok()
         .flatten()
@@ -7017,19 +7025,44 @@ fn open_markdown_link(
         return;
     }
 
+    let path_style = project.read(cx).path_style(cx);
     let path = Path::new(&decoded);
-    let path = if path.is_absolute() {
+    let path = if path_style.is_absolute(path) {
         path.to_path_buf()
     } else {
         let Some(source_directory) = source_directory else {
             return;
         };
-        source_directory.join(path)
+        path_style.join(source_directory, path)
     };
     let fs = project.read(cx).fs().clone();
+    let resolve_remote = project.read(cx).is_via_remote_server().then(|| {
+        project.update(cx, |project, cx| {
+            project.resolve_abs_file_link(&path.to_string_lossy(), cx)
+        })
+    });
     window
         .spawn(cx, async move |cx| {
-            if !fs.is_file(&path).await {
+            let (is_file, remote_target) = if let Some(resolve_remote) = resolve_remote {
+                match resolve_remote.await {
+                    Ok(target) => (target.is_some(), target),
+                    Err(error) => {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_error(
+                                format!(
+                                    "Could not resolve file link at “{}”. {error:#}",
+                                    path.display()
+                                ),
+                                cx,
+                            );
+                        });
+                        return Err(error);
+                    }
+                }
+            } else {
+                (fs.is_file(&path).await, None)
+            };
+            if !is_file {
                 workspace.update(cx, |workspace, cx| {
                     workspace.show_toast(
                         workspace::Toast::new(
@@ -7045,6 +7078,9 @@ fn open_markdown_link(
                 return anyhow::Ok(());
             }
             let open = workspace.update_in(cx, |workspace, window, cx| {
+                if let Some(target) = remote_target {
+                    return workspace.open_resolved_path(target, window, cx);
+                }
                 // A file inside the project opens as one of its own; anything
                 // else is opened by absolute path, which the workspace adds
                 // as a single-file worktree.

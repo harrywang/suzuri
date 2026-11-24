@@ -7640,3 +7640,200 @@ async fn test_table_math_recovery_requires_a_matching_width(cx: &mut TestAppCont
         assert_eq!(texts(&table.rows[0]), ["$|x|$", "ok"]);
     });
 }
+
+#[gpui::test]
+async fn test_remote_relative_markdown_link_renders_pdf(
+    cx: &mut TestAppContext,
+    server_cx: &mut TestAppContext,
+) {
+    use project::Fs as _;
+    use remote::RemoteClient;
+    use remote_server::{HeadlessAppState, HeadlessProject};
+    use std::time::{Duration, Instant};
+    use util::path;
+
+    const MARKDOWN: &str = "[Raine, 1991](refs/sample.pdf)\n";
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    let manuscript = directory.path().join("manuscript");
+    std::fs::create_dir_all(manuscript.join("refs")).expect("create reference directory");
+    let draft = manuscript.join("draft.md");
+    let reference = manuscript.join("refs/sample.pdf");
+    std::fs::write(&draft, MARKDOWN).expect("write draft");
+
+    let mut pdf = String::from("%PDF-1.7\n");
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 72] /Contents 4 0 R >>",
+        "<< /Length 0 >>\nstream\nendstream",
+    ];
+    let mut offsets = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", index + 1));
+    }
+    let xref = pdf.len();
+    pdf.push_str("xref\n0 5\n0000000000 65535 f \n");
+    for offset in offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"
+    ));
+    std::fs::write(&reference, pdf).expect("write sample PDF");
+
+    cx.executor().allow_parking();
+    init_test(cx);
+    cx.update(|cx| {
+        release_channel::init(semver::Version::new(0, 0, 0), cx);
+        pdf_viewer::init(cx);
+    });
+    server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+    let (options, session, _) = RemoteClient::fake_server(cx, server_cx);
+    server_cx.update(HeadlessProject::init);
+    let server_fs = project::FakeFs::new(server_cx.executor());
+    server_fs
+        .create_dir(path!("/workspace/manuscript/refs").as_ref())
+        .await
+        .expect("create remote reference directory");
+    server_fs
+        .insert_file(
+            path!("/workspace/manuscript/draft.md"),
+            std::fs::read(&draft).expect("read draft fixture"),
+        )
+        .await;
+    server_fs
+        .insert_file(
+            path!("/workspace/manuscript/refs/sample.pdf"),
+            std::fs::read(&reference).expect("read PDF fixture"),
+        )
+        .await;
+    let _headless = server_cx.new(|cx| {
+        HeadlessProject::new(
+            HeadlessAppState {
+                session,
+                fs: server_fs.clone(),
+                http_client: Arc::new(http_client::BlockedHttpClient),
+                node_runtime: node_runtime::NodeRuntime::unavailable(),
+                languages: Arc::new(language::LanguageRegistry::new(
+                    cx.background_executor().clone(),
+                )),
+                extension_host_proxy: Arc::new(extension::ExtensionHostProxy::new()),
+                startup_time: Instant::now(),
+            },
+            false,
+            cx,
+        )
+    });
+    let remote_client = RemoteClient::connect_mock(options, cx).await;
+    let client_fs = project::FakeFs::new(cx.executor());
+    let languages = Arc::new(language::LanguageRegistry::test(cx.executor()));
+    let markdown = language::markdown_lang();
+    languages.add(markdown.clone());
+    languages.add(markdown_inline_lang());
+    let project = cx.update(|cx| {
+        let client = client::Client::new(
+            Arc::new(clock::FakeSystemClock::new()),
+            http_client::FakeHttpClient::with_404_response(),
+            cx,
+        );
+        project::Project::init(&client, cx);
+        let user_store = cx.new(|cx| client::UserStore::new(client.clone(), cx));
+        project::Project::remote(
+            remote_client,
+            client,
+            node_runtime::NodeRuntime::unavailable(),
+            user_store,
+            languages,
+            client_fs,
+            false,
+            cx,
+        )
+    });
+    let (worktree, _) = project
+        .update(cx, |project, cx| {
+            project.find_or_create_worktree(path!("/workspace"), true, cx)
+        })
+        .await
+        .expect("open remote workspace root");
+    let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+    let path = project::ProjectPath {
+        worktree_id,
+        path: util::rel_path::rel_path("manuscript/draft.md").into(),
+    };
+    let (workspace, cx) =
+        cx.add_window_view(|window, cx| workspace::Workspace::test_new(project, window, cx));
+    let editor = workspace
+        .update_in(cx, |workspace, window, cx| {
+            workspace.open_path(path, None, true, window, cx)
+        })
+        .await
+        .expect("open remote draft")
+        .downcast::<Editor>()
+        .expect("draft opens in the editor");
+    editor.update(cx, |editor, cx| {
+        let buffer = editor
+            .buffer()
+            .read(cx)
+            .as_singleton()
+            .expect("draft buffer");
+        buffer.update(cx, |buffer, cx| {
+            assert!(buffer.file().expect("remote file").as_local().is_none());
+            buffer.set_language(Some(markdown), cx);
+        });
+    });
+    cx.run_until_parked();
+    let destination = editor.read_with(cx, |editor, cx| {
+        extract_markers(editor, cx)
+            .expect("draft Markdown markers")
+            .inline
+            .into_iter()
+            .find_map(|marker| match marker.kind {
+                InlineKind::Link { destination, label } if label.as_ref() == "Raine, 1991" => {
+                    Some(destination)
+                }
+                _ => None,
+            })
+            .expect("extract the relative PDF link from the draft")
+    });
+    cx.update(|window, cx| open_link(&editor.downgrade(), &destination, window, cx));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cx.debug_bounds("pdf-page-0").is_none() && Instant::now() < deadline {
+        cx.executor().timer(Duration::from_millis(25)).await;
+        cx.run_until_parked();
+    }
+    assert!(
+        cx.debug_bounds("pdf-page-0").is_some(),
+        "the draft's relative link must render the first page of the remote PDF"
+    );
+    workspace.read_with(cx, |workspace, cx| {
+        let active_item = workspace.active_item(cx).expect("PDF viewer is active");
+        assert_eq!(
+            active_item.project_path(cx),
+            Some(project::ProjectPath {
+                worktree_id,
+                path: util::rel_path::rel_path("manuscript/refs/sample.pdf").into(),
+            }),
+        );
+    });
+
+    cx.update(|window, cx| {
+        open_markdown_link(&editor.downgrade(), "refs/missing.md", window, cx);
+    });
+    cx.run_until_parked();
+    workspace.read_with(cx, |workspace, cx| {
+        assert!(
+            workspace.has_notification(&workspace::notifications::NotificationId::Named(
+                "markdown-live-preview-link".into()
+            )),
+            "a missing remote link must show a toast"
+        );
+        assert_eq!(workspace.items(cx).count(), 2);
+    });
+    assert!(
+        !server_fs
+            .is_file(path!("/workspace/manuscript/refs/missing.md").as_ref())
+            .await
+    );
+}
