@@ -22,14 +22,20 @@ fn init_test(cx: &mut TestAppContext) {
 }
 
 fn markdown_inline_lang() -> Arc<Language> {
-    Arc::new(Language::new(
-        LanguageConfig {
-            name: "Markdown-Inline".into(),
-            hidden: true,
-            ..LanguageConfig::default()
-        },
-        Some(tree_sitter_md::INLINE_LANGUAGE.into()),
-    ))
+    Arc::new(
+        Language::new(
+            LanguageConfig {
+                name: "Markdown-Inline".into(),
+                hidden: true,
+                ..LanguageConfig::default()
+            },
+            Some(tree_sitter_md::INLINE_LANGUAGE.into()),
+        )
+        .with_highlights_query(include_str!(
+            "../../grammars/src/markdown-inline/highlights.scm"
+        ))
+        .expect("valid Markdown inline highlight query"),
+    )
 }
 
 async fn markdown_test_context(cx: &mut TestAppContext) -> EditorTestContext {
@@ -3250,6 +3256,113 @@ async fn test_bracket_math_in_headings_and_after_stray_escapes(cx: &mut TestAppC
             \(1) see ⋯
         "}
     );
+}
+
+#[gpui::test]
+async fn test_bracket_math_delimiters_do_not_style_intervening_prose(cx: &mut TestAppContext) {
+    let mut cx = markdown_test_context(cx).await;
+    let syntax = Arc::new(theme::SyntaxTheme::new_test([
+        ("emphasis", gpui::Hsla::blue()),
+        ("strikethrough", gpui::yellow()),
+        ("link_text", gpui::Hsla::green()),
+        ("link_uri", gpui::Hsla::red()),
+    ]));
+    cx.language_registry()
+        .language_for_name(MARKDOWN_INLINE)
+        .await
+        .expect("registered Markdown inline grammar")
+        .set_theme(&syntax);
+    cx.set_state(indoc::indoc! {r"
+        \(\eta_i=\sum_j J^{\rm res}_{ij}z_j\) has variance \(\sum_j(J^{\rm res}_{ij})^2\),
+
+        Suppose that once it reaches some overlap \(m_*\), the network can complete the drawing reliably. Then
+        \[
+        \Pr(\text{reaches }m_*)\approx
+        \Pr\!\left(R>m_*e^{-\Gamma_{\rm GN}}\right).
+        \]
+
+        *the value \(x_i\) is small*
+
+        \(a**b\) [details](destˇination) \(c**d\)
+
+        \(a~b\) text \(c~d\)
+
+        ~~deleted text~~
+
+        **\(a~b\) stays bold \(c~d\)**
+
+        ## \(a~b\) stays a heading \(c~d\)
+    "});
+    cx.executor().run_until_parked();
+    let preview = cx.display_text();
+    assert!(preview.contains("⋯ has variance ⋯,"));
+    assert!(preview.contains("⋯ text ⋯"));
+    assert!(preview.contains("⋯, the network can complete the drawing reliably. Then"));
+    assert_eq!(applied_block_count(&mut cx), 1);
+    cx.update(|_, cx| {
+        assert!(cx.global::<MathCache>().entries.iter().any(|(key, entry)| {
+            key.style == MathStyle::Display && matches!(entry, MathEntry::Ready { .. })
+        }));
+    });
+
+    let styled_text = |cx: &mut EditorTestContext, matches: fn(HighlightStyle) -> bool| {
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let style = editor::EditorStyle {
+                syntax: syntax.clone(),
+                ..Default::default()
+            };
+            snapshot
+                .display_snapshot
+                .highlighted_chunks(
+                    editor::display_map::DisplayRow(0)
+                        ..snapshot.display_snapshot.max_point().row() + 1,
+                    language::LanguageAwareStyling {
+                        tree_sitter: true,
+                        diagnostics: false,
+                    },
+                    &style,
+                )
+                .filter(|chunk| chunk.style.is_some_and(matches))
+                .map(|chunk| chunk.text)
+                .collect::<String>()
+        })
+    };
+    let source_emphasis = |style: HighlightStyle| style.color == Some(gpui::Hsla::blue());
+    let blue = styled_text(&mut cx, source_emphasis);
+    assert!(blue.is_empty(), "unexpected source emphasis on {blue:?}");
+    let source_strike = |style: HighlightStyle| style.color == Some(gpui::yellow());
+    assert!(!styled_text(&mut cx, source_strike).contains(" text "));
+    let struck = styled_text(&mut cx, |style| style.strikethrough.is_some());
+    assert_eq!(struck, "deleted text");
+    let bold = styled_text(&mut cx, |style| style.font_weight == Some(FontWeight::BOLD));
+    assert!(bold.contains(" stays bold "));
+    let heading = styled_text(&mut cx, |style| {
+        style.font_weight == Some(FontWeight::SEMIBOLD)
+    });
+    assert!(heading.contains(" stays a heading "));
+    let italic = styled_text(&mut cx, |style| {
+        style.font_style == Some(gpui::FontStyle::Italic)
+    });
+    assert!(italic.contains("the value ") && italic.contains(" is small"));
+    let link_uri = styled_text(&mut cx, |style| style.color == Some(gpui::Hsla::red()));
+    assert!(
+        link_uri.contains("destination"),
+        "revealed link URI: {link_uri:?}"
+    );
+
+    cx.update_editor(|editor, _, cx| {
+        editor
+            .addon_mut::<LivePreviewAddon>()
+            .expect("live preview")
+            .enabled_override = Some(false);
+        recompute(editor, cx);
+    });
+    cx.executor().run_until_parked();
+    let source = styled_text(&mut cx, source_emphasis);
+    assert!(source.contains("has variance"));
+    assert!(source.contains("the network can complete the drawing reliably. Then"));
+    assert!(styled_text(&mut cx, source_strike).contains(" text "));
 }
 
 #[gpui::test]

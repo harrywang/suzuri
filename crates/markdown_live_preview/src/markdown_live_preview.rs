@@ -971,6 +971,7 @@ struct MarkerSet {
     /// italic/bold) instead of source-mode syntax-highlight colors.
     italic: Vec<Range<Anchor>>,
     bold: Vec<Range<Anchor>>,
+    false_emphasis: Vec<Range<Anchor>>,
     /// Link text, restyled to upright accent color so links read as
     /// clickable color while italics remain the only slanted text.
     link_text: Vec<Range<Anchor>>,
@@ -1465,17 +1466,19 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
 
 /// Namespaces within `HighlightKey::MarkdownLivePreview`, one per decoration
 /// kind so each can be written and cleared independently of the others.
-const STRIKE: usize = 0;
-const ITALIC: usize = 1;
-const BOLD: usize = 2;
-const LINK: usize = 3;
-const DEFINITION: usize = 4;
-const ORDERED_MARKER: usize = 5;
-const CITATION: usize = 6;
-const HIGHLIGHT: usize = 7;
-const TAG: usize = 8;
-const CITATION_UNKNOWN: usize = 9;
-const CODE: usize = 10;
+// Apply plain text first so overlapping preview styles can override it.
+const PLAIN: usize = 0;
+const STRIKE: usize = 1;
+const ITALIC: usize = 2;
+const BOLD: usize = 3;
+const LINK: usize = 4;
+const DEFINITION: usize = 5;
+const ORDERED_MARKER: usize = 6;
+const CITATION: usize = 7;
+const HIGHLIGHT: usize = 8;
+const TAG: usize = 9;
+const CITATION_UNKNOWN: usize = 10;
+const CODE: usize = 11;
 const HEADING_STYLE_BASE: usize = 100;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
@@ -1544,6 +1547,16 @@ fn apply_emphasis_highlights(
     }
 
     let sets = [
+        (
+            PLAIN,
+            markers.map(|markers| markers.false_emphasis.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                font_style: Some(gpui::FontStyle::Normal),
+                font_weight: Some(FontWeight::NORMAL),
+                ..Default::default()
+            },
+        ),
         (
             STRIKE,
             markers.map(|markers| markers.strikethrough.clone()),
@@ -8434,6 +8447,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         strikethrough: Vec::new(),
         italic: Vec::new(),
         bold: Vec::new(),
+        false_emphasis: Vec::new(),
         link_text: Vec::new(),
         definitions: Vec::new(),
         definition_ranges: Vec::new(),
@@ -8484,6 +8498,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         strikethrough,
         italic,
         bold,
+        false_emphasis,
         link_text,
         definitions,
         definition_ranges,
@@ -8528,6 +8543,7 @@ fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
         strikethrough,
         italic,
         bold,
+        false_emphasis,
         link_text,
         definitions: definitions.join("\n"),
         definition_ranges,
@@ -8561,6 +8577,7 @@ struct Extraction<'a> {
     strikethrough: Vec<Range<Anchor>>,
     italic: Vec<Range<Anchor>>,
     bold: Vec<Range<Anchor>>,
+    false_emphasis: Vec<Range<Anchor>>,
     link_text: Vec<Range<Anchor>>,
     definitions: Vec<String>,
     definition_ranges: Vec<Range<Anchor>>,
@@ -9229,6 +9246,33 @@ impl Extraction<'_> {
         }
     }
 
+    fn suppress_false_emphasis(&mut self, node: tree_sitter::Node) {
+        // Nested markup (for example a link) has its own syntax capture.
+        // Only suppress the parts that inherit the rejected emphasis.
+        let mut start = node.start_byte();
+        for child in node.named_children(&mut node.walk()) {
+            if matches!(
+                child.kind(),
+                "emphasis_delimiter"
+                    | "backslash_escape"
+                    | "entity_reference"
+                    | "numeric_character_reference"
+                    | "hard_line_break"
+            ) {
+                continue;
+            }
+            if start < child.start_byte() {
+                let range = self.anchor_range(start..child.start_byte());
+                self.false_emphasis.push(range);
+            }
+            start = child.end_byte();
+        }
+        if start < node.end_byte() {
+            let range = self.anchor_range(start..node.end_byte());
+            self.false_emphasis.push(range);
+        }
+    }
+
     fn walk_inline_layer(&mut self, root: tree_sitter::Node) {
         let mut stack = vec![root];
         while let Some(node) = stack.pop() {
@@ -9238,6 +9282,12 @@ impl Extraction<'_> {
                 // Emphasis the grammar paired across a formula's edge, as in
                 // `\( a*b \) and c*`, is not emphasis the reader wrote.
                 BracketMathOverlap::Straddles => {
+                    if matches!(
+                        node.kind(),
+                        "emphasis" | "strong_emphasis" | "strikethrough"
+                    ) {
+                        self.suppress_false_emphasis(node);
+                    }
                     push_children(node, &mut stack);
                     continue;
                 }
