@@ -1466,17 +1466,19 @@ fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
 
 /// Namespaces within `HighlightKey::MarkdownLivePreview`, one per decoration
 /// kind so each can be written and cleared independently of the others.
-const STRIKE: usize = 0;
-const ITALIC: usize = 1;
-const BOLD: usize = 2;
-const LINK: usize = 3;
-const DEFINITION: usize = 4;
-const ORDERED_MARKER: usize = 5;
-const CITATION: usize = 6;
-const HIGHLIGHT: usize = 7;
-const TAG: usize = 8;
-const CITATION_UNKNOWN: usize = 9;
-const CODE: usize = 10;
+// Apply plain text first so overlapping preview styles can override it.
+const PLAIN: usize = 0;
+const STRIKE: usize = 1;
+const ITALIC: usize = 2;
+const BOLD: usize = 3;
+const LINK: usize = 4;
+const DEFINITION: usize = 5;
+const ORDERED_MARKER: usize = 6;
+const CITATION: usize = 7;
+const HIGHLIGHT: usize = 8;
+const TAG: usize = 9;
+const CITATION_UNKNOWN: usize = 10;
+const CODE: usize = 11;
 const HEADING_STYLE_BASE: usize = 100;
 
 /// Emphasis spans get preview-like typography: the plain text color with true
@@ -1545,6 +1547,16 @@ fn apply_emphasis_highlights(
     }
 
     let sets = [
+        (
+            PLAIN,
+            markers.map(|markers| markers.false_emphasis.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                font_style: Some(gpui::FontStyle::Normal),
+                font_weight: Some(FontWeight::NORMAL),
+                ..Default::default()
+            },
+        ),
         (
             STRIKE,
             markers.map(|markers| markers.strikethrough.clone()),
@@ -1654,17 +1666,6 @@ fn apply_emphasis_highlights(
             },
         ),
     ];
-    let key = HighlightKey::MarkdownLivePreviewPlainText;
-    if let Some(markers) = markers.filter(|markers| !markers.false_emphasis.is_empty()) {
-        editor.highlight_text(
-            key,
-            markers.false_emphasis.clone(),
-            HighlightStyle::default(),
-            cx,
-        );
-    } else {
-        editor.clear_highlights(key, cx);
-    }
     for (key, ranges, style) in sets {
         match ranges {
             Some(ranges) if !ranges.is_empty() => {
@@ -9281,7 +9282,10 @@ impl Extraction<'_> {
                 // Emphasis the grammar paired across a formula's edge, as in
                 // `\( a*b \) and c*`, is not emphasis the reader wrote.
                 BracketMathOverlap::Straddles => {
-                    if matches!(node.kind(), "emphasis" | "strong_emphasis") {
+                    if matches!(
+                        node.kind(),
+                        "emphasis" | "strong_emphasis" | "strikethrough"
+                    ) {
                         self.suppress_false_emphasis(node);
                     }
                     push_children(node, &mut stack);

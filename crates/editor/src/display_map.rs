@@ -176,8 +176,6 @@ pub enum HighlightKey {
     InlineAssist,
     InputComposition,
     MarkdownLivePreview(usize),
-    /// Display these source ranges without their Tree-sitter highlight.
-    MarkdownLivePreviewPlainText,
     MatchingBracket,
     NavigationOverlay(NavigationOverlayKey),
     PendingInput,

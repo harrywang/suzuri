@@ -3259,10 +3259,11 @@ async fn test_bracket_math_in_headings_and_after_stray_escapes(cx: &mut TestAppC
 }
 
 #[gpui::test]
-async fn test_bracket_math_subscripts_do_not_style_intervening_prose(cx: &mut TestAppContext) {
+async fn test_bracket_math_delimiters_do_not_style_intervening_prose(cx: &mut TestAppContext) {
     let mut cx = markdown_test_context(cx).await;
     let syntax = Arc::new(theme::SyntaxTheme::new_test([
         ("emphasis", gpui::Hsla::blue()),
+        ("strikethrough", gpui::yellow()),
         ("link_text", gpui::Hsla::green()),
         ("link_uri", gpui::Hsla::red()),
     ]));
@@ -3283,10 +3284,19 @@ async fn test_bracket_math_subscripts_do_not_style_intervening_prose(cx: &mut Te
         *the value \(x_i\) is small*
 
         \(a**b\) [details](destˇination) \(c**d\)
+
+        \(a~b\) text \(c~d\)
+
+        ~~deleted text~~
+
+        **\(a~b\) stays bold \(c~d\)**
+
+        ## \(a~b\) stays a heading \(c~d\)
     "});
     cx.executor().run_until_parked();
     let preview = cx.display_text();
     assert!(preview.contains("⋯ has variance ⋯,"));
+    assert!(preview.contains("⋯ text ⋯"));
     assert!(preview.contains("⋯, the network can complete the drawing reliably. Then"));
     assert_eq!(applied_block_count(&mut cx), 1);
     cx.update(|_, cx| {
@@ -3321,6 +3331,16 @@ async fn test_bracket_math_subscripts_do_not_style_intervening_prose(cx: &mut Te
     let source_emphasis = |style: HighlightStyle| style.color == Some(gpui::Hsla::blue());
     let blue = styled_text(&mut cx, source_emphasis);
     assert!(blue.is_empty(), "unexpected source emphasis on {blue:?}");
+    let source_strike = |style: HighlightStyle| style.color == Some(gpui::yellow());
+    assert!(!styled_text(&mut cx, source_strike).contains(" text "));
+    let struck = styled_text(&mut cx, |style| style.strikethrough.is_some());
+    assert_eq!(struck, "deleted text");
+    let bold = styled_text(&mut cx, |style| style.font_weight == Some(FontWeight::BOLD));
+    assert!(bold.contains(" stays bold "));
+    let heading = styled_text(&mut cx, |style| {
+        style.font_weight == Some(FontWeight::SEMIBOLD)
+    });
+    assert!(heading.contains(" stays a heading "));
     let italic = styled_text(&mut cx, |style| {
         style.font_style == Some(gpui::FontStyle::Italic)
     });
@@ -3342,6 +3362,7 @@ async fn test_bracket_math_subscripts_do_not_style_intervening_prose(cx: &mut Te
     let source = styled_text(&mut cx, source_emphasis);
     assert!(source.contains("has variance"));
     assert!(source.contains("the network can complete the drawing reliably. Then"));
+    assert!(styled_text(&mut cx, source_strike).contains(" text "));
 }
 
 #[gpui::test]
