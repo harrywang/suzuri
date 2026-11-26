@@ -139,6 +139,9 @@ pub struct PdfViewer {
     /// The window's device-pixel ratio, captured each frame in `render`.
     display_scale: f32,
     pan_x: Pixels,
+    /// The viewport width the pages were last laid out at, so a frame that
+    /// finds a different width knows to re-anchor the scroll position.
+    laid_out_viewport_width: f32,
     /// Where each page was laid out in the last frame, in window coordinates.
     /// Hit-testing reads these instead of recomputing the layout.
     page_bounds: Rc<RefCell<HashMap<usize, Bounds<Pixels>>>>,
@@ -284,6 +287,7 @@ impl PdfViewer {
             render_scale: SCREEN_SCALE_FACTOR,
             display_scale: SCREEN_SCALE_FACTOR,
             pan_x: px(0.0),
+            laid_out_viewport_width: 0.0,
             page_bounds: Rc::default(),
             text_layouts: HashMap::new(),
             text_extraction_task: Task::ready(()),
@@ -533,6 +537,11 @@ impl PdfViewer {
     /// Like `scroll_to_page`, but lines up the point `top` PDF points below
     /// the page's top edge instead of the edge itself.
     fn scroll_to_page_point(&mut self, index: usize, top: f32, cx: &mut Context<Self>) {
+        self.set_scroll_to_page_point(index, top);
+        cx.notify();
+    }
+
+    fn set_scroll_to_page_point(&mut self, index: usize, top: f32) {
         let viewport_width: f32 = self.scroll_handle.bounds().size.width.into();
         let fit_width = Self::page_fit_width(viewport_width);
         let mut offset_y = self.page_top(index, fit_width);
@@ -544,7 +553,46 @@ impl PdfViewer {
         let offset = self.scroll_handle.offset();
         self.scroll_handle
             .set_offset(point(offset.x, px(-offset_y)));
-        cx.notify();
+    }
+
+    /// The point on the line `scroll_to_page` aligns page tops to, as a page
+    /// and a distance in PDF points below its top edge, for pages laid out at
+    /// `fit_width`. Unlike the pixel offset, it does not depend on the width.
+    fn reading_position(&self, fit_width: f32) -> Option<(usize, f32)> {
+        let dimensions = self.page_dimensions();
+        let reading_line = self.scroll_top();
+        let mut page_top = 0.0;
+        for (index, dim) in dimensions.iter().enumerate() {
+            let page_height = Self::display_height(dim, fit_width, self.zoom_level);
+            let is_last = index + 1 == dimensions.len();
+            if reading_line < page_top + page_height + PAGE_GAP_PX || is_last {
+                if dim.width <= 0.0 {
+                    return Some((index, 0.0));
+                }
+                let scale = fit_width / dim.width * self.zoom_level;
+                return Some((index, (reading_line - page_top) / scale));
+            }
+            page_top += page_height + PAGE_GAP_PX;
+        }
+        None
+    }
+
+    /// Page heights follow the pane's width, so a pixel offset kept across a
+    /// resize (a side panel opening, say) lands on another part of the
+    /// document (#199). Runs before the layout first uses the new width and
+    /// puts back the page and point that were at the top under the old one.
+    fn keep_reading_position_across_resize(&mut self) {
+        let viewport_width: f32 = self.scroll_handle.bounds().size.width.into();
+        if viewport_width <= 0.0 {
+            return;
+        }
+        let previous_width = std::mem::replace(&mut self.laid_out_viewport_width, viewport_width);
+        if previous_width <= 0.0 || previous_width == viewport_width {
+            return;
+        }
+        if let Some((index, top)) = self.reading_position(Self::page_fit_width(previous_width)) {
+            self.set_scroll_to_page_point(index, top);
+        }
     }
 
     /// The scroll position, as a distance below the top of the document.
@@ -1077,6 +1125,7 @@ impl Focusable for PdfViewer {
 impl Render for PdfViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.display_scale = window.scale_factor();
+        self.keep_reading_position_across_resize();
         self.request_visible_pages(cx);
 
         let content = if let Some(error) = &self.render_error {
@@ -1403,6 +1452,7 @@ impl Item for PdfViewer {
                 render_scale: self.render_scale,
                 display_scale: self.display_scale,
                 pan_x: self.pan_x,
+                laid_out_viewport_width: 0.0,
                 page_bounds: Rc::default(),
                 text_layouts: self.text_layouts.clone(),
                 text_extraction_task: Task::ready(()),
@@ -1836,6 +1886,62 @@ mod navigation_tests {
     fn redraw(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) {
         viewer.update_in(cx, |_, window, _| window.refresh());
         cx.run_until_parked();
+    }
+
+    /// Page heights follow the pane's width, and the scroll offset used to
+    /// stay put in pixels, so opening or closing a side panel moved the view
+    /// to another part of the document (#199).
+    #[gpui::test]
+    async fn resizing_the_pane_keeps_the_reading_position(cx: &mut TestAppContext) {
+        const PAGE: usize = 4;
+        const POINTS_DOWN: f32 = 300.0;
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        viewer.update(cx, |viewer, cx| {
+            viewer.scroll_to_page_point(PAGE, POINTS_DOWN, cx)
+        });
+        redraw(&viewer, cx);
+
+        // Measured from the frame's own layout rather than from
+        // `reading_position`, which is the fix's inverse and would cancel
+        // out a mistake the two shared.
+        let distance_from_reading_line =
+            |viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext| {
+                viewer.read_with(cx, |viewer, _| {
+                    let page = viewer.page_bounds.borrow()[&PAGE];
+                    let dimensions = viewer.page_dimensions()[PAGE];
+                    let point_y = f32::from(page.top())
+                        + POINTS_DOWN * f32::from(page.size.width) / dimensions.width;
+                    let reading_line =
+                        f32::from(viewer.scroll_handle.bounds().top()) + PAGE_CANVAS_MARGIN_PX;
+                    point_y - reading_line
+                })
+            };
+        let before = distance_from_reading_line(&viewer, cx);
+        assert!(
+            before.abs() < 1.0,
+            "the point should start on the reading line, {before}px away"
+        );
+
+        let window_height = cx.update(|window, _| window.viewport_size().height);
+        for width in [px(500.0), px(1100.0), px(800.0)] {
+            cx.simulate_resize(gpui::size(width, window_height));
+            redraw(&viewer, cx);
+            redraw(&viewer, cx);
+
+            let page_width = viewer.read_with(cx, |viewer, _| {
+                viewer.page_bounds.borrow()[&PAGE].size.width
+            });
+            let expected_page_width = PdfViewer::page_fit_width(f32::from(width));
+            assert!(
+                (f32::from(page_width) - expected_page_width).abs() < 1.0,
+                "pages should be laid out at the new width, got {page_width:?} for {width:?}"
+            );
+            let after = distance_from_reading_line(&viewer, cx);
+            assert!(
+                (after - before).abs() < 1.0,
+                "at {width:?} the point drifted {after}px from the reading line"
+            );
+        }
     }
 
     #[gpui::test]
