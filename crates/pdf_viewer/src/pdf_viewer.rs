@@ -30,9 +30,9 @@ use editor::{Editor, EditorEvent, actions::SelectAll};
 use file_icons::FileIcons;
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, Entity, EventEmitter, FocusHandle, Focusable,
-    Font, IntoElement, KeyContext, MouseButton, ParentElement, Pixels, Point, Render, RenderImage,
-    ScrollDelta, ScrollEvent, ScrollHandle, SharedString, Styled, Subscription, Task, TextAlign,
-    TextStyleRefinement, Window, actions, canvas, div, img, point, px,
+    Font, IntoElement, KeyContext, MouseButton, ParentElement, PinchEvent, Pixels, Point, Render,
+    RenderImage, ScrollDelta, ScrollEvent, ScrollHandle, SharedString, Styled, Subscription, Task,
+    TextAlign, TextStyleRefinement, Window, actions, canvas, div, img, point, px,
 };
 use project::Project;
 use ui::WithScrollbar;
@@ -543,13 +543,7 @@ impl PdfViewer {
 
     fn set_scroll_to_page_point(&mut self, index: usize, top: f32) {
         let viewport_width: f32 = self.scroll_handle.bounds().size.width.into();
-        let fit_width = Self::page_fit_width(viewport_width);
-        let mut offset_y = self.page_top(index, fit_width);
-        if let Some(dimensions) = self.page_dimensions().get(index)
-            && dimensions.width > 0.0
-        {
-            offset_y += top * fit_width / dimensions.width * self.zoom_level;
-        }
+        let offset_y = self.column_y_of(index, top, Self::page_fit_width(viewport_width));
         let offset = self.scroll_handle.offset();
         self.scroll_handle
             .set_offset(point(offset.x, px(-offset_y)));
@@ -559,22 +553,39 @@ impl PdfViewer {
     /// and a distance in PDF points below its top edge, for pages laid out at
     /// `fit_width`. Unlike the pixel offset, it does not depend on the width.
     fn reading_position(&self, fit_width: f32) -> Option<(usize, f32)> {
+        self.document_position_at(self.scroll_top(), fit_width)
+    }
+
+    /// The page and the distance in PDF points below its top edge at
+    /// `column_y` pixels below the top of the pages column. Neither depends
+    /// on the width or zoom the pages are laid out at, which pixels do.
+    fn document_position_at(&self, column_y: f32, fit_width: f32) -> Option<(usize, f32)> {
         let dimensions = self.page_dimensions();
-        let reading_line = self.scroll_top();
         let mut page_top = 0.0;
         for (index, dim) in dimensions.iter().enumerate() {
             let page_height = Self::display_height(dim, fit_width, self.zoom_level);
             let is_last = index + 1 == dimensions.len();
-            if reading_line < page_top + page_height + PAGE_GAP_PX || is_last {
+            if column_y < page_top + page_height + PAGE_GAP_PX || is_last {
                 if dim.width <= 0.0 {
                     return Some((index, 0.0));
                 }
                 let scale = fit_width / dim.width * self.zoom_level;
-                return Some((index, (reading_line - page_top) / scale));
+                return Some((index, (column_y - page_top) / scale));
             }
             page_top += page_height + PAGE_GAP_PX;
         }
         None
+    }
+
+    /// The inverse of `document_position_at`.
+    fn column_y_of(&self, index: usize, points_down: f32, fit_width: f32) -> f32 {
+        let mut column_y = self.page_top(index, fit_width);
+        if let Some(dimensions) = self.page_dimensions().get(index)
+            && dimensions.width > 0.0
+        {
+            column_y += points_down * fit_width / dimensions.width * self.zoom_level;
+        }
+        column_y
     }
 
     /// Page heights follow the pane's width, so a pixel offset kept across a
@@ -1017,38 +1028,55 @@ impl PdfViewer {
         cx: &mut Context<Self>,
     ) {
         let old_zoom = self.zoom_level;
-        self.zoom_level = new_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
-        if (self.zoom_level - old_zoom).abs() > f32::EPSILON {
-            if old_zoom > 0.0 {
-                let ratio = self.zoom_level / old_zoom;
-                self.pan_x *= ratio;
-            }
-            self.clamp_pan();
-
-            if let Some(cursor) = zoom_center {
-                let bounds = self.scroll_handle.bounds();
-                let offset = self.scroll_handle.offset();
-
-                let cursor_in_container =
-                    point(cursor.x - bounds.origin.x, cursor.y - bounds.origin.y);
-
-                let content_x = cursor_in_container.x - offset.x;
-                let content_y = cursor_in_container.y - offset.y;
-
-                let zoom_ratio = self.zoom_level / old_zoom;
-                let new_content_x = content_x * zoom_ratio;
-                let new_content_y = content_y * zoom_ratio;
-
-                let new_offset = point(
-                    cursor_in_container.x - new_content_x,
-                    cursor_in_container.y - new_content_y,
-                );
-                self.scroll_handle.set_offset(new_offset);
-            }
-
-            cx.notify();
-            self.schedule_render_after_zoom(cx);
+        let new_zoom = new_zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        if (new_zoom - old_zoom).abs() <= f32::EPSILON || old_zoom <= 0.0 {
+            return;
         }
+        let bounds = self.scroll_handle.bounds();
+        let viewport_width: f32 = bounds.size.width.into();
+        if viewport_width <= 0.0 {
+            self.zoom_level = new_zoom;
+            cx.notify();
+            return;
+        }
+
+        // The anchor keeps the same spot of the document under it: the
+        // cursor, or else the reading line `scroll_to_page` aligns pages to.
+        // It is held as a page and a point rather than by scaling the pixel
+        // offset, because the gutter and the gaps between pages do not grow
+        // with zoom, and scaling them too slid the document away from the
+        // cursor by up to a gap per page above it.
+        let reading_line_y = bounds.top() + px(PAGE_CANVAS_MARGIN_PX);
+        let anchor = zoom_center.unwrap_or(point(bounds.center().x, reading_line_y));
+        let anchor_below_reading_line = f32::from(anchor.y - reading_line_y);
+        let fit_width = Self::page_fit_width(viewport_width);
+        let anchored =
+            self.document_position_at(self.scroll_top() + anchor_below_reading_line, fit_width);
+        // Pages are centred and then shifted by `pan_x`, so horizontally the
+        // anchor's distance from the pages' centre is what scales.
+        let anchor_from_pages_center = anchor.x - bounds.center().x - self.pan_x;
+
+        self.zoom_level = new_zoom;
+        let ratio = new_zoom / old_zoom;
+        self.pan_x = anchor.x - bounds.center().x - anchor_from_pages_center * ratio;
+        self.clamp_pan();
+        if let Some((index, points_down)) = anchored {
+            let top = (self.column_y_of(index, points_down, fit_width) - anchor_below_reading_line)
+                .max(0.0);
+            let offset = self.scroll_handle.offset();
+            self.scroll_handle.set_offset(point(offset.x, px(-top)));
+        }
+
+        cx.notify();
+        self.schedule_render_after_zoom(cx);
+    }
+
+    fn handle_pinch(&mut self, event: &PinchEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        self.set_zoom(
+            self.zoom_level * (1.0 + event.delta),
+            Some(event.position),
+            cx,
+        );
     }
 
     fn zoom_in(&mut self, _: &ZoomIn, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1098,6 +1126,7 @@ impl PdfViewer {
                 1.0 / (1.0 + delta.abs() * SCROLL_ZOOM_SENSITIVITY)
             };
             self.set_zoom(self.zoom_level * zoom_factor, Some(event.position), cx);
+            cx.stop_propagation();
         } else {
             let delta_x = match event.delta {
                 ScrollDelta::Pixels(pixels) => pixels.x,
@@ -1331,12 +1360,25 @@ impl Render for PdfViewer {
                             // shift-scroll moves the page diagonally.
                             .restrict_scroll_to_axis()
                             .track_scroll(&self.scroll_handle)
-                            .on_scroll(cx.listener(Self::handle_scroll_wheel))
+                            .on_pinch(cx.listener(Self::handle_pinch))
                             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
                             .on_mouse_move(cx.listener(Self::handle_mouse_move))
                             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
                             .cursor(CursorStyle::IBeam)
-                            .child(content),
+                            .child(
+                                // Listening on a child, not the container: a
+                                // child's scroll listener runs before the
+                                // container scrolls, so a zooming wheel can
+                                // stop it. Otherwise the view also scrolled by
+                                // the delta, sliding the page out from under
+                                // the cursor being zoomed around.
+                                div()
+                                    .id("pdf-zoom-surface")
+                                    .w_full()
+                                    .min_h_full()
+                                    .on_scroll(cx.listener(Self::handle_scroll_wheel))
+                                    .child(content),
+                            ),
                     )
                     .vertical_scrollbar_for(&self.scroll_handle, window, cx),
             )
@@ -1886,6 +1928,166 @@ mod navigation_tests {
     fn redraw(viewer: &Entity<PdfViewer>, cx: &mut VisualTestContext) {
         viewer.update_in(cx, |_, window, _| window.refresh());
         cx.run_until_parked();
+    }
+
+    /// The page under `position` and the spot on it, in PDF points from the
+    /// page's top-left corner, read from the last frame's layout.
+    fn document_point_under(
+        viewer: &Entity<PdfViewer>,
+        position: Point<Pixels>,
+        cx: &mut VisualTestContext,
+    ) -> (usize, f32, f32) {
+        viewer.read_with(cx, |viewer, _| {
+            let page_bounds = viewer.page_bounds.borrow();
+            let (&index, bounds) = page_bounds
+                .iter()
+                .find(|(_, bounds)| bounds.contains(&position))
+                .expect("a page under the position");
+            let scale = f32::from(bounds.size.width) / viewer.page_dimensions()[index].width;
+            (
+                index,
+                f32::from(position.x - bounds.left()) / scale,
+                f32::from(position.y - bounds.top()) / scale,
+            )
+        })
+    }
+
+    /// Where the last frame drew the spot `x`, `y` PDF points into a page.
+    fn window_point_of(
+        viewer: &Entity<PdfViewer>,
+        (index, x, y): (usize, f32, f32),
+        cx: &mut VisualTestContext,
+    ) -> Point<Pixels> {
+        viewer.read_with(cx, |viewer, _| {
+            let bounds = viewer.page_bounds.borrow()[&index];
+            let scale = f32::from(bounds.size.width) / viewer.page_dimensions()[index].width;
+            point(bounds.left() + px(x * scale), bounds.top() + px(y * scale))
+        })
+    }
+
+    fn assert_stays_under(
+        viewer: &Entity<PdfViewer>,
+        spot: (usize, f32, f32),
+        position: Point<Pixels>,
+        context: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let drawn_at = window_point_of(viewer, spot, cx);
+        let drift = drawn_at - position;
+        // Layout rounds each page to whole pixels, so a page's drawn top can
+        // sit up to half a pixel per page above it from the computed one.
+        assert!(
+            f32::from(drift.x).abs() < 3.0 && f32::from(drift.y).abs() < 3.0,
+            "{context}: the spot under {position:?} moved by {drift:?}"
+        );
+    }
+
+    /// Pinching a trackpad zooms around the fingers (#200).
+    #[gpui::test]
+    async fn pinching_zooms_around_the_fingers(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        viewer.update(cx, |viewer, cx| viewer.scroll_to_page_point(5, 200.0, cx));
+        redraw(&viewer, cx);
+
+        let position = viewer.read_with(cx, |viewer, _| {
+            let page = viewer.page_bounds.borrow()[&5];
+            let reading_line = viewer.scroll_handle.bounds().top() + px(PAGE_CANVAS_MARGIN_PX);
+            point(
+                page.left() + page.size.width * 0.3,
+                reading_line + px(150.0),
+            )
+        });
+        let spot = document_point_under(&viewer, position, cx);
+
+        for (delta, steps, context) in [(0.1, 6, "pinching in"), (-0.1, 3, "pinching out")] {
+            for _ in 0..steps {
+                cx.simulate_event(PinchEvent {
+                    position,
+                    delta,
+                    modifiers: Modifiers::none(),
+                    phase: gpui::TouchPhase::Moved,
+                });
+                redraw(&viewer, cx);
+            }
+            assert_stays_under(&viewer, spot, position, context, cx);
+        }
+        let zoom = viewer.read_with(cx, |viewer, _| viewer.zoom_level);
+        assert!(
+            (zoom - 1.1_f32.powi(6) * 0.9_f32.powi(3)).abs() < 0.01,
+            "each pinch step should scale the zoom by 1 + delta, zoom is {zoom}"
+        );
+    }
+
+    /// Cmd+scroll scaled the whole pixel offset, gutter and page gaps
+    /// included, though neither grows with zoom, so deep in a document the
+    /// page slid out from under the cursor by up to a gap per page above it.
+    #[gpui::test]
+    async fn command_scroll_zooms_around_the_cursor_deep_in_the_document(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        viewer.update(cx, |viewer, cx| viewer.scroll_to_page_point(8, 100.0, cx));
+        redraw(&viewer, cx);
+
+        let position = viewer.read_with(cx, |viewer, _| {
+            let reading_line = viewer.scroll_handle.bounds().top() + px(PAGE_CANVAS_MARGIN_PX);
+            point(
+                viewer.scroll_handle.bounds().center().x,
+                reading_line + px(80.0),
+            )
+        });
+        let spot = document_point_under(&viewer, position, cx);
+        assert_eq!(spot.0, 8, "the cursor should start over page 9");
+
+        for _ in 0..3 {
+            cx.simulate_event(ScrollEvent {
+                position,
+                delta: ScrollDelta::Pixels(point(px(0.0), px(30.0))),
+                modifiers: Modifiers::command(),
+                ..Default::default()
+            });
+            redraw(&viewer, cx);
+        }
+        assert!(viewer.read_with(cx, |viewer, _| viewer.zoom_level) > 1.5);
+        assert_stays_under(&viewer, spot, position, "zooming with cmd-scroll", cx);
+    }
+
+    /// The zoom buttons and keys have no cursor to zoom around, and used to
+    /// keep the pixel offset, which lands elsewhere at another zoom. They now
+    /// keep the reading line on the same spot, as a resize does (#199).
+    #[gpui::test]
+    async fn zoom_buttons_keep_the_reading_position(cx: &mut TestAppContext) {
+        let (viewer, cx, _dir) = open_viewer(cx).await;
+        viewer.update(cx, |viewer, cx| viewer.scroll_to_page_point(4, 300.0, cx));
+        redraw(&viewer, cx);
+
+        let reading_line = viewer.read_with(cx, |viewer, _| {
+            let bounds = viewer.scroll_handle.bounds();
+            point(bounds.center().x, bounds.top() + px(PAGE_CANVAS_MARGIN_PX))
+        });
+        let spot = document_point_under(&viewer, reading_line, cx);
+
+        fn zoom_with(
+            action: impl gpui::Action,
+            context: &str,
+            viewer: &Entity<PdfViewer>,
+            spot: (usize, f32, f32),
+            reading_line: Point<Pixels>,
+            cx: &mut VisualTestContext,
+        ) {
+            cx.dispatch_action(action);
+            redraw(viewer, cx);
+            assert_stays_under(viewer, spot, reading_line, context, cx);
+        }
+        zoom_with(ZoomIn, "zooming in", &viewer, spot, reading_line, cx);
+        zoom_with(ZoomIn, "zooming in again", &viewer, spot, reading_line, cx);
+        zoom_with(ZoomOut, "zooming out", &viewer, spot, reading_line, cx);
+        zoom_with(
+            ResetZoom,
+            "resetting the zoom",
+            &viewer,
+            spot,
+            reading_line,
+            cx,
+        );
     }
 
     /// Page heights follow the pane's width, and the scroll offset used to
