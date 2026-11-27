@@ -6333,8 +6333,11 @@ impl EditorElement {
                     ));
 
                     if axis == ScrollbarAxis::Vertical {
-                        let fast_markers =
-                            self.collect_fast_scrollbar_markers(&cursor_markers, scrollbar_layout);
+                        let fast_markers = self.collect_fast_scrollbar_markers(
+                            &cursor_markers,
+                            scrollbar_layout,
+                            &layout.position_map.snapshot.display_snapshot,
+                        );
                         // Refresh slow scrollbar markers in the background. Below, we
                         // paint whatever markers have already been computed.
                         self.refresh_slow_scrollbar_markers(layout, scrollbar_layout, window, cx);
@@ -6536,6 +6539,8 @@ impl EditorElement {
         &self,
         cursor_markers: &[(DisplayPoint, Hsla)],
         scrollbar_layout: &ScrollbarLayout,
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
+        display_snapshot: &DisplaySnapshot,
     ) -> Vec<PaintQuad> {
         let cursor_ranges = cursor_markers
             .iter()
@@ -6546,11 +6551,7 @@ impl EditorElement {
             })
             .collect_vec();
         // SUZURI: Native line typography must share row geometry with editor input and painting.
-        scrollbar_layout.marker_quads_for_ranges(
-            cursor_ranges,
-            None,
-            &layout.position_map.snapshot.display_snapshot,
-        )
+        scrollbar_layout.marker_quads_for_ranges(cursor_ranges, None, display_snapshot)
     }
 
     fn refresh_slow_scrollbar_markers(
